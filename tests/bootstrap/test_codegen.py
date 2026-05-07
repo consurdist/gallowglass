@@ -1113,6 +1113,201 @@ let main : Nat = match Y { | X → 0 | Y → 1 | Extra n → n }
 
 
 # ---------------------------------------------------------------------------
+# AUDIT.md D8: nested in-law `let` lambda-lifted instead of `(1 rhs body)`
+#
+# Reaver's `lawExp` text-form parser only accepts the `(1 rhs body)` bind
+# form at the law's body root.  Emitting it nested inside an Elim arg
+# (e.g., the body of a match arm) produces text Reaver fails to parse
+# with `law: unbound: "_N"`.  The fix lambda-lifts nested lets: nested
+# `let x = rhs in body` becomes `App(Pin(SubLaw), captures…, rhs)`.
+# Top-of-law lets keep the native `(1 rhs body)` form.
+# ---------------------------------------------------------------------------
+
+
+def test_d8_top_of_law_let_keeps_native_form():
+    """A let at the law's body root emits `A(A(N(1), rhs), body)` — the
+    native PLAN let form Reaver natively parses as a bind."""
+    src = '''
+let func : Nat → Nat
+  = λ x → let y = x in y
+'''
+    v = val_of(src, 'func')
+    # f compiles to L(1, name, body).  body should be A(A(N(1), N(1)), N(2)).
+    assert is_law(v)
+    body = v.body
+    assert is_app(body), f'expected App at law body root, got {type(body).__name__}'
+    # Outer App's f is A(N(1), rhs), arg is the let body.
+    assert is_app(body.fun) and is_nat(body.fun.fun) and int(body.fun.fun) == 1, \
+        f'expected (1 rhs body) form at law root; got body.fun={body.fun!r}'
+
+
+def test_d8_nested_let_in_match_arm_lambda_lifts():
+    """A let inside a match-arm body MUST NOT emit `(1 rhs body)` —
+    Reaver rejects that form there.  The fix lambda-lifts; the result
+    runs to the expected value."""
+    src = '''
+let func : Nat → Nat → Nat
+  = λ x y → match x {
+      | 0 → let b = y in b
+      | _ → x
+    }
+'''
+    # f 0 7 = let b = 7 in b = 7
+    fn = eval_val(src, 'func')
+    from dev.harness.plan import apply
+    assert evaluate(apply(apply(fn, N(0)), N(7))) == 7
+    # f 5 7 = 5 (wildcard arm)
+    assert evaluate(apply(apply(fn, N(5)), N(7))) == 5
+
+
+def test_d8_nested_let_captures_outer_param():
+    """The lifted sub-law captures outer-lambda parameters needed by
+    the body.  Mirrors the calc REPL's `let b = bytes_at … in match b
+    { … }` shape that drove discovery of D8."""
+    src = '''
+let func : Nat → Nat → Nat
+  = λ x y → match x {
+      | 0 → let b = y in match b {
+              | 0 → x
+              | _ → b
+            }
+      | _ → x
+    }
+'''
+    fn = eval_val(src, 'func')
+    from dev.harness.plan import apply
+    # f 0 0 = let b = 0 in match 0 { 0 → x = 0 } → 0
+    assert evaluate(apply(apply(fn, N(0)), N(0))) == 0
+    # f 0 5 = let b = 5 in match 5 { _ → b = 5 } → 5
+    assert evaluate(apply(apply(fn, N(0)), N(5))) == 5
+    # f 9 5 = wildcard → x = 9
+    assert evaluate(apply(apply(fn, N(9)), N(5))) == 9
+
+
+def test_d8_nested_let_with_self_ref():
+    """The lifted sub-law's body must reference the enclosing law's
+    self-ref to recurse correctly.  Use match's predecessor binding
+    `k = n - 1` so the function terminates, ensuring the self-ref
+    path actually fires (not just the base case)."""
+    src = '''
+let count_down : Nat → Nat
+  = λ n → match n {
+      | 0 → 0
+      | k → let prev = k in count_down prev
+    }
+'''
+    # count_down 5 recurses 5 times via the self-ref captured into the
+    # nested-let's lifted sub-law, then returns 0 from the base case.
+    # If self-ref capture is broken, this either loops forever or
+    # raises CodegenError at compile time.
+    fn = eval_val(src, 'count_down')
+    from dev.harness.plan import apply
+    assert evaluate(apply(fn, N(0))) == 0
+    assert evaluate(apply(fn, N(5))) == 0
+    assert evaluate(apply(fn, N(20))) == 0
+
+
+def test_d8_nested_let_inside_nested_lambda():
+    """When a nested lambda is lambda-lifted into a sub-law, that
+    sub-law's body is itself top-of-law.  A nested let inside the
+    nested lambda must use the native `(1 rhs body)` form there
+    (because it's at the sub-law's body root), not lambda-lift again.
+
+    Pin: `_compile_lam_lifted` sets `lifted_env.top_of_law = True`."""
+    src = '''
+let outer : Nat → Nat
+  = λ x → let helper = λ y → let z = y in z in helper x
+'''
+    fn = eval_val(src, 'outer')
+    from dev.harness.plan import apply
+    assert evaluate(apply(fn, N(7))) == 7
+    assert evaluate(apply(fn, N(0))) == 0
+
+
+def test_d8_repro_fixture_runs():
+    """The 14-line reproducer from `tests/reaver/fixtures/-
+    repro_d8_let_in_arm.gls` (the source that surfaced D8 during
+    Phase G #2 pre-flight) now compiles cleanly and produces the
+    correct value via the harness evaluator."""
+    fixture = os.path.join(os.path.dirname(__file__), '..',
+                           'reaver', 'fixtures', 'repro_d8_let_in_arm.gls')
+    with open(fixture) as f:
+        src = f.read()
+    # `main = go 5 10`; go x y at x≠0 takes the wildcard arm → y;
+    # at x=0 takes `let b = add x y in add b 1` = (0 + 10) + 1 = 11.
+    # The fixture's main calls go 5 10 → 10 (wildcard).
+    # NOTE: the fixture currently uses Reaver.BPLAN ops which the
+    # Python harness doesn't evaluate, so this test only asserts that
+    # codegen succeeds, not the runtime value.  The differential test
+    # in `tests/reaver/test_differential.py::test_d8_nested_let_in_match_arm`
+    # exercises a parallel-shape program through the actual runtime.
+    compiled = pipeline(src, 'Main')
+    assert 'Main.go' in compiled
+    assert 'Main.main' in compiled
+    assert is_law(compiled['Main.go'])
+
+
+def test_d8_nested_let_chain_in_arm():
+    """A chain of nested lets inside an arm body each lambda-lifts.
+    The let chain becomes a stack of sub-laws."""
+    src = '''
+let func : Nat → Nat
+  = λ x → match x {
+      | 0 → let a = 10 in let b = 20 in let c = 30 in a
+      | _ → x
+    }
+'''
+    fn = eval_val(src, 'func')
+    from dev.harness.plan import apply
+    assert evaluate(apply(fn, N(0))) == 10
+    assert evaluate(apply(fn, N(99))) == 99
+
+
+def test_d8_top_level_let_chain_uses_native_form():
+    """A chain of lets at the law body's root all use `(1 rhs body)`,
+    not lambda-lifting.  The body of each top-let is itself top-of-law."""
+    src = '''
+let func : Nat → Nat
+  = λ x →
+      let aaa = x in
+      let bbb = aaa in
+      bbb
+'''
+    v = val_of(src, 'func')
+    assert is_law(v)
+    body = v.body
+    # Outer: (1 rhs1 inner)
+    assert is_app(body) and is_app(body.fun) and is_nat(body.fun.fun) and int(body.fun.fun) == 1
+    inner = body.arg
+    # Inner: (1 rhs2 final)
+    assert is_app(inner) and is_app(inner.fun) and is_nat(inner.fun.fun) and int(inner.fun.fun) == 1
+
+
+def test_d8_nested_let_does_not_emit_one_form():
+    """Structural assertion: a nested let in a match arm emits an App
+    of a Pin'd Law, not the (1 ...) form."""
+    src = '''
+let func : Nat → Nat
+  = λ x → match x {
+      | 0 → let a = 100 in a
+      | _ → x
+    }
+'''
+    v = val_of(src, 'func')
+    # Walk the law body to find any (1 rhs body) form. There must be none.
+    def has_one_form(v) -> bool:
+        from dev.harness.plan import is_app, is_nat
+        if is_app(v):
+            if is_app(v.fun) and is_nat(v.fun.fun) and int(v.fun.fun) == 1:
+                return True
+            return has_one_form(v.fun) or has_one_form(v.arg)
+        return False
+    assert is_law(v)
+    assert not has_one_form(v.body), \
+        f'nested let in arm body must not emit (1 rhs body); body = {v.body!r}'
+
+
+# ---------------------------------------------------------------------------
 # F11 (D from feedback follow-ups): nullary + unary + binary mix
 #
 # `_build_tag_chain` had a bug in its multi-arm branch where
