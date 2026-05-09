@@ -47,7 +47,7 @@ import unittest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 
 from dev.harness.plan import A, P, L, N, is_nat, is_app, is_pin, is_law, evaluate
-from dev.harness.bplan import bevaluate
+from dev.harness.eval import bevaluate
 
 MODULE = 'Compiler'
 SRC_PATH = os.path.join(os.path.dirname(__file__), '..', '..',
@@ -78,7 +78,7 @@ def compile_module_bplan():
     global _COMPILED_BPLAN
     if _COMPILED_BPLAN is not None:
         return _COMPILED_BPLAN
-    from dev.harness.bplan import register_jets
+    from dev.harness.eval import register_jets
     compiled = compile_module()
     register_jets(compiled)
     _COMPILED_BPLAN = compiled
@@ -130,7 +130,14 @@ def plan2pv(val, bc, cache=None):
 
     Cycles are impossible in a PLAN DAG; the cache avoids redundant work
     for shared sub-values.
+
+    Each constructor call is forced to WHNF immediately so that sub-terms
+    are fully reduced before being passed to parent constructors. Without
+    this, WHNF-only backends (Marduk) leave inner applications unreduced
+    — e.g. App(PNat_law, 3) instead of App(Nat(0), 3) — producing wrong
+    ADT structure when the parent constructor builds its result.
     """
+    from dev.harness.eval import bevaluate as _bev
     if cache is None:
         cache = {}
     key = id(val)
@@ -138,19 +145,19 @@ def plan2pv(val, bc, cache=None):
         return cache[key]
 
     if is_nat(val):
-        r = A(bc['Compiler.PNat'], val)
+        r = _bev(A(bc['Compiler.PNat'], val))
     elif is_app(val):
-        r = A(A(bc['Compiler.PApp'],
-               plan2pv(val.fun, bc, cache)),
-              plan2pv(val.arg, bc, cache))
+        r = _bev(A(A(bc['Compiler.PApp'],
+               plan2pv(val.head, bc, cache)),
+              plan2pv(val.tail, bc, cache)))
     elif is_pin(val):
-        r = A(bc['Compiler.PPin'], plan2pv(val.val, bc, cache))
+        r = _bev(A(bc['Compiler.PPin'], plan2pv(val.item, bc, cache)))
     elif is_law(val):
         body_pv = plan2pv(val.body, bc, cache)
-        pair = A(A(bc['Compiler.MkPair'], val.arity), body_pv)
-        r = A(A(bc['Compiler.PLaw'], val.name), pair)
+        pair = _bev(A(A(bc['Compiler.MkPair'], val.arity), body_pv))
+        r = _bev(A(A(bc['Compiler.PLaw'], val.name), pair))
     else:
-        r = A(bc['Compiler.PNat'], 0)
+        r = _bev(A(bc['Compiler.PNat'], 0))
 
     cache[key] = r
     return r
@@ -168,14 +175,17 @@ def gls_bytes_decode(ev):
     content_nat is the little-endian encoding of the byte sequence.
     Returns None if ev is not a valid Bytes value.
     """
-    if (is_app(ev) and is_app(ev.fun)
-            and is_nat(ev.fun.fun) and ev.fun.fun == 0):
-        length = ev.fun.arg
-        content = ev.arg
+    from dev.harness.plan import nat as _get_nat
+    if (is_app(ev) and is_app(ev.head)
+            and is_nat(ev.head.head) and ev.head.head == 0):
+        length = ev.head.tail
+        content = ev.tail
         if is_nat(length) and is_nat(content):
-            if length == 0:
+            length_int = _get_nat(length)
+            content_int = _get_nat(content)
+            if length_int == 0:
                 return b''
-            return content.to_bytes(length, 'little')
+            return content_int.to_bytes(length_int, 'little')
     return None
 
 

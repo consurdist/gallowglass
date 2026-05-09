@@ -60,7 +60,7 @@ def eval_plan(val, *args):
     old_limit = sys.getrecursionlimit()
     sys.setrecursionlimit(max(old_limit, 50000))
     try:
-        from dev.harness.bplan import bevaluate
+        from dev.harness.eval import bevaluate
         result = val
         for arg in args:
             result = A(result, arg)
@@ -261,14 +261,14 @@ class TestListOps(unittest.TestCase):
 
     def _list_to_py(self, val):
         """Convert a PLAN list to a Python list of nats."""
-        from dev.harness.plan import evaluate
+        from dev.harness.eval import bevaluate
         result = []
-        current = evaluate(val)
+        current = bevaluate(val)
         while is_app(current):
             # Cons x rest = A(A(1, x), rest)
-            if is_app(current.fun):
-                result.append(current.fun.arg)
-                current = evaluate(current.arg)
+            if is_app(current.head):
+                result.append(current.head.tail)
+                current = bevaluate(current.tail)
             else:
                 break
         return result
@@ -327,7 +327,7 @@ class TestAssocList(unittest.TestCase):
         result = eval_plan(self._get('assoc_lookup'), 2, alist)
         # Should be Some(20) = A(1, 20)
         self.assertTrue(is_app(result))
-        self.assertEqual(result.arg, 20)
+        self.assertEqual(result.tail, 20)
 
     def test_assoc_lookup_not_found(self):
         alist = self._make_assoc((1, 10), (2, 20))
@@ -353,9 +353,10 @@ class TestByteOps(unittest.TestCase):
 
     def _make_bytes(self, bs):
         """Build a Bytes pair from a Python bytes object."""
+        from dev.harness.eval import bevaluate
         mk_pair = self.compiled['Compiler.MkPair']
         content = int.from_bytes(bs, 'little') if bs else 0
-        return A(A(mk_pair, len(bs)), content)
+        return bevaluate(A(A(mk_pair, len(bs)), content))
 
     def test_byte_at(self):
         # content nat for bytes [0x48, 0x65, 0x6C] = 0x6C6548.
@@ -400,11 +401,12 @@ class TestByteOps(unittest.TestCase):
         a = self._make_bytes(b'He')
         b = self._make_bytes(b'lo')
         result = eval_plan(self._get('bytes_concat'), a, b)
-        from dev.harness.bplan import bevaluate
+        from dev.harness.eval import bevaluate
         result = bevaluate(result)
-        if is_app(result) and is_app(result.fun):
-            self.assertEqual(result.fun.arg, 4)
-            self.assertEqual(result.arg, int.from_bytes(b'Helo', 'little'))
+        if is_app(result) and is_app(result.head):
+            from dev.harness.eval import bevaluate as _bev
+            self.assertEqual(_bev(result.head.tail), 4)
+            self.assertEqual(_bev(result.tail), int.from_bytes(b'Helo', 'little'))
         else:
             self.fail(f'bytes_concat did not produce MkPair: {result}')
 

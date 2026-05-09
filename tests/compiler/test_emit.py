@@ -69,7 +69,7 @@ def compile_module_bplan():
     global _COMPILED_BPLAN
     if _COMPILED_BPLAN is not None:
         return _COMPILED_BPLAN
-    from dev.harness.bplan import register_jets
+    from dev.harness.eval import register_jets
     compiled = compile_module()  # jets work by object identity; reuse same dict
     register_jets(compiled)
     _COMPILED_BPLAN = compiled
@@ -105,7 +105,7 @@ def eval_plan(val, *args):
 
 def eval_bplan(val, *args):
     """Evaluate using BPLAN harness (arithmetic jets active)."""
-    from dev.harness.bplan import bevaluate
+    from dev.harness.eval import bevaluate
     old = sys.getrecursionlimit()
     sys.setrecursionlimit(max(old, 100000))
     try:
@@ -121,10 +121,12 @@ def check_bytes(compiled, result, expected_str):
     """
     Assert that a PLAN Bytes value (MkPair len content) encodes expected_str.
     Uses bytes_length and bytes_content — both O(1) field extractions.
+    Uses eval_bplan so that Marduk-backend results (Marduk Vals) are handled
+    correctly; eval_plan uses the legacy evaluator which can't process Marduk Vals.
     """
     expected = expected_str.encode('utf-8')
-    length = eval_plan(compiled['Compiler.bytes_length'], result)
-    content = eval_plan(compiled['Compiler.bytes_content'], result)
+    length = eval_bplan(compiled['Compiler.bytes_length'], result)
+    content = eval_bplan(compiled['Compiler.bytes_content'], result)
     assert length == len(expected), \
         f'Length mismatch: got {length}, expected {len(expected)} for {expected_str!r}'
     if expected:

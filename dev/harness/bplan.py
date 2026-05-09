@@ -25,7 +25,7 @@ just faster.  M8.8 self-hosting validation is the definitive correctness gate.
 """
 
 from dev.harness.plan import A, L, P, N, is_nat, is_pin, is_law, is_app
-from dev.harness.plan import arity as _plan_arity
+from dev.harness.plan import arity as _plan_arity, nat as _get_nat
 
 
 # ---------------------------------------------------------------------------
@@ -213,12 +213,31 @@ def _bop(opcode, e):
     # land here already forced; for the BPLAN path, evaluate the inner
     # App once more via the BPLAN evaluator to thread jets through any
     # nested PLAN-recursive computations the BPLAN op might inspect.
-    from dev.harness.plan import _BPLAN_OPCODE, _RPLAN_OPCODE, _bplan_op, _rplan_stub, _unapp
+    from dev.harness.plan import _BPLAN_OPCODE, _RPLAN_OPCODE, _bplan_op, _rplan_stub, _unapp, nat_str
     if opcode == _BPLAN_OPCODE:
         # The single arg is the App ("Name" arg1 ... argN).  bevaluate
         # forces it; unapp flattens to [name, args...] for dispatch.
         inner = bevaluate(e[0])
-        return _bplan_op(_unapp(inner))
+        parts = _unapp(inner)
+        # Route Pin / Law / Elim through bplan's jet-aware constructors
+        # rather than plan.py's evaluate-based equivalents. The named
+        # alternatives are how codegen now emits these (Pin/Law/Elim
+        # direct-opcode <0>/<1>/<2> dispatch is no longer used per the
+        # ABI alignment with marduk); without this routing, recursive
+        # match scrutinees would force via plan.evaluate (no jets) and
+        # blow the PLAN recursion limit on arithmetic-heavy code.
+        if parts and is_nat(parts[0]):
+            name = nat_str(parts[0])
+            args = parts[1:]
+            if name == 'Elim' and len(args) == 6:
+                return _bmatch(args[0], args[1], args[2],
+                               args[3], args[4], args[5])
+            if name == 'Law' and len(args) == 3:
+                a, n, b = args
+                return L(a if is_nat(a) else 0, n, b)
+            if name == 'Pin' and len(args) == 1:
+                return P(args[0])
+        return _bplan_op(parts)
     if opcode == _RPLAN_OPCODE:
         return _rplan_stub(_unapp(e[0]))
     raise ValueError(f'_bop: unknown opcode {opcode}')
@@ -288,17 +307,17 @@ def _sat_sub(m, n):
 
 def _pair_len(v):
     """Extract len field from MkPair len content = A(A(0, len), content)."""
-    if isinstance(v, A) and isinstance(v.fun, A) and is_nat(v.fun.fun) and v.fun.fun == 0:
-        ln = v.fun.arg
-        return ln if is_nat(ln) else 0
+    if is_app(v) and is_app(v.head) and is_nat(v.head.head) and _get_nat(v.head.head) == 0:
+        ln = v.head.tail
+        return _get_nat(ln) if is_nat(ln) else 0
     return 0
 
 
 def _pair_content(v):
     """Extract content field from MkPair len content."""
-    if isinstance(v, A) and isinstance(v.fun, A) and is_nat(v.fun.fun) and v.fun.fun == 0:
-        c = v.arg
-        return c if is_nat(c) else 0
+    if is_app(v) and is_app(v.head) and is_nat(v.head.head) and _get_nat(v.head.head) == 0:
+        c = v.tail
+        return _get_nat(c) if is_nat(c) else 0
     return 0
 
 
@@ -333,18 +352,18 @@ def _bytes_concat(a, b):
 # ---------------------------------------------------------------------------
 
 def _is_pnat(v):
-    return is_app(v) and is_nat(v.fun) and v.fun == 0
+    return is_app(v) and is_nat(v.head) and v.head == 0
 
 def _is_papp(v):
-    return (is_app(v) and is_app(v.fun)
-            and is_nat(v.fun.fun) and v.fun.fun == 1)
+    return (is_app(v) and is_app(v.head)
+            and is_nat(v.head.head) and v.head.head == 1)
 
 def _is_plaw(v):
-    return (is_app(v) and is_app(v.fun)
-            and is_nat(v.fun.fun) and v.fun.fun == 2)
+    return (is_app(v) and is_app(v.head)
+            and is_nat(v.head.head) and v.head.head == 2)
 
 def _is_ppin(v):
-    return is_app(v) and is_nat(v.fun) and v.fun == 3
+    return is_app(v) and is_nat(v.head) and v.head == 3
 
 
 def _emit_debruijn_ref(i):
@@ -360,29 +379,29 @@ def _emit_law_sig(arity):
 def _emit_body_val(pval, depth, ep):
     """Body-context emitter: mirrors emit_bval_dispatch / emit_body_val."""
     if _is_pnat(pval):
-        return _emit_debruijn_ref(pval.arg)
+        return _emit_debruijn_ref(pval.tail)
     if _is_ppin(pval):
-        return f'(#pin {ep(pval.arg)})'
+        return f'(#pin {ep(pval.tail)})'
     if _is_plaw(pval):
         return ep(pval)
     if _is_papp(pval):
-        f = pval.fun.arg   # inner of A(A(1,f), x)
-        x = pval.arg
+        f = pval.head.tail   # inner of A(A(1,f), x)
+        x = pval.tail
         # dispatch on f structure
         if _is_pnat(f):
-            opcode = f.arg
+            opcode = f.tail
             if opcode == 0:
                 # PApp(PNat 0)(PNat k) → quoted nat; else generic app
                 if _is_pnat(x):
-                    return str(x.arg)
+                    return str(x.tail)
                 return f'({_emit_body_val(f, depth, ep)} {_emit_body_val(x, depth, ep)})'
             else:
                 return f'({_emit_body_val(f, depth, ep)} {_emit_body_val(x, depth, ep)})'
         if _is_papp(f):
-            f_fun = f.fun.arg   # inner of A(A(1, f_fun), f_x)
+            f_fun = f.head.tail   # inner of A(A(1, f_fun), f_x)
             if _is_pnat(f_fun):
-                opcode = f_fun.arg
-                x2 = f.arg
+                opcode = f_fun.tail
+                x2 = f.tail
                 if opcode == 0:
                     return f'({_emit_body_val(x2, depth, ep)} {_emit_body_val(x, depth, ep)})'
                 if opcode == 1:
@@ -398,18 +417,18 @@ def _emit_body_val(pval, depth, ep):
 def _emit_pval(pval):
     """Top-level emitter: mirrors emit_pval / emit_pval_dispatch."""
     if _is_pnat(pval):
-        return str(pval.arg)
+        return str(pval.tail)
     if _is_ppin(pval):
-        return f'(#pin {_emit_pval(pval.arg)})'
+        return f'(#pin {_emit_pval(pval.tail)})'
     if _is_papp(pval):
-        f = pval.fun.arg
-        x = pval.arg
+        f = pval.head.tail
+        x = pval.tail
         return f'({_emit_pval(f)} {_emit_pval(x)})'
     if _is_plaw(pval):
-        name = pval.fun.arg
-        pair = pval.arg     # A(A(0, arity), body_pv)
-        arity = pair.fun.arg
-        body_pv = pair.arg
+        name = pval.head.tail
+        pair = pval.tail     # A(A(0, arity), body_pv)
+        arity = _get_nat(pair.head.tail)
+        body_pv = pair.tail
         sig = _emit_law_sig(arity)
         body_asm = _emit_body_val(body_pv, arity, _emit_pval)
         return f'(#law "{name}" {sig}\n  {body_asm})'
@@ -451,10 +470,10 @@ def _gls_list_to_pairs(lst):
     node = lst
     while is_app(node):
         # Cons = A(A(N(1), element), rest)
-        pair = node.fun.arg    # A(A(N(0), name_nat), pval)
-        rest = node.arg
-        name_nat = pair.fun.arg
-        pval = pair.arg
+        pair = node.head.tail    # A(A(N(0), name_nat), pval)
+        rest = node.tail
+        name_nat = pair.head.tail
+        pval = pair.tail
         pairs.append((name_nat, pval))
         node = rest
     return pairs
@@ -479,9 +498,9 @@ def _emit_program_jet(lst):
     for name_nat, pval in pairs:
         bind_gls = _emit_bind_jet(name_nat, pval)
         # bind_gls = A(A(N(0), length), content_nat) — GLS Bytes
-        length = bind_gls.fun.arg
+        length = bind_gls.head.tail
         if length > 0:
-            parts.append(bind_gls.arg.to_bytes(length, 'little'))
+            parts.append(bind_gls.tail.to_bytes(length, 'little'))
     raw = b''.join(parts)
     if not raw:
         return A(A(0, 0), 0)
@@ -602,8 +621,8 @@ def _list_is_nil(v):
     return is_nat(v) and v == 0
 
 def _list_is_cons(v):
-    return (is_app(v) and is_app(v.fun)
-            and is_nat(v.fun.fun) and v.fun.fun == 1)
+    return (is_app(v) and is_app(v.head)
+            and is_nat(v.head.head) and v.head.head == 1)
 
 
 def _list_to_pylist(v):
@@ -619,8 +638,8 @@ def _list_to_pylist(v):
             # Not a recognized List node — bail out.  Fall back to user
             # interpretation (jet returns whatever it has so far).
             raise ValueError(f'List jet: not a List spine node {node!r}')
-        head = node.fun.arg
-        tail = node.arg
+        head = node.head.tail
+        tail = node.tail
         out.append(head)
         node = bevaluate(tail)
     return out
