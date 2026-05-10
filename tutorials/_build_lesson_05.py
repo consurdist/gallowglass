@@ -235,10 +235,115 @@ Assumes `02-typeclasses.ipynb` — constrained wrappers, instance syntax.'''),
     ('code', 'as_text (mul_iv base_iv base_iv)'),
     ('code', 'width_iv (mul_iv base_iv base_iv)'),
 
+    ('md', '## Fixed-point display\n\n'
+           'The `Show` instance above renders raw `Nat` values. If your '
+           'intervals represent measurements with two decimal places — `110` '
+           'meaning `1.10`, `90` meaning `0.90` — you want the display to '
+           'reflect that.\n\n'
+           'The key idea: a single `scale` constant at the top of the notebook '
+           'parameterises the renderer. Change `scale` from `100` to `1000` '
+           'and you get three decimal places everywhere, with no other edits.'),
+
+    ('code', 'use Core.Nat unqualified { nat_lt, div_nat, mod_nat }'),
+
+    ('md', '`scale` is the notebook-level fixed-point denominator. '
+           '`100` gives two decimal places:'),
+    ('code', 'let scale : Nat = 100'),
+
+    ('md', 'Three helper functions feed `show_fixed`.\n\n'
+           '`count_digits n` — number of decimal digits in `n` '
+           '(0 counts as 1):'),
+    ('code', 'let count_digits : Nat → Nat\n'
+             '  = λ nn →\n'
+             '      if nat_lt nn 10\n'
+             '      then 1\n'
+             '      else add 1 (count_digits (div_nat nn 10))'),
+
+    ('md', '`frac_digits sc` — decimal places implied by scale `sc`. '
+           'For `sc = 100`: `count_digits 100 = 3`, minus 1 = 2 places:'),
+    ('code', 'let frac_digits : Nat → Nat\n'
+             '  = λ sc → sub (count_digits sc) 1'),
+
+    ('md', '`zeros n` — a `Text` of `n` zero characters, used to '
+           'left-pad the fractional part:'),
+    ('code', 'let zeros : Nat → Text\n'
+             '  = λ nn → match nn {\n'
+             '      | 0  → ""\n'
+             '      | kk → text_concat "0" (zeros kk)\n'
+             '    }'),
+
+    ('md', '`show_fixed sc nn` renders `nn` as a decimal with the number '
+           'of places implied by `sc`. The padding count is '
+           '`frac_digits sc − count_digits frac`, saturating to 0:'),
+    ('code', 'let show_fixed : Nat → Nat → Text\n'
+             '  = λ sc nn →\n'
+             '      let whole = div_nat nn sc in\n'
+             '      let frac  = mod_nat nn sc in\n'
+             '      let pad   = sub (frac_digits sc) (count_digits frac) in\n'
+             '      text_concat (show_nat whole)\n'
+             '        (text_concat "."\n'
+             '          (text_concat (zeros pad) (show_nat frac)))'),
+
+    ('md', 'With `scale = 100`, `90` renders as `"0.90"` and `110` as `"1.10"`:'),
+    ('code', 'show_fixed scale 90'),
+    ('code', 'show_fixed scale 110'),
+    ('code', 'show_fixed scale 5'),
+
+    ('md', 'Partially apply `show_fixed` to pin the scale — the result is '
+           'an ordinary `Nat → Text` function:'),
+    ('code', 'let show_fp : Nat → Text = show_fixed scale'),
+    ('code', 'show_fp 90'),
+    ('code', 'show_fp 110'),
+
+    ('md', '## `[lo, hi]` and `mid ± rad` in fixed-point\n\n'
+           'Both display formats are parameterised by scale the same way:'),
+    ('code', 'let show_iv_bounds : Nat → Interval → Text\n'
+             '  = λ sc ii → match ii {\n'
+             '      | MkInterval ll hh →\n'
+             '          text_concat "["\n'
+             '            (text_concat (show_fixed sc ll)\n'
+             '              (text_concat ", "\n'
+             '                (text_concat (show_fixed sc hh) "]")))\n'
+             '    }'),
+    ('code', 'let bounds_fp : Interval → Text = show_iv_bounds scale'),
+    ('code', 'bounds_fp (MkInterval 90 110)'),
+
+    ('code', 'let show_iv_pm : Nat → Interval → Text\n'
+             '  = λ sc ii → match ii {\n'
+             '      | MkInterval ll hh →\n'
+             '          let mid = div_nat (add ll hh) 2 in\n'
+             '          let rad = div_nat (sub hh ll) 2 in\n'
+             '          text_concat (show_fixed sc mid)\n'
+             '            (text_concat " +- " (show_fixed sc rad))\n'
+             '    }'),
+    ('code', 'let pm_fp : Interval → Text = show_iv_pm scale'),
+    ('code', 'pm_fp (MkInterval 90 110)'),
+    ('code', 'pm_fp (MkInterval 95 115)'),
+
+    ('md', '## Application: resistances in a circuit\n\n'
+           'Two resistors with manufacturing tolerance, measured in hundredths '
+           'of an ohm. R₁ ∈ [1.30, 1.47] Ω, R₂ ∈ [2.20, 2.35] Ω — '
+           'represented at scale 100 as:'),
+    ('code', 'let r1 : Interval = MkInterval 130 147\n'
+             'let r2 : Interval = MkInterval 220 235'),
+
+    ('md', 'Series resistance R₁ + R₂, displayed both ways:'),
+    ('code', 'bounds_fp (add_iv r1 r2)'),
+    ('code', 'pm_fp (add_iv r1 r2)'),
+
+    ('md', 'The `mid ± rad` form uses integer division, so results with odd '
+           'total width round down. `[3.50, 3.82]` has width 32 (even), '
+           'midpoint exactly 3.66, radius exactly 0.16 — no rounding here. '
+           'An odd-width interval like `[3.50, 3.83]` would give '
+           '`3.66 ± 0.16` (true midpoint 3.665, truncated).'),
+
     ('md', '## What\'s next\n\n'
            'You\'ve built a typeclass from scratch — type, functions, Show '
            'instance, class declaration, instance binding, constrained '
-           'wrappers, and applications.\n\n'
+           'wrappers, fixed-point display, and applications.\n\n'
+           '- **Change `scale`** — swap `100` for `1000` at the top and '
+           're-run; `show_fp`, `bounds_fp`, and `pm_fp` all adapt with no '
+           'other edits.\n'
            '- **Subtraction** — `[la, ha] − [lb, hb] = [la−hb, ha−lb]` with '
            'saturating-sub guarding the lower bound; add `iv_sub` as a method '
            'to `IvArith` and implement it for `Interval`.\n'
