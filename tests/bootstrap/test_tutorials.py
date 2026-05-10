@@ -123,5 +123,10 @@ class TestLesson04EffectsAndHandlers(_TutorialNotebookTestMixin, unittest.TestCa
     BUILD = '_build_lesson_04.py'
 
 
+class TestLesson05IntervalArithmetic(_TutorialNotebookTestMixin, unittest.TestCase):
+    NOTEBOOK = '05-interval-arithmetic.ipynb'
+    BUILD = '_build_lesson_05.py'
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -28,6 +28,7 @@ local kernel.
 | `02-typeclasses.ipynb`              | `Eq`, `Ord`, `Show`; constrained wrappers for class-method dispatch; defining your own instances.    |
 | `03-glass-ir.ipynb`                 | The typed intermediate representation, pin hashes, content addressing.                               |
 | `04-effects-and-handlers.ipynb`     | Effect rows, the `eff` declaration, `handle` shape, the `External` and `Abort` invariants.           |
+| `05-interval-arithmetic.ipynb`      | Typeclass from scratch: `Interval` type, `IvArith` class, instance, constrained wrappers, applications. |
 
 The lessons are sequential — each one assumes the previous.
 
