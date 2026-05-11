@@ -32,6 +32,7 @@ dependencies = [
 
 [project.scripts]
 gallowglass-kernel = "gallowglass_kernel._cli:main"
+gallowglass = "bootstrap.repl:main"
 
 [project.urls]
 Homepage = "https://github.com/sigilante/gallowglass"
