@@ -176,13 +176,67 @@ included verbatim in an LLM's context window.
 
 ### MCP server
 
-For LLM-driven workflows, an MCP (Model Context Protocol) server exposes four tools — `compile_snippet`, `infer_type`, `explain_effect_row`, `render_fragment` — over stdio:
+For LLM-driven workflows, an MCP (Model Context Protocol) server exposes six tools over stdio:
+
+| Tool | Purpose |
+|---|---|
+| `compile_snippet` | Compile a source snippet, return IR and pin table |
+| `infer_type` | Infer the type of a name or expression |
+| `explain_effect_row` | Explain an effect row in prose |
+| `render_fragment` | Render a Glass IR fragment by FQ name |
+| `lookup_fragment` | Look up Glass IR for a specific name |
+| `get_context` | Bundle Glass IR for multiple names within a token budget |
 
 ```bash
 python3 -m bootstrap.mcp_server
 ```
 
 The server loads the Core prelude once at startup and threads it as priors into every per-call snippet build. See `bootstrap/mcp_server.py` for the protocol shape.
+
+## Running under Reaver
+
+`tools/run_reaver.py` compiles a `.gls` file via the Python bootstrap and hands the result to Reaver's `plan-assembler` CLI. Requires `vendor/reaver/` (run `tools/vendor.sh`) and `nix` or `cabal` on `PATH`.
+
+**Discover what a file exports** (load-only — no `--fn`):
+
+```bash
+python3 tools/run_reaver.py demos/csv_table.gls CsvTable
+# OK — all bindings loaded.  'CsvTable' exports:
+#   list_nth
+#   max_nat
+#   table_get_field
+#   col_max
+#   row0  row1  row2
+#   table
+#   row_count_result
+#   col_count_result
+#   top_score_result
+#   get_field_result
+```
+
+**Inspect a pure value** (`--trace` embeds a `(Trace ...)` call; Reaver evaluates and prints):
+
+```bash
+python3 tools/run_reaver.py demos/csv_table.gls CsvTable --fn top_score_result --trace
+# 95
+```
+
+**Run an I/O entry point** (stdin/stdout wired through, for programs using `Reaver.RPLAN.input/output`):
+
+```bash
+echo 'let xx = 42' | \
+    python3 tools/run_reaver.py compiler/src/Compiler.gls Compiler \
+        --fn main_reaver --no-prelude
+```
+
+The `--no-prelude` flag skips loading the Core prelude — use it for self-contained files (like `Compiler.gls`) that define their own primitives via `external mod`. Omit it for files that `use Core.Nat`, `use Core.List`, etc.
+
+Via `make`:
+
+```bash
+make reaver-run SRC=demos/csv_table.gls MOD=CsvTable
+make reaver-run SRC=demos/csv_table.gls MOD=CsvTable FN=top_score_result REAVER_ARGS=--trace
+```
 
 ## Design principles
 

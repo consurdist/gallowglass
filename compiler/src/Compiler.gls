@@ -584,7 +584,7 @@ let is_alnum_or_under : Nat → Nat
       match (is_digit b) {
         | 0 →
             match (is_alpha b) {
-              | 0 → nat_eq b 95
+              | 0 → Reaver.BPLAN.eq b 95
               | k → 1
             }
         | k → 1
@@ -727,9 +727,9 @@ let lexpos_newline : Pair Nat (Pair Nat Nat) → Pair Nat (Pair Nat Nat)
 -- The newline itself is consumed.
 let lex_skip_line : Pair Nat Nat → LexPos → LexPos
   = λ src pos →
-      match (nat_eq (lexpos_offset pos) (bytes_length src)) {
+      match (Reaver.BPLAN.eq (lexpos_offset pos) (bytes_length src)) {
         | 0 →
-            match (nat_eq (bytes_at src (lexpos_offset pos)) 0x0A) {
+            match (Reaver.BPLAN.eq (bytes_at src (lexpos_offset pos)) 0x0A) {
               | 0 →
                   lex_skip_line src (lexpos_advance pos)
               | k → lexpos_advance pos
@@ -743,25 +743,25 @@ let lex_skip_line : Pair Nat Nat → LexPos → LexPos
 -- without mutual recursion.
 let lex_skip_ws : Pair Nat Nat → LexPos → LexPos
   = λ src pos →
-      match (nat_eq (lexpos_offset pos) (bytes_length src)) {
+      match (Reaver.BPLAN.eq (lexpos_offset pos) (bytes_length src)) {
         | 0 →
             let b = bytes_at src (lexpos_offset pos) in
-            match (nat_eq b 0x20) {
+            match (Reaver.BPLAN.eq b 0x20) {
               | 0 →
-                  match (nat_eq b 0x09) {
+                  match (Reaver.BPLAN.eq b 0x09) {
                     | 0 →
-                        match (nat_eq b 0x0D) {
+                        match (Reaver.BPLAN.eq b 0x0D) {
                           | 0 →
-                              match (nat_eq b 0x0A) {
+                              match (Reaver.BPLAN.eq b 0x0A) {
                                 | 0 →
                                     -- Check for "--" comment: b must be 0x2D '-'
-                                    match (nat_eq b 0x2D) {
+                                    match (Reaver.BPLAN.eq b 0x2D) {
                                       | 0 → pos
                                       | k →
                                           -- peek at next byte
-                                          match (nat_eq (Core.PLAN.inc (lexpos_offset pos)) (bytes_length src)) {
+                                          match (Reaver.BPLAN.eq (Core.PLAN.inc (lexpos_offset pos)) (bytes_length src)) {
                                             | 0 →
-                                                match (nat_eq (bytes_at src (Core.PLAN.inc (lexpos_offset pos))) 0x2D) {
+                                                match (Reaver.BPLAN.eq (bytes_at src (Core.PLAN.inc (lexpos_offset pos))) 0x2D) {
                                                   | 0 → pos
                                                   | k →
                                                       lex_skip_ws src (lex_skip_line src (lexpos_advance_n pos 2))
@@ -788,7 +788,7 @@ let lex_skip_ws : Pair Nat Nat → LexPos → LexPos
 -- Returns MkPair end_pos (MkPair byte_len ident_nat)
 let lex_scan_ident_go : Pair Nat Nat → LexPos → Nat → Nat → Pair LexPos (Pair Nat Nat)
   = λ src pos ident_len ident_nat →
-      match (nat_eq (lexpos_offset pos) (bytes_length src)) {
+      match (Reaver.BPLAN.eq (lexpos_offset pos) (bytes_length src)) {
         | 0 →
             match (is_alnum_or_under (bytes_at src (lexpos_offset pos))) {
               | 0 → MkPair pos (MkPair ident_len ident_nat)
@@ -805,47 +805,52 @@ let lex_scan_ident_go : Pair Nat Nat → LexPos → Nat → Nat → Pair LexPos 
 -- Keywords map to their token; leading uppercase → TkIdent (PascalCase);
 -- leading lowercase → TkIdent (snake_case) unless keyword.
 -- "_" alone → TkUnderscore.
+--
+-- Uses Reaver.BPLAN.eq (O(1) native integer comparison) instead of nat_eq
+-- (O(n) PLAN Nat iteration) for keyword dispatch.  Keyword constants like
+-- kw_let = 0x74656C = 7,628,140 would take >7M PLAN reductions per check
+-- under nat_eq; BPLAN.eq dispatches as a single Haskell integer comparison.
 let lex_classify_ident : Nat → Nat → Token
   = λ ident_len ident_nat →
-      match (nat_eq ident_nat kw_let) {
+      match (Reaver.BPLAN.eq ident_nat kw_let) {
         | 0 →
-            match (nat_eq ident_nat kw_type) {
+            match (Reaver.BPLAN.eq ident_nat kw_type) {
               | 0 →
-                  match (nat_eq ident_nat kw_match) {
+                  match (Reaver.BPLAN.eq ident_nat kw_match) {
                     | 0 →
-                        match (nat_eq ident_nat kw_if) {
+                        match (Reaver.BPLAN.eq ident_nat kw_if) {
                           | 0 →
-                              match (nat_eq ident_nat kw_then) {
+                              match (Reaver.BPLAN.eq ident_nat kw_then) {
                                 | 0 →
-                                    match (nat_eq ident_nat kw_else) {
+                                    match (Reaver.BPLAN.eq ident_nat kw_else) {
                                       | 0 →
-                                          match (nat_eq ident_nat kw_external) {
+                                          match (Reaver.BPLAN.eq ident_nat kw_external) {
                                             | 0 →
-                                                match (nat_eq ident_nat kw_mod) {
+                                                match (Reaver.BPLAN.eq ident_nat kw_mod) {
                                                   | 0 →
-                                                      match (nat_eq ident_nat kw_in) {
+                                                      match (Reaver.BPLAN.eq ident_nat kw_in) {
                                                         | 0 →
-                                                            match (nat_eq ident_nat kw_fn) {
+                                                            match (Reaver.BPLAN.eq ident_nat kw_fn) {
                                                               | 0 →
-                                                                  match (nat_eq ident_nat kw_forall_ascii) {
+                                                                  match (Reaver.BPLAN.eq ident_nat kw_forall_ascii) {
                                                                     | 0 →
-                                                                        match (nat_eq ident_nat kw_underscore) {
+                                                                        match (Reaver.BPLAN.eq ident_nat kw_underscore) {
                                                                           | 0 →
-                                                                              match (nat_eq ident_nat kw_fix) {
+                                                                              match (Reaver.BPLAN.eq ident_nat kw_fix) {
                                                                                 | 0 →
-                                                                                    match (nat_eq ident_nat kw_class) {
+                                                                                    match (Reaver.BPLAN.eq ident_nat kw_class) {
                                                                                       | 0 →
-                                                                                          match (nat_eq ident_nat kw_instance) {
+                                                                                          match (Reaver.BPLAN.eq ident_nat kw_instance) {
                                                                                             | 0 →
-                                                                                                match (nat_eq ident_nat kw_eff) {
+                                                                                                match (Reaver.BPLAN.eq ident_nat kw_eff) {
                                                                                                   | 0 →
-                                                                                                      match (nat_eq ident_nat kw_handle) {
+                                                                                                      match (Reaver.BPLAN.eq ident_nat kw_handle) {
                                                                                                         | 0 →
-                                                                                                            match (nat_eq ident_nat kw_pure) {
+                                                                                                            match (Reaver.BPLAN.eq ident_nat kw_pure) {
                                                                                                               | 0 →
-                                                                                                                  match (nat_eq ident_nat kw_run) {
+                                                                                                                  match (Reaver.BPLAN.eq ident_nat kw_run) {
                                                                                                                     | 0 →
-                                                                                                                        match (nat_eq ident_nat kw_use) {
+                                                                                                                        match (Reaver.BPLAN.eq ident_nat kw_use) {
                                                                                                                           | 0 → TkIdent ident_nat
                                                                                                                           | k → TkUse
                                                                                                                         }
@@ -896,7 +901,7 @@ let lex_classify_ident : Nat → Nat → Token
 -- Returns MkPair end_pos accumulated_value
 let lex_scan_nat_dec_go : Pair Nat Nat → LexPos → Nat → Pair LexPos Nat
   = λ src pos acc →
-      match (nat_eq (lexpos_offset pos) (bytes_length src)) {
+      match (Reaver.BPLAN.eq (lexpos_offset pos) (bytes_length src)) {
         | 0 →
             match (is_digit (bytes_at src (lexpos_offset pos))) {
               | 0 → MkPair pos acc
@@ -910,7 +915,7 @@ let lex_scan_nat_dec_go : Pair Nat Nat → LexPos → Nat → Pair LexPos Nat
 -- lex_scan_nat_hex_go: accumulate hex digits after "0x" prefix.
 let lex_scan_nat_hex_go : Pair Nat Nat → LexPos → Nat → Pair LexPos Nat
   = λ src pos acc →
-      match (nat_eq (lexpos_offset pos) (bytes_length src)) {
+      match (Reaver.BPLAN.eq (lexpos_offset pos) (bytes_length src)) {
         | 0 →
             match (is_hex_digit (bytes_at src (lexpos_offset pos))) {
               | 0 → MkPair pos acc
@@ -931,12 +936,12 @@ let lex_scan_nat_hex_go : Pair Nat Nat → LexPos → Nat → Pair LexPos Nat
 -- Caller must have already consumed the opening '"'.
 let lex_scan_text_go : Pair Nat Nat → LexPos → Nat → Nat → Pair LexPos (Pair Nat Nat)
   = λ src pos tlen tnat →
-      match (nat_eq (lexpos_offset pos) (bytes_length src)) {
+      match (Reaver.BPLAN.eq (lexpos_offset pos) (bytes_length src)) {
         | 0 →
-            match (nat_eq (bytes_at src (lexpos_offset pos)) 0x22) {   -- '"'
+            match (Reaver.BPLAN.eq (bytes_at src (lexpos_offset pos)) 0x22) {   -- '"'
               | 0 →
                   -- Check for backslash escape
-                  match (nat_eq (bytes_at src (lexpos_offset pos)) 0x5C) {  -- '\'
+                  match (Reaver.BPLAN.eq (bytes_at src (lexpos_offset pos)) 0x5C) {  -- '\'
                     | 0 →
                         let b = bytes_at src (lexpos_offset pos) in
                         lex_scan_text_go src (lexpos_advance pos)
@@ -944,7 +949,7 @@ let lex_scan_text_go : Pair Nat Nat → LexPos → Nat → Nat → Pair LexPos (
                           (bit_or tnat (shift_left b (mul 8 tlen)))
                     | k →
                         -- backslash: consume next byte literally
-                        match (nat_eq (Core.PLAN.inc (lexpos_offset pos)) (bytes_length src)) {
+                        match (Reaver.BPLAN.eq (Core.PLAN.inc (lexpos_offset pos)) (bytes_length src)) {
                           | 0 →
                               let b2 = bytes_at src (Core.PLAN.inc (lexpos_offset pos)) in
                               lex_scan_text_go src (lexpos_advance_n pos 2)
@@ -970,12 +975,12 @@ let lex_scan_text_go : Pair Nat Nat → LexPos → Nat → Nat → Pair LexPos (
 let find_close_brace : Pair Nat Nat → Nat → Nat → Nat
   = λ src offset depth →
       let b = bytes_at src offset in
-      match (nat_eq b 0x7B) {
+      match (Reaver.BPLAN.eq b 0x7B) {
         | 0 →
-            match (nat_eq b 0x7D) {
+            match (Reaver.BPLAN.eq b 0x7D) {
               | 0 → find_close_brace src (Core.PLAN.inc offset) depth
               | k →
-                  match (nat_eq depth 1) {
+                  match (Reaver.BPLAN.eq depth 1) {
                     | 0 → find_close_brace src (Core.PLAN.inc offset) (sub depth 1)
                     | k → offset
                   }
@@ -993,21 +998,21 @@ let find_close_brace : Pair Nat Nat → Nat → Nat → Nat
 -- Returns MkPair (List frag) end_pos.
 let lex_scan_interp_go : Pair Nat Nat → LexPos → Nat → Nat → List (Pair Nat Nat) → Pair (List (Pair Nat Nat)) LexPos
   = λ src pos tlen tnat frags →
-      match (nat_eq (lexpos_offset pos) (bytes_length src)) {
+      match (Reaver.BPLAN.eq (lexpos_offset pos) (bytes_length src)) {
         | 0 →
             let b = bytes_at src (lexpos_offset pos) in
-            match (nat_eq b 0x22) {
+            match (Reaver.BPLAN.eq b 0x22) {
               | 0 →
-                  match (nat_eq b 0x5C) {
+                  match (Reaver.BPLAN.eq b 0x5C) {
                     | 0 →
-                        match (nat_eq b 0x23) {
+                        match (Reaver.BPLAN.eq b 0x23) {
                           | 0 →
                               lex_scan_interp_go src (lexpos_advance pos)
                                 (Core.PLAN.inc tlen)
                                 (bit_or tnat (shift_left b (mul 8 tlen)))
                                 frags
                           | k →
-                              match (nat_eq (bytes_at src (Core.PLAN.inc (lexpos_offset pos))) 0x7B) {
+                              match (Reaver.BPLAN.eq (bytes_at src (Core.PLAN.inc (lexpos_offset pos))) 0x7B) {
                                 | 0 →
                                     lex_scan_interp_go src (lexpos_advance pos)
                                       (Core.PLAN.inc tlen)
@@ -1027,7 +1032,7 @@ let lex_scan_interp_go : Pair Nat Nat → LexPos → Nat → Nat → List (Pair 
                               }
                         }
                     | k →
-                        match (nat_eq (Core.PLAN.inc (lexpos_offset pos)) (bytes_length src)) {
+                        match (Reaver.BPLAN.eq (Core.PLAN.inc (lexpos_offset pos)) (bytes_length src)) {
                           | 0 →
                               let b2 = bytes_at src (Core.PLAN.inc (lexpos_offset pos)) in
                               lex_scan_interp_go src (lexpos_advance_n pos 2)
@@ -1051,14 +1056,14 @@ let lex_scan_interp_go : Pair Nat Nat → LexPos → Nat → Nat → List (Pair 
 -- has_interp: 1 if source bytes between start and end contain '#{'
 let has_interp : Pair Nat Nat → Nat → Nat → Nat
   = λ src start end_off →
-      match (nat_eq start end_off) {
+      match (Reaver.BPLAN.eq start end_off) {
         | 0 →
-            match (nat_eq (bytes_at src start) 0x23) {
+            match (Reaver.BPLAN.eq (bytes_at src start) 0x23) {
               | 0 → has_interp src (Core.PLAN.inc start) end_off
               | k →
-                  match (nat_eq (Core.PLAN.inc start) end_off) {
+                  match (Reaver.BPLAN.eq (Core.PLAN.inc start) end_off) {
                     | 0 →
-                        match (nat_eq (bytes_at src (Core.PLAN.inc start)) 0x7B) {
+                        match (Reaver.BPLAN.eq (bytes_at src (Core.PLAN.inc start)) 0x7B) {
                           | 0 → has_interp src (Core.PLAN.inc start) end_off
                           | k → 1
                         }
@@ -1086,42 +1091,42 @@ let lex_one : Pair Nat Nat → LexPos → Pair Token LexPos
             -- Identifiers / keywords
             match (is_alpha b) {
               | 0 →
-                  match (nat_eq b 0x5F) {           -- '_'
+                  match (Reaver.BPLAN.eq b 0x5F) {           -- '_'
                     | 0 →
                         -- Punctuation and operators
-                        match (nat_eq b 0x28) {           -- '('
+                        match (Reaver.BPLAN.eq b 0x28) {           -- '('
                           | 0 →
-                              match (nat_eq b 0x29) {     -- ')'
+                              match (Reaver.BPLAN.eq b 0x29) {     -- ')'
                                 | 0 →
-                                    match (nat_eq b 0x5B) {   -- '['
+                                    match (Reaver.BPLAN.eq b 0x5B) {   -- '['
                                       | 0 →
-                                          match (nat_eq b 0x5D) {   -- ']'
+                                          match (Reaver.BPLAN.eq b 0x5D) {   -- ']'
                                             | 0 →
-                                                match (nat_eq b 0x7B) {   -- '{'
+                                                match (Reaver.BPLAN.eq b 0x7B) {   -- '{'
                                       | 0 →
-                                          match (nat_eq b 0x7D) {   -- '}'
+                                          match (Reaver.BPLAN.eq b 0x7D) {   -- '}'
                                             | 0 →
-                                                match (nat_eq b 0x7C) {   -- '|'
+                                                match (Reaver.BPLAN.eq b 0x7C) {   -- '|'
                                                   | 0 →
-                                                      match (nat_eq b 0x3D) {   -- '='
+                                                      match (Reaver.BPLAN.eq b 0x3D) {   -- '='
                                                         | 0 →
-                                                            match (nat_eq b 0x3A) {   -- ':' or '::'
+                                                            match (Reaver.BPLAN.eq b 0x3A) {   -- ':' or '::'
                                                               | 0 →
-                                                                  match (nat_eq b 0x2E) {   -- '.'
+                                                                  match (Reaver.BPLAN.eq b 0x2E) {   -- '.'
                                                                     | 0 →
-                                                                        match (nat_eq b 0x2C) {   -- ','
+                                                                        match (Reaver.BPLAN.eq b 0x2C) {   -- ','
                                                                           | 0 →
-                                                                              match (nat_eq b 0x40) {   -- '@'
+                                                                              match (Reaver.BPLAN.eq b 0x40) {   -- '@'
                                                                                 | 0 →
-                                                                                    match (nat_eq b 0x60) {   -- '`'
+                                                                                    match (Reaver.BPLAN.eq b 0x60) {   -- '`'
                                                                                       | 0 →
-                                                                                          match (nat_eq b 0x22) {   -- '"'
+                                                                                          match (Reaver.BPLAN.eq b 0x22) {   -- '"'
                                                                                             | 0 →
                                                                                                 -- 0xE2: lead byte for → ← ∀
-                                                                                                match (nat_eq b 0xE2) {
+                                                                                                match (Reaver.BPLAN.eq b 0xE2) {
                                                                                                   | 0 →
                                                                                                       -- 0xCE: lead byte for λ
-                                                                                                      match (nat_eq b 0xCE) {
+                                                                                                      match (Reaver.BPLAN.eq b 0xCE) {
                                                                                                         | 0 →
                                                                                                             -- Unknown byte: emit error token
                                                                                                             MkPair (TkErr b) pos1
@@ -1136,11 +1141,11 @@ let lex_one : Pair Nat Nat → LexPos → Pair Token LexPos
                                                                                                       let b3 = bytes_at src (Core.PLAN.inc (lexpos_offset pos1)) in
                                                                                                       let seq = bit_or b (bit_or (shift_left b2 8) (shift_left b3 16)) in
                                                                                                       let pos3 = lexpos_advance_n pos 3 in
-                                                                                                      match (nat_eq seq kw_arrow_uni) {
+                                                                                                      match (Reaver.BPLAN.eq seq kw_arrow_uni) {
                                                                                                         | 0 →
-                                                                                                            match (nat_eq seq kw_backarrow_uni) {
+                                                                                                            match (Reaver.BPLAN.eq seq kw_backarrow_uni) {
                                                                                                               | 0 →
-                                                                                                                  match (nat_eq seq kw_forall_uni) {
+                                                                                                                  match (Reaver.BPLAN.eq seq kw_forall_uni) {
                                                                                                                     | 0 → MkPair (TkErr b) pos3
                                                                                                                     | k → MkPair TkForall pos3
                                                                                                                   }
@@ -1177,7 +1182,7 @@ let lex_one : Pair Nat Nat → LexPos → Pair Token LexPos
                                                                   }
                                                               | k →
                                                                   -- Check for :: (colon-colon)
-                                                                  match (nat_eq (bytes_at src (lexpos_offset pos1)) 0x3A) {
+                                                                  match (Reaver.BPLAN.eq (bytes_at src (lexpos_offset pos1)) 0x3A) {
                                                                     | 0 → MkPair TkColon pos1
                                                                     | k → MkPair TkColonColon (lexpos_advance pos1)
                                                                   }
@@ -1222,7 +1227,7 @@ let lex_one : Pair Nat Nat → LexPos → Pair Token LexPos
             }
         | k →
             -- Digit: check for 0x/0X hex prefix
-            match (nat_eq b 0x30) {           -- '0'
+            match (Reaver.BPLAN.eq b 0x30) {           -- '0'
               | 0 →
                   -- Non-zero digit: decimal scan starting with value (b - '0')
                   let tr = lex_scan_nat_dec_go src pos1 (sub b 0x30) in
@@ -1231,11 +1236,11 @@ let lex_one : Pair Nat Nat → LexPos → Pair Token LexPos
                   }
               | k →
                   -- '0': peek at next byte for 'x'/'X'
-                  match (nat_eq (lexpos_offset pos1) (bytes_length src)) {
+                  match (Reaver.BPLAN.eq (lexpos_offset pos1) (bytes_length src)) {
                     | 0 →
-                        match (nat_eq (bytes_at src (lexpos_offset pos1)) 0x78) {   -- 'x'
+                        match (Reaver.BPLAN.eq (bytes_at src (lexpos_offset pos1)) 0x78) {   -- 'x'
                           | 0 →
-                              match (nat_eq (bytes_at src (lexpos_offset pos1)) 0x58) {   -- 'X'
+                              match (Reaver.BPLAN.eq (bytes_at src (lexpos_offset pos1)) 0x58) {   -- 'X'
                                 | 0 →
                                     -- plain '0' (or '0' followed by non-x digit)
                                     MkPair (TkNat 0) pos1
@@ -1268,7 +1273,7 @@ let lex_one : Pair Nat Nat → LexPos → Pair Token LexPos
 let lex : Pair Nat Nat → Nat → Nat → Nat → List Token
   = λ src offset line col →
       let pos1 = lex_skip_ws src (mk_lexpos offset line col) in
-      match (nat_eq (lexpos_offset pos1) (bytes_length src)) {
+      match (Reaver.BPLAN.eq (lexpos_offset pos1) (bytes_length src)) {
         | 0 →
             let tr = lex_one src pos1 in
             match tr {
@@ -6535,7 +6540,7 @@ let run_main : Nat → Nat
 -- read.
 let bytesBar_byte_count : Nat → Nat
   = fix λ self n →
-      match (nat_eq n 1) {
+      match (Reaver.BPLAN.eq n 1) {
         | 0 → Core.PLAN.inc (self (Reaver.BPLAN.rsh n 8))
         | _ → 0
       }
@@ -6560,11 +6565,19 @@ let bytesBar_encode : Pair Nat Nat → Nat
 -- read_all_loop: drain stdin into a Bytes accumulator.  Each iter
 -- calls Input for up to 65536 bytes, decodes via decode_input_chunk,
 -- concatenates onto acc, and recurses.  Exits on length-0 chunk.
+--
+-- Note: written without nested literal patterns in constructor fields
+-- because the bootstrap codegen collapses multiple arms for the same
+-- constructor tag (even when field values differ) — both
+-- `| MkPair 0 _ →` and `| MkPair len chunk →` would resolve to tag=0
+-- and the first arm would always fire.  Extract `len` first, then
+-- dispatch on the Nat.
 let read_all_loop : Pair Nat Nat → Pair Nat Nat
   = fix λ self acc →
-      match (decode_input_chunk (Reaver.RPLAN.input 65536)) {
-        | MkPair 0 _       → acc
-        | MkPair len chunk → self (bytes_concat acc (MkPair len chunk))
+      let chunk = decode_input_chunk (Reaver.RPLAN.input 65536) in
+      match (bytes_length chunk) {
+        | 0 → acc
+        | _ → self (bytes_concat acc chunk)
       }
 
 let read_all : Nat → Pair Nat Nat

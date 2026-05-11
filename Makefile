@@ -87,6 +87,25 @@ test-selfhost:
 test-reaver: vendor-verify
 	$(PYTHON) -m pytest tests/reaver/ -v
 
+## Run a .gls file under Reaver.  Required: SRC= MOD=  Optional: FN= ARG= REAVER_ARGS=
+##
+##   make reaver-run SRC=compiler/src/Compiler.gls MOD=Compiler
+##   make reaver-run SRC=compiler/src/Compiler.gls MOD=Compiler FN=main_reaver
+##   make reaver-run SRC=src/Foo.gls MOD=Foo FN=my_value REAVER_ARGS=--trace
+##
+## REAVER_ARGS may include --trace, --no-prelude, --timeout N, -v.
+reaver-run: vendor-verify
+ifndef SRC
+	$(error SRC is required: make reaver-run SRC=path/to/file.gls MOD=ModuleName)
+endif
+ifndef MOD
+	$(error MOD is required: make reaver-run SRC=path/to/file.gls MOD=ModuleName)
+endif
+	$(PYTHON) tools/run_reaver.py $(SRC) $(MOD) \
+	    $(if $(FN),--fn $(FN)) \
+	    $(if $(ARG),--arg $(ARG)) \
+	    $(REAVER_ARGS)
+
 ## Run all compiler tests inside Docker (macOS-friendly)
 ## Build first: make docker-build
 test-selfhost-docker:

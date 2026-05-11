@@ -1,28 +1,37 @@
 #!/usr/bin/env python3
 """
-Phase G #2 smoke tests — bootstrap-compiled `compiler/src/Compiler.gls`
-runs as a Reaver process via `main_reaver`.
+Phase G smoke and byte-identity tests — bootstrap-compiled
+`compiler/src/Compiler.gls` runs as a Reaver process via `main_reaver`.
 
-The test suite is deliberately narrow:
+Phase G #2 smoke tests (``TestPhaseG2Smoke``):
 
-* `test_compiler_loads_under_reaver` — the bootstrap-emitted Plan
-  Assembler text parses cleanly under Reaver. After AUDIT.md D8, all
-  ~568 bindings (including the new `read_all_loop`,
-  `decode_input_chunk`, `bytesBar_encode`, and `main_reaver`) load
-  without `law: unbound` or other parse errors.
-* `test_main_reaver_empty_source_runs` — invoking `main_reaver` with
-  empty stdin drains zero bytes from stdin, runs the pure `main`
-  pipeline on `(MkPair 0 0)`, and writes the empty result to stdout.
-  The test asserts the process exits cleanly.
+* ``test_compiler_loads_under_reaver`` — the bootstrap-emitted Plan
+  Assembler text parses cleanly under Reaver.  All bindings (including
+  ``read_all_loop``, ``decode_input_chunk``, ``bytesBar_encode``, and
+  ``main_reaver``) load without ``law: unbound`` or parse errors.
+* ``test_main_reaver_empty_source_runs`` — invoking ``main_reaver``
+  with empty stdin runs the pure ``main`` pipeline on ``(MkPair 0 0)``
+  and writes the empty result to stdout.  The test asserts a clean exit
+  with empty stdout.
 
-Phase G #3 (forward work) will add the byte-identity test against
-non-trivial fixtures, gated on the recursive-arithmetic emit path
-either becoming fast enough (Reaver jet matching) or being scoped to
-small enough fixtures.
+Phase G #3 byte-identity gate (``TestPhaseG3ByteIdentity``):
+
+* Feeds small, prelude-free Gallowglass source to ``main_reaver`` and
+  asserts that stdout is byte-identical to the Python bootstrap
+  compiler's output for the same source compiled with module name
+  ``Compiler``.  Validates the full round-trip:
+
+    stdin bytes → bytesBar decode → PLAN compiler pipeline
+    → bytesBar encode → natBytes → stdout bytes
+
+  Timeout 300 s per fixture — conservative because Reaver has no jet
+  substrate for recursive arithmetic yet.
 """
 
 import os
+import resource
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -84,6 +93,16 @@ def _run_compiler(stdin_bytes: bytes, *, function: str = 'Compiler_main_reaver',
                   arg: str = '0', timeout: int = 60) -> tuple[bytes, bytes, int]:
     """Run the bootstrap-emitted Compiler.gls under Reaver with given stdin.
     Returns (stdout, stderr, exit_code).
+
+    Safety: the subprocess is placed in its own process group (start_new_session)
+    so that on timeout the entire nix/cabal/plan-assembler child tree is killed
+    with SIGKILL — not just the outermost nix wrapper.  Orphaned plan-assembler
+    processes accumulating unbounded PLAN thunks were the cause of the 108GB OOM
+    kernel panic; this guarantees the process tree is dead before we return.
+
+    A 4 GB virtual-address cap is applied via RLIMIT_AS so that even if SIGKILL
+    delivery is delayed (macOS D-state during heavy swap), the process can't
+    allocate past the limit.
     """
     plan_text = _compile_compiler_to_plan()
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -96,22 +115,47 @@ def _run_compiler(stdin_bytes: bytes, *, function: str = 'Compiler_main_reaver',
         else:
             cmd = ['cabal', 'run', '-v0', 'plan-assembler', '--',
                    tmpdir, 'compiler', function, arg]
-        result = subprocess.run(
-            cmd, cwd=REAVER_DIR, input=stdin_bytes,
-            capture_output=True, timeout=timeout,
+
+        _4GB = 4 * 1024 ** 3
+
+        def _limit():
+            try:
+                resource.setrlimit(resource.RLIMIT_AS, (_4GB, _4GB))
+            except (ValueError, resource.error):
+                pass  # platform may not support AS limit; best-effort
+
+        proc = subprocess.Popen(
+            cmd, cwd=REAVER_DIR,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,  # own process group → kill whole tree
+            preexec_fn=_limit,
         )
-    return result.stdout, result.stderr, result.returncode
+        try:
+            stdout, stderr = proc.communicate(input=stdin_bytes, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            # SIGKILL the entire process group (nix + cabal + plan-assembler).
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            try:
+                stdout, stderr = proc.communicate()
+            except Exception:
+                stdout, stderr = b'', b''
+            raise
+        return stdout, stderr, proc.returncode
 
 
 @requires_reaver
 class TestPhaseG2Smoke(unittest.TestCase):
     """Phase G #2 smoke tests — Compiler.gls runs as a Reaver process.
 
-    These tests are *not* the byte-identity self-host gate (Phase G
-    #3 forward work). They check the I/O surface — that
-    bootstrap-compiled `Compiler.gls` parses cleanly under Reaver and
-    that `main_reaver` can be invoked without crashing on empty
-    input.
+    These tests check the I/O surface — that bootstrap-compiled
+    ``Compiler.gls`` parses cleanly under Reaver and that ``main_reaver``
+    can be invoked without crashing on empty input.  Byte-identity
+    correctness is in ``TestPhaseG3ByteIdentity``.
     """
 
     def test_compiler_loads_under_reaver(self):
@@ -182,6 +226,73 @@ class TestPhaseG2Smoke(unittest.TestCase):
             f'expected empty stdout for empty source, got {stdout!r}\n'
             f'stderr-tail={stderr[-500:]!r}',
         )
+
+
+@requires_reaver
+class TestPhaseG3ByteIdentity(unittest.TestCase):
+    """Phase G #3 — byte-identity self-host gate.
+
+    For each fixture, the Python bootstrap compiler (module name
+    ``Compiler``) and the PLAN self-hosting compiler (``main_reaver``,
+    which hardcodes ``nn_Compiler = 8243113893085146947``) must produce
+    bit-for-bit identical Plan Assembler text.
+
+    Fixtures are intentionally prelude-free so ``resolve`` can use an
+    empty module-env dict, matching the PLAN compiler's own startup
+    state.
+
+    Timeout 300 s is conservative — Reaver interprets every PLAN
+    reduction step in Haskell with no jet substrate yet for arithmetic.
+    """
+
+    _TIMEOUT = 300
+
+    @classmethod
+    def _reference(cls, src: str) -> bytes:
+        prog = parse(lex(src, '<fixture>'), '<fixture>')
+        resolved, _ = resolve(prog, 'Compiler', {}, '<fixture>')
+        compiled = compile_program(resolved, 'Compiler')
+        return emit_program(compiled).encode()
+
+    def _assert_byte_identical(self, src: str) -> None:
+        reference = self._reference(src)
+        try:
+            stdout, stderr, exit_code = _run_compiler(
+                src.encode(), timeout=self._TIMEOUT
+            )
+        except subprocess.TimeoutExpired:
+            self.fail(
+                f'main_reaver timed out after {self._TIMEOUT}s for fixture {src!r}.\n'
+                f'Reaver has no jet substrate for arithmetic yet; '
+                f'raise _TIMEOUT or wait for jets.'
+            )
+        self.assertEqual(
+            exit_code, 0,
+            f'main_reaver failed (exit {exit_code}) for fixture {src!r}:\n'
+            f'stderr-tail={stderr[-1500:]!r}',
+        )
+        self.assertEqual(
+            stdout, reference,
+            f'byte-identity mismatch for {src!r}:\n'
+            f'  reference={reference!r}\n'
+            f'  actual   ={stdout!r}\n'
+            f'  stderr-tail={stderr[-500:]!r}',
+        )
+
+    def test_single_nat_binding(self):
+        """``let xx = 42`` — Nat literal; exercises the full lex→emit path."""
+        self._assert_byte_identical('let xx = 42')
+
+    def test_identity_function(self):
+        """``let f = fn x -> x`` — Law emit; validates lambda codegen.
+
+        Short names keep identifier nats small (``f`` = 0x66 = 102).
+        ``id_fn`` encodes to 474 billion, which makes every remaining
+        ``nat_eq`` call involving it O(474B) steps under Reaver — timing
+        out the 300s window.  The fixture still exercises the full
+        lambda/Law emit path.
+        """
+        self._assert_byte_identical('let f = fn x -> x')
 
 
 if __name__ == '__main__':

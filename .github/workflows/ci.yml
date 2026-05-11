@@ -38,6 +38,7 @@ jobs:
   # Three parallel jobs against vendor/reaver's plan-assembler:
   #   - smoke        : minimal end-to-end fixtures (test_smoke.py +
   #                    RPLAN I/O + the repl_calc demo)
+  #   - selfhost     : Phase G byte-identity gate (test_selfhost.py)
   #   - differential : harness ≡ Reaver fixtures (test_differential.py)
   # Same Nix + plan-assembler setup; the actions/cache step lets the second
   # job hit the warm Nix store rather than rebuilding GHC from scratch.
@@ -50,6 +51,8 @@ jobs:
         include:
           - suite: smoke
             target: tests/reaver/test_smoke.py tests/reaver/test_rplan_io.py tests/reaver/test_repl_calc.py
+          - suite: selfhost
+            target: tests/reaver/test_selfhost.py
           - suite: differential
             target: tests/reaver/test_differential.py
     steps:

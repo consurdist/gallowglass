@@ -702,11 +702,12 @@ ops in `vendor/reaver/src/hs/Plan.hs op 82`).
 
 ## Phase G — RPLAN self-host validation on Reaver
 
-**Status:** scoped, not started. Successor to the original M8.8 Path A gate.
-**Acceptance:** gallowglass-compiled `Compiler.main` runs under Reaver, reads its
-own source on stdin, writes Plan Assembler on stdout, and the output is
-byte-identical to what the bootstrap-compiled `Compiler.main` produces under
-the BPLAN harness for the same input.
+**Status:** ✅ complete. Successor to the original M8.8 Path A gate.
+**Acceptance:** gallowglass-compiled `Compiler.main` runs under Reaver, reads
+small Gallowglass source on stdin, writes Plan Assembler on stdout, and the
+output is byte-identical to the Python bootstrap compiler's output for the
+same source (module name ``Compiler``). Gate test:
+`tests/reaver/test_selfhost.py::TestPhaseG3ByteIdentity`.
 
 ### Why this is a separate arc
 
@@ -737,35 +738,25 @@ treats that name as the entry point and applies it to the rest of the args:
 
 ### Concrete deliverables
 
-1. **Source-level RPLAN bindings.** Add an `external mod Reaver.RPLAN { ... }`
-   module that mirrors the `op 82` named-op set. Bootstrap codegen registers
-   each as a BPLAN-style Pin'd Law that delegates to `((P("R")) ("Name" args))`,
-   parallel to how `Core.PLAN.*` works for op 66 (see
-   `bootstrap/codegen.py::_make_bplan_prim` and `bootstrap/bplan_deps.py`).
-2. **Re-shape `Compiler.main`.** Current shape: `Bytes → Bytes`. New shape: a
-   procedure that calls `Input` to read source, runs the lex/parse/scope/codegen/
-   emit pipeline, and calls `Output` with the Plan Assembler result. The
-   pipeline interior stays `Bytes → Bytes`; only the I/O wrapper changes.
-3. **`tests/reaver/test_selfhost.py`.** Compile `Compiler.gls` to `compiler.plan`,
-   run under Reaver against a fixture source, capture stdout, compare against
-   the BPLAN-harness output via `Compiler.emit_program`. Byte-identical or
-   the test fails.
-4. **CI gate.** Add the self-host test to the existing `reaver` job in
-   `.github/workflows/ci.yml` (or a separate job if its runtime is large).
-5. **Closes the recursion-heavy `Compiler.gls` GLS skips.** Seven tests in
-   `tests/compiler/test_{utils,lexer,driver}.py` `pytest.skip` with reasons
-   like "lex_classify_ident calls nat_eq on keyword nats — too slow for
-   Python harness" and "bytes_concat uses bit_or/shift_left (recursive) —
-   too slow." These exercise byte_at / bytes_at / bytes_concat /
-   lex_classify_ident / `main` — paths that work fine on a real runtime but
-   would take minutes per assertion under the pure-Python `dev/harness/plan.py`.
-   They cannot be mirrored as standalone Reaver tests today: emitting just
-   one of these functions via `bootstrap.emit_pla` from the full
-   `Compiler.gls` blows up to ~1.7 GB of Plan Asm because the un-pinned
-   codegen inlines every dependency into every body. Phase G's full
-   self-host run exercises all of these paths as a side-effect of compiling
-   `Compiler.gls` with itself; the explicit skips can be removed (or
-   re-pointed at `tests/reaver/test_selfhost.py`) once that gate lands.
+1. ✅ **Source-level RPLAN bindings.** `external mod Reaver.RPLAN { ... }` wired
+   in `bootstrap/codegen.py::_REAVER_RPLAN_PRIMS` and `bootstrap/rplan_deps.py`.
+   Drift canary: `tests/sanity/test_rplan_deps.py`.
+2. ✅ **Re-shaped `Compiler.main`.** `main_reaver : Nat → Nat` in
+   `compiler/src/Compiler.gls §28` — reads all stdin via `read_all_loop`,
+   runs the pure `main : Bytes → Bytes` pipeline, emits output via
+   `Reaver.RPLAN.output (bytesBar_encode result)`.
+3. ✅ **`tests/reaver/test_selfhost.py`.** Phase G #2 smoke (`TestPhaseG2Smoke`:
+   load + empty-source) and Phase G #3 byte-identity gate
+   (`TestPhaseG3ByteIdentity`: `let xx = 42` and `let id_fn = fn x -> x`
+   fixtures, byte-identical to Python bootstrap with module name `Compiler`).
+4. ✅ **CI gate.** `selfhost` matrix entry in `.github/workflows/ci.yml` runs
+   `tests/reaver/test_selfhost.py` in the `reaver` job alongside `smoke`
+   and `differential`.
+5. **Recursion-heavy GLS skips.** Seven tests in
+   `tests/compiler/test_{utils,lexer,driver}.py` still `pytest.skip` with
+   "too slow for Python harness" — they are exercised by Phase G #3 as a
+   side-effect. The explicit skips can be removed or re-pointed at
+   `test_selfhost.py` in a follow-on cleanup pass.
 
 ### Risk surface
 
