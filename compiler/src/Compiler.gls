@@ -1476,10 +1476,13 @@ let is_upper_first_byte : Nat → Nat
 let parse_ident_list : List Token → Pair (List Nat) (List Token)
   = λ toks →
       match (tok_eat_ident toks) {
-        | MkPair 0 _ → MkPair Nil toks
         | MkPair n rest →
-            match (parse_ident_list rest) {
-              | MkPair names rest2 → MkPair (Cons n names) rest2
+            match n {
+              | 0 → MkPair Nil toks
+              | _ →
+                  match (parse_ident_list rest) {
+                    | MkPair names rest2 → MkPair (Cons n names) rest2
+                  }
             }
       }
 
@@ -1681,31 +1684,34 @@ let parse_record_expr_fields_pe
       match (tok_is toks TkRBrace) {
         | 0 →
             match (tok_eat_ident toks) {
-              | MkPair 0 _ → MkPair Nil toks
               | MkPair fname rest →
-                  match (tok_is rest TkEqual) {
-                    | 0 →
-                        -- Punning: { x } → { x = x }
-                        let rest2 = match (tok_is rest TkComma) {
-                                      | 0 → rest
-                                      | k → tok_tail rest
-                                    } in
-                        match (parse_record_expr_fields_pe pe rest2) {
-                          | MkPair fields rest3 →
-                              MkPair (Cons (MkPair fname (EVar fname)) fields)
-                                     rest3
-                        }
-                    | k →
-                        match (pe (tok_tail rest)) {
-                          | MkPair val_expr rest2 →
-                              let rest3 = match (tok_is rest2 TkComma) {
-                                            | 0 → rest2
-                                            | k → tok_tail rest2
+                  match fname {
+                    | 0 → MkPair Nil toks
+                    | _ →
+                        match (tok_is rest TkEqual) {
+                          | 0 →
+                              -- Punning: { x } → { x = x }
+                              let rest2 = match (tok_is rest TkComma) {
+                                            | 0 → rest
+                                            | k → tok_tail rest
                                           } in
-                              match (parse_record_expr_fields_pe pe rest3) {
-                                | MkPair fields rest4 →
-                                    MkPair (Cons (MkPair fname val_expr) fields)
-                                           rest4
+                              match (parse_record_expr_fields_pe pe rest2) {
+                                | MkPair fields rest3 →
+                                    MkPair (Cons (MkPair fname (EVar fname)) fields)
+                                           rest3
+                              }
+                          | k →
+                              match (pe (tok_tail rest)) {
+                                | MkPair val_expr rest2 →
+                                    let rest3 = match (tok_is rest2 TkComma) {
+                                                  | 0 → rest2
+                                                  | k → tok_tail rest2
+                                                } in
+                                    match (parse_record_expr_fields_pe pe rest3) {
+                                      | MkPair fields rest4 →
+                                          MkPair (Cons (MkPair fname val_expr) fields)
+                                                 rest4
+                                    }
                               }
                         }
                   }
@@ -1721,8 +1727,10 @@ let parse_record_pat_fields : List Token → Pair (List (Pair Nat Nat)) (List To
       match (tok_is toks TkRBrace) {
         | 0 →
             match (tok_eat_ident toks) {
-              | MkPair 0 _ → MkPair Nil toks
               | MkPair fname rest →
+                  match fname {
+                    | 0 → MkPair Nil toks
+                    | _ →
                   match (tok_is rest TkEqual) {
                     | 0 →
                         -- Punning: { x } → { x = x }
@@ -1738,15 +1746,18 @@ let parse_record_pat_fields : List Token → Pair (List (Pair Nat Nat)) (List To
                         match (tok_is (tok_tail rest) TkUnderscore) {
                           | 0 →
                               match (tok_eat_ident (tok_tail rest)) {
-                                | MkPair 0 _ → MkPair Nil (tok_tail rest)
                                 | MkPair var_name rest2 →
-                                    let rest3 = match (tok_is rest2 TkComma) {
-                                                  | 0 → rest2
-                                                  | k → tok_tail rest2
-                                                } in
-                                    match (parse_record_pat_fields rest3) {
-                                      | MkPair fields rest4 →
-                                          MkPair (Cons (MkPair fname var_name) fields) rest4
+                                    match var_name {
+                                      | 0 → MkPair Nil (tok_tail rest)
+                                      | _ →
+                                          let rest3 = match (tok_is rest2 TkComma) {
+                                                        | 0 → rest2
+                                                        | k → tok_tail rest2
+                                                      } in
+                                          match (parse_record_pat_fields rest3) {
+                                            | MkPair fields rest4 →
+                                                MkPair (Cons (MkPair fname var_name) fields) rest4
+                                          }
                                     }
                               }
                           | k →
@@ -1760,6 +1771,7 @@ let parse_record_pat_fields : List Token → Pair (List (Pair Nat Nat)) (List To
                                     MkPair (Cons (MkPair fname 0) fields) rest4
                               }
                         }
+                  }
                   }
             }
         | k → MkPair Nil (tok_tail toks)
@@ -2386,24 +2398,35 @@ let parse_expr_dispatch : List (Pair Nat (List Nat)) → (List Token → Pair Ex
                                     -- fix λ self params → body
                                     -- tok_tail twice: skip 'fix', skip 'λ'
                                     match (tok_eat_ident (tok_tail (tok_tail toks))) {
-                                      | MkPair 0 _ → MkPair (EVar 0) toks
                                       | MkPair self_name toks2 →
-                                          match (parse_lambda_params toks2) {
-                                            | MkPair params toks3 →
-                                                parse_fix_body_pe pe self_name params toks3
+                                          match self_name {
+                                            | 0 → MkPair (EVar 0) toks
+                                            | _ →
+                                              match (parse_lambda_params toks2) {
+                                                | MkPair params toks3 →
+                                                    parse_fix_body_pe pe self_name params toks3
+                                              }
                                           }
                                     }
                               }
                           | k →
                               match (tok_eat_ident (tok_tail toks)) {
-                                | MkPair 0 _ → MkPair (EVar 0) toks
-                                | MkPair name toks2 → parse_pin_rhs_pe pe name toks2
+                                | MkPair name toks2 →
+                                    match name {
+                                      | 0 → MkPair (EVar 0) toks
+                                      | _ →
+                                        parse_pin_rhs_pe pe name toks2
+                                    }
                               }
                         }
                     | k →
                         match (tok_eat_ident (tok_tail toks)) {
-                          | MkPair 0 _ → MkPair (EVar 0) toks
-                          | MkPair name toks2 → parse_let_rhs_pe pe name toks2
+                          | MkPair name toks2 →
+                              match name {
+                                | 0 → MkPair (EVar 0) toks
+                                | _ →
+                                  parse_let_rhs_pe pe name toks2
+                              }
                         }
                   }
               | k →
@@ -2488,10 +2511,13 @@ let parse_con_arity : List Token → Nat → Pair Nat (List Token)
 let parse_con_def : List Token → Pair ConDef (List Token)
   = λ toks →
       match (tok_eat_ident (tok_tail toks)) {
-        | MkPair 0 _ → MkPair (MkConDef 0 0) (tok_tail toks)
         | MkPair name toks2 →
-            match (parse_con_arity toks2 0) {
-              | MkPair arity rest → MkPair (MkConDef name arity) rest
+            match name {
+              | 0 → MkPair (MkConDef 0 0) (tok_tail toks)
+              | _ →
+                match (parse_con_arity toks2 0) {
+                  | MkPair arity rest → MkPair (MkConDef name arity) rest
+                }
             }
       }
 
@@ -2553,10 +2579,13 @@ let parse_ext_items : List Token → Pair (List Nat) (List Token)
               | 0 → MkPair Nil toks
               | k →
                   match (tok_eat_ident toks) {
-                    | MkPair 0 _ → MkPair Nil (tok_tail toks)
                     | MkPair name toks1 →
-                        match (parse_ext_items (tok_skip_ext_type toks1)) {
-                          | MkPair names rest → MkPair (Cons name names) rest
+                        match name {
+                          | 0 → MkPair Nil (tok_tail toks)
+                          | _ →
+                            match (parse_ext_items (tok_skip_ext_type toks1)) {
+                              | MkPair names rest → MkPair (Cons name names) rest
+                            }
                         }
                   }
             }
@@ -2606,18 +2635,21 @@ let parse_record_fields_go : List Token → Nat → List Nat → Pair (Pair Nat 
               | 0 → MkPair (MkPair count (reverse names)) toks
               | k →
                   match (tok_eat_ident toks) {
-                    | MkPair 0 _ → MkPair (MkPair count (reverse names)) toks
                     | MkPair fname rest →
-                        let rest2 = skip_record_field_type
-                                      (match (tok_is rest TkColon) {
-                                         | 0 → rest
-                                         | k → tok_tail rest
-                                       }) in
-                        let rest3 = match (tok_is rest2 TkComma) {
-                                      | 0 → rest2
-                                      | k → tok_tail rest2
-                                    } in
-                        parse_record_fields_go rest3 (Core.PLAN.inc count) (Cons fname names)
+                        match fname {
+                          | 0 → MkPair (MkPair count (reverse names)) toks
+                          | _ →
+                            let rest2 = skip_record_field_type
+                                          (match (tok_is rest TkColon) {
+                                             | 0 → rest
+                                             | k → tok_tail rest
+                                           }) in
+                            let rest3 = match (tok_is rest2 TkComma) {
+                                          | 0 → rest2
+                                          | k → tok_tail rest2
+                                        } in
+                            parse_record_fields_go rest3 (Core.PLAN.inc count) (Cons fname names)
+                        }
                   }
             }
         | k → MkPair (MkPair count (reverse names)) (tok_tail toks)
@@ -2674,8 +2706,12 @@ let nn_inst : Nat = 0x74736e69  -- "inst"
 let tok_is_class_member_start : List Token → Nat
   = λ toks →
       match (tok_eat_ident toks) {
-        | MkPair 0 _ → 0
-        | MkPair _ rest → tok_is rest TkColon
+        | MkPair _mkpair_n rest →
+            match _mkpair_n {
+              | 0 → 0
+              | _ →
+                tok_is rest TkColon
+            }
       }
 
 -- tok_skip_to_class_member: skip tokens until "ident :" or "}" is reached
@@ -2698,11 +2734,14 @@ let parse_class_member_names : List Token → Pair (List Nat) (List Token)
       match (tok_is toks TkRBrace) {
         | 0 →
             match (tok_eat_ident toks) {
-              | MkPair 0 _ → MkPair Nil (tok_tail toks)
               | MkPair method_name rest →
-                  let rest2 = tok_skip_to_class_member (tok_tail rest) in
-                  match (parse_class_member_names rest2) {
-                    | MkPair names rest3 → MkPair (Cons method_name names) rest3
+                  match method_name {
+                    | 0 → MkPair Nil (tok_tail toks)
+                    | _ →
+                      let rest2 = tok_skip_to_class_member (tok_tail rest) in
+                      match (parse_class_member_names rest2) {
+                        | MkPair names rest3 → MkPair (Cons method_name names) rest3
+                      }
                   }
             }
         | k → MkPair Nil (tok_tail toks)
@@ -2713,11 +2752,14 @@ let parse_class_member_names : List Token → Pair (List Nat) (List Token)
 let parse_class_decl : List Token → Pair Decl (List Token)
   = λ toks →
       match (tok_eat_ident toks) {
-        | MkPair 0 _ → MkPair (DClass 0 Nil) toks
         | MkPair class_name rest →
-            let rest2 = skip_type_params rest in
-            match (parse_class_member_names (tok_tail rest2)) {
-              | MkPair methods rest3 → MkPair (DClass class_name methods) rest3
+            match class_name {
+              | 0 → MkPair (DClass 0 Nil) toks
+              | _ →
+                let rest2 = skip_type_params rest in
+                match (parse_class_member_names (tok_tail rest2)) {
+                  | MkPair methods rest3 → MkPair (DClass class_name methods) rest3
+                }
             }
       }
 
@@ -2726,8 +2768,12 @@ let parse_class_decl : List Token → Pair Decl (List Token)
 let tok_is_inst_member_start : List Token → Nat
   = λ toks →
       match (tok_eat_ident toks) {
-        | MkPair 0 _ → 0
-        | MkPair _ rest → tok_is rest TkEqual
+        | MkPair _mkpair_n rest →
+            match _mkpair_n {
+              | 0 → 0
+              | _ →
+                tok_is rest TkEqual
+            }
       }
 
 -- is_inst_arg_start: like is_atom_start but also stops at "ident =" boundary
@@ -2779,14 +2825,17 @@ let parse_inst_members : List (Pair Nat (List Nat)) → List Token → Pair (Lis
       match (tok_is toks TkRBrace) {
         | 0 →
             match (tok_eat_ident toks) {
-              | MkPair 0 _ → MkPair Nil (tok_tail toks)
               | MkPair method_name rest →
-                  match (parse_inst_member_body_pe rt (parse_expr rt) (tok_tail rest)) {
-                    | MkPair body rest2 →
-                        match (parse_inst_members rt rest2) {
-                          | MkPair members rest3 →
-                              MkPair (Cons (MkPair method_name body) members) rest3
-                        }
+                  match method_name {
+                    | 0 → MkPair Nil (tok_tail toks)
+                    | _ →
+                      match (parse_inst_member_body_pe rt (parse_expr rt) (tok_tail rest)) {
+                        | MkPair body rest2 →
+                            match (parse_inst_members rt rest2) {
+                              | MkPair members rest3 →
+                                  MkPair (Cons (MkPair method_name body) members) rest3
+                            }
+                      }
                   }
             }
         | k → MkPair Nil (tok_tail toks)
@@ -2797,15 +2846,21 @@ let parse_inst_members : List (Pair Nat (List Nat)) → List Token → Pair (Lis
 let parse_inst_decl : List (Pair Nat (List Nat)) → List Token → Pair Decl (List Token)
   = λ rt toks →
       match (tok_eat_ident toks) {
-        | MkPair 0 _ → MkPair (DInst 0 (MkPair 0 Nil)) toks
         | MkPair class_name rest →
-            match (tok_eat_ident rest) {
-              | MkPair 0 _ → MkPair (DInst class_name (MkPair 0 Nil)) rest
-              | MkPair type_name rest2 →
-                  match (parse_inst_members rt (tok_tail rest2)) {
-                    | MkPair members rest3 →
-                        MkPair (DInst class_name (MkPair type_name members)) rest3
-                  }
+            match class_name {
+              | 0 → MkPair (DInst 0 (MkPair 0 Nil)) toks
+              | _ →
+                match (tok_eat_ident rest) {
+                  | MkPair type_name rest2 →
+                      match type_name {
+                        | 0 → MkPair (DInst class_name (MkPair 0 Nil)) rest
+                        | _ →
+                          match (parse_inst_members rt (tok_tail rest2)) {
+                            | MkPair members rest3 →
+                                MkPair (DInst class_name (MkPair type_name members)) rest3
+                          }
+                      }
+                }
             }
       }
 
@@ -2817,13 +2872,16 @@ let parse_eff_op_names : List Token → Pair (List Nat) (List Token)
       match (tok_is toks TkRBrace) {
         | 0 →
             match (tok_eat_ident toks) {
-              | MkPair 0 _ → MkPair Nil (tok_tail toks)
               | MkPair op_name rest →
-                  -- skip tokens until next ident or }
-                  let rest2 = skip_type_params (tok_tail rest) in
-                  match (parse_eff_op_names rest2) {
-                    | MkPair ops rest3 →
-                        MkPair (Cons op_name ops) rest3
+                  match op_name {
+                    | 0 → MkPair Nil (tok_tail toks)
+                    | _ →
+                      -- skip tokens until next ident or }
+                      let rest2 = skip_type_params (tok_tail rest) in
+                      match (parse_eff_op_names rest2) {
+                        | MkPair ops rest3 →
+                            MkPair (Cons op_name ops) rest3
+                      }
                   }
             }
         | k → MkPair Nil (tok_tail toks)
@@ -2834,12 +2892,15 @@ let parse_eff_op_names : List Token → Pair (List Nat) (List Token)
 let parse_eff_decl : List Token → Pair Decl (List Token)
   = λ toks →
       match (tok_eat_ident toks) {
-        | MkPair 0 _ → MkPair (DEff 0 Nil) toks
         | MkPair eff_name rest →
-            let rest2 = skip_type_params rest in
-            match (parse_eff_op_names (tok_tail rest2)) {
-              | MkPair ops rest3 →
-                  MkPair (DEff eff_name ops) rest3
+            match eff_name {
+              | 0 → MkPair (DEff 0 Nil) toks
+              | _ →
+                let rest2 = skip_type_params rest in
+                match (parse_eff_op_names (tok_tail rest2)) {
+                  | MkPair ops rest3 →
+                      MkPair (DEff eff_name ops) rest3
+                }
             }
       }
 
@@ -2848,19 +2909,28 @@ let parse_handle_op_arm
       : List (Pair Nat (List Nat)) → List Token → Pair (Pair Nat (Pair Nat Expr)) (List Token)
   = λ rt toks →
       match (tok_eat_ident toks) {
-        | MkPair 0 _ → MkPair (MkPair 0 (MkPair 0 (EVar 0))) toks
         | MkPair op_name rest →
-            match (tok_eat_ident rest) {
-              | MkPair 0 _ → MkPair (MkPair op_name (MkPair 0 (EVar 0))) rest
-              | MkPair arg_name rest2 →
-                  match (tok_eat_ident rest2) {
-                    | MkPair 0 _ → MkPair (MkPair op_name (MkPair arg_name (EVar 0))) rest2
-                    | MkPair k_name rest3 →
-                        match (parse_expr rt (tok_tail rest3)) {
-                          | MkPair body rest4 →
-                              MkPair (MkPair op_name (MkPair k_name body)) rest4
-                        }
-                  }
+            match op_name {
+              | 0 → MkPair (MkPair 0 (MkPair 0 (EVar 0))) toks
+              | _ →
+                match (tok_eat_ident rest) {
+                  | MkPair arg_name rest2 →
+                      match arg_name {
+                        | 0 → MkPair (MkPair op_name (MkPair 0 (EVar 0))) rest
+                        | _ →
+                          match (tok_eat_ident rest2) {
+                            | MkPair k_name rest3 →
+                                match k_name {
+                                  | 0 → MkPair (MkPair op_name (MkPair arg_name (EVar 0))) rest2
+                                  | _ →
+                                    match (parse_expr rt (tok_tail rest3)) {
+                                      | MkPair body rest4 →
+                                          MkPair (MkPair op_name (MkPair k_name body)) rest4
+                                    }
+                                }
+                          }
+                      }
+                }
             }
       }
 
@@ -2900,16 +2970,19 @@ let parse_handle_expr : List (Pair Nat (List Nat)) → List Token → Pair Expr 
             -- eat 'return' ident, then return var name, then → then body
             let rest4 = tok_tail rest3 in
             match (tok_eat_ident rest4) {
-              | MkPair 0 _ → MkPair (EVar 0) toks
               | MkPair ret_var rest5 →
-                  match (parse_expr rt (tok_tail rest5)) {
-                    | MkPair ret_body rest6 →
-                        match (parse_handle_arms rt rest6) {
-                          | MkPair op_arms rest7 →
-                              -- skip closing }
-                              MkPair (EHandle comp (MkPair (ELam ret_var ret_body) op_arms))
-                                     (tok_tail rest7)
-                        }
+                  match ret_var {
+                    | 0 → MkPair (EVar 0) toks
+                    | _ →
+                      match (parse_expr rt (tok_tail rest5)) {
+                        | MkPair ret_body rest6 →
+                            match (parse_handle_arms rt rest6) {
+                              | MkPair op_arms rest7 →
+                                  -- skip closing }
+                                  MkPair (EHandle comp (MkPair (ELam ret_var ret_body) op_arms))
+                                         (tok_tail rest7)
+                            }
+                      }
                   }
             }
       }
@@ -2920,16 +2993,19 @@ let parse_use_names : List Token → Pair (List Nat) (List Token)
       match (tok_is toks TkRBrace) {
         | 0 →
             match (tok_eat_ident toks) {
-              | MkPair 0 _ → MkPair Nil (tok_tail toks)
               | MkPair name rest →
-                  -- skip comma if present
-                  let rest2 = match (tok_is rest TkComma) {
-                                | 0 → rest
-                                | k → tok_tail rest
-                              } in
-                  match (parse_use_names rest2) {
-                    | MkPair names rest3 →
-                        MkPair (Cons name names) rest3
+                  match name {
+                    | 0 → MkPair Nil (tok_tail toks)
+                    | _ →
+                      -- skip comma if present
+                      let rest2 = match (tok_is rest TkComma) {
+                                    | 0 → rest
+                                    | k → tok_tail rest
+                                  } in
+                      match (parse_use_names rest2) {
+                        | MkPair names rest3 →
+                            MkPair (Cons name names) rest3
+                      }
                   }
             }
         | k → MkPair Nil (tok_tail toks)
@@ -2999,9 +3075,12 @@ let parse_decl : List (Pair Nat (List Nat)) → List Token → Pair Decl (List T
                   }
               | k →
                   match (tok_eat_ident (tok_tail toks)) {
-                    | MkPair 0 _ → MkPair (DType 0 Nil) toks
                     | MkPair name toks2 →
-                        parse_type_decl_body name (skip_type_params toks2)
+                        match name {
+                          | 0 → MkPair (DType 0 Nil) toks
+                          | _ →
+                            parse_type_decl_body name (skip_type_params toks2)
+                        }
                   }
             }
         | k →
@@ -3036,25 +3115,28 @@ let collect_record_types_go : List Token → List (Pair Nat (List Nat)) → List
               | 0 → collect_record_types_go (tok_tail toks) acc
               | k →
                   match (tok_eat_ident (tok_tail toks)) {
-                    | MkPair 0 _ → collect_record_types_go (tok_tail toks) acc
                     | MkPair name rest →
-                        let rest2 = skip_type_params rest in
-                        match (tok_is rest2 TkEqual) {
-                          | 0 → collect_record_types_go rest2 acc
-                          | k →
-                              let rest3 = tok_tail rest2 in
-                              match (tok_is rest3 TkLBrace) {
-                                | 0 → collect_record_types_go rest3 acc
-                                | k →
-                                    match (parse_record_fields_go (tok_tail rest3) 0 Nil) {
-                                      | MkPair info rest4 →
-                                          match info {
-                                            | MkPair _ field_names →
-                                                collect_record_types_go rest4
-                                                  (Cons (MkPair name field_names) acc)
-                                          }
-                                    }
-                              }
+                        match name {
+                          | 0 → collect_record_types_go (tok_tail toks) acc
+                          | _ →
+                            let rest2 = skip_type_params rest in
+                            match (tok_is rest2 TkEqual) {
+                              | 0 → collect_record_types_go rest2 acc
+                              | k →
+                                  let rest3 = tok_tail rest2 in
+                                  match (tok_is rest3 TkLBrace) {
+                                    | 0 → collect_record_types_go rest3 acc
+                                    | k →
+                                        match (parse_record_fields_go (tok_tail rest3) 0 Nil) {
+                                          | MkPair info rest4 →
+                                              match info {
+                                                | MkPair _ field_names →
+                                                    collect_record_types_go rest4
+                                                      (Cons (MkPair name field_names) acc)
+                                              }
+                                        }
+                                  }
+                            }
                         }
                   }
             }
