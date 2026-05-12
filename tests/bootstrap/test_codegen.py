@@ -1972,23 +1972,77 @@ def test_top_level_nat_unchanged():
 # ---------------------------------------------------------------------------
 #
 # When two arms match the same constructor and one binds a literal in a
-# field position (`| MkPair 0 _ → A | MkPair n r → B`), the codegen has no
-# way to inspect field values — it would dispatch both arms on the same
-# tag and the first would fire unconditionally.  Until the full fix lands
-# (group same-tag arms and synthesise a nested field dispatch), the
-# codegen rejects the pattern with a clear error pointing at the
-# extract-then-dispatch workaround.  Root cause of the Phase G3 300s
-# timeout; commits 40d2199 / 18e6f5b / 0df4ef6 worked around it at every
-# affected call site in `Compiler.gls`.
+# field position (`| MkPair 0 _ → A | MkPair n r → B`), the codegen used
+# to dispatch both arms on the same tag and silently fire the first
+# unconditionally — root cause of the Phase G3 300s timeout.
+# `_collapse_same_tag_arms` now rewrites the canonical extract-then-
+# dispatch shape automatically, so users may write the natural literal-
+# bearing arm form.  Patterns the collapse cannot represent (literals in
+# multiple field positions, etc.) still raise CodegenError with a clear
+# error pointing at the manual workaround.  AUDIT.md D9.
 
-def test_same_constructor_literal_field_rejected():
-    """`match p { | MkPair 0 _ → A | MkPair n r → B }` raises CodegenError."""
+def test_same_constructor_literal_field_compiles_and_dispatches():
+    """`match p { | MkPair 0 _ → A | MkPair n _ → B }` evaluates correctly."""
+    src = (
+        'type Pair a b = | MkPair a b\n'
+        'let test_zero : Nat\n'
+        '  = match (MkPair 0 99) {\n'
+        '    | MkPair 0 _ → 1\n'
+        '    | MkPair n _ → 2\n'
+        '  }\n'
+        'let test_nonzero : Nat\n'
+        '  = match (MkPair 5 99) {\n'
+        '    | MkPair 0 _ → 1\n'
+        '    | MkPair n _ → 2\n'
+        '  }\n'
+    )
+    compiled = pipeline(src)
+    # The literal arm fires when the first field is 0, the var arm fires
+    # otherwise.  Both values are concrete Nats, so we can evaluate them
+    # against the harness and assert directly.
+    assert evaluate(compiled['Test.test_zero']) == 1
+    assert evaluate(compiled['Test.test_nonzero']) == 2
+
+
+def test_same_constructor_literal_field_unary():
+    """Unary constructors also collapse: `| Just 0 → A | Just n → B`."""
+    src = (
+        'type Maybe a = | Nothing | Just a\n'
+        'let test : Nat\n'
+        '  = match (Just 7) {\n'
+        '    | Just 0 → 100\n'
+        '    | Just n → n\n'
+        '    | Nothing → 999\n'
+        '  }\n'
+    )
+    compiled = pipeline(src)
+    assert evaluate(compiled['Test.test']) == 7
+
+
+def test_same_constructor_var_in_distinguishing_position_binds():
+    """The fallback arm's binding for the distinguishing field still
+    works inside its body."""
     src = (
         'type Pair a b = | MkPair a b\n'
         'let test : Nat\n'
-        '  = match (MkPair 5 0) {\n'
+        '  = match (MkPair 42 0) {\n'
         '    | MkPair 0 _ → 1\n'
-        '    | MkPair n _ → 2\n'
+        '    | MkPair n _ → n\n'    # `n` should bind to 42, not be dropped
+        '  }\n'
+    )
+    compiled = pipeline(src)
+    assert evaluate(compiled['Test.test']) == 42
+
+
+def test_same_constructor_unhandled_shape_still_rejected():
+    """Literals in multiple field positions across the arm group remain
+    a hard error — the collapse only handles single-position dispatch."""
+    src = (
+        'type Pair a b = | MkPair a b\n'
+        'let test : Nat\n'
+        '  = match (MkPair 5 7) {\n'
+        '    | MkPair 0 1 → 1\n'    # literal in BOTH positions
+        '    | MkPair n r → 2\n'
         '  }\n'
     )
     try:
@@ -1999,7 +2053,9 @@ def test_same_constructor_literal_field_rejected():
         assert 'nested `match`' in msg or 'extract' in msg, \
             f'error should describe the workaround: {msg!r}'
         return
-    raise AssertionError('expected CodegenError for same-constructor literal-field pattern')
+    raise AssertionError(
+        'expected CodegenError for two-literal pattern the collapse cannot handle'
+    )
 
 
 def test_same_constructor_no_literal_still_ok():

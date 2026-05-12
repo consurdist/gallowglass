@@ -292,6 +292,75 @@ class TestPhaseG3ByteIdentity(unittest.TestCase):
         """
         self._assert_byte_identical('let id = fn x -> x')
 
+    def test_type_annotation(self):
+        """``let zz : Nat = 1`` — exercises ``skip_ann`` / ``tok_skip_to_equal``.
+
+        Without the type annotation the parser never enters
+        ``tok_skip_to_equal``; the residual ``nat_eq``-on-Token bug there
+        was undetectable from the bare-let fixtures.  This pins the
+        BPLAN.eq fix at ``compiler/src/Compiler.gls:1356``.
+        """
+        self._assert_byte_identical('let zz : Nat = 1')
+
+    def test_multi_decl_source_order(self):
+        """Two top-level bindings emit in source order, not reverse.
+
+        ``compile_program`` accumulates by prepending; without an explicit
+        ``reverse`` at the boundary the output flipped the binding order
+        relative to the Python bootstrap.  Single-decl fixtures never
+        surfaced this.
+        """
+        self._assert_byte_identical(
+            'let two_decls_a = 7\nlet two_decls_b = 9'
+        )
+
+    def test_nested_lambda(self):
+        """``let kk = fn x -> fn y -> x`` — `fn`-`->`-`fn`-`->` chain.
+
+        Exercises ``parse_lambda_params`` recursion across multiple ``fn``
+        keywords and the lambda body re-entering ``parse_expr_dispatch``.
+        Bootstrap-emitted Law has arity 2 (both params lifted into a
+        single law), body is the first parameter slot.
+
+        ``kk`` rather than ``k`` because single-letter snake-case names
+        in ``[a..q]`` are type variables, not let bindings.
+        """
+        self._assert_byte_identical('let kk = fn x -> fn y -> x')
+
+    @unittest.expectedFailure
+    def test_application_in_body(self):
+        """``let ap = fn ff -> fn xx -> ff xx`` — emits an App in the law body.
+
+        The previous fixtures only emitted bare slot references in
+        bodies; this fixture should pin the ``(_1 _2)`` body-apply form
+        (``emit_bval_papp_*``).  Currently xfail: the Gallowglass
+        self-host emits arity 3 + body ``_2`` while the Python bootstrap
+        emits arity 2 + body ``(_1 _2)``.  Looks like a self-host
+        ``cg_flatten_lam`` / lambda-lifting divergence pre-dating this
+        PR — out of scope for the rc1 → 1.0 work but pinned here so the
+        next session can pick it up.
+        """
+        self._assert_byte_identical('let ap = fn ff -> fn xx -> ff xx')
+
+    @unittest.expectedFailure
+    def test_same_constructor_literal_field_collapses(self):
+        """`match (MkPair 0 99) { | MkPair 0 _ -> 1 | MkPair n _ -> 2 }` —
+        the same-constructor collapse pass auto-rewrites this in the
+        Python bootstrap (``bootstrap/codegen.py::_collapse_same_tag_arms``).
+        Currently xfail: the Gallowglass self-host's own codegen
+        (``compiler/src/Compiler.gls``) does not yet carry that pass, so
+        the self-host trips on the old behaviour.  Porting the collapse
+        to ``Compiler.gls`` closes this.  AUDIT.md D9 follow-up.
+        """
+        src = (
+            'type Pair a b = | MkPair a b\n'
+            'let tt = match (MkPair 0 99) {\n'
+            '  | MkPair 0 _ -> 1\n'
+            '  | MkPair n _ -> 2\n'
+            '}'
+        )
+        self._assert_byte_identical(src)
+
 
 if __name__ == '__main__':
     unittest.main()

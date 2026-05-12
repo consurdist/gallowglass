@@ -2099,6 +2099,155 @@ class Compiler:
             succ = make_succ_law(1, env)
             return self._make_op2_dispatch(zero_val0, succ, scrutinee, env)
 
+    def _collapse_same_tag_arms(self, con_arms: list, loc=None) -> list:
+        """Group `con_arms` by tag; rewrite each multi-arm tag into a single
+        arm whose body is a synthesised nested `ExprMatch` on the
+        distinguishing field.
+
+        Each entry of `con_arms` is `(info, field_pats, body, original_pat)`.
+        Returns a new list of the same shape with at most one entry per tag.
+
+        Supported shape (the one used throughout `compiler/src/Compiler.gls`,
+        introduced as a workaround for the historic miscompile):
+
+          | Con literal_0 wildcard_1 ... wildcard_n → A
+          | Con var_0     var_1      ... var_n      → B   (fallback)
+
+        i.e. all arms for a given tag share the same field-position layout,
+        exactly one position is a literal in the literal arms, every other
+        position is a wildcard/variable, and the last arm has all-var fields.
+        The rewrite extracts the distinguishing field as a fresh variable in
+        the single output arm and matches on it.
+
+        Anything else (literals in multiple positions, no var/wildcard
+        fallback arm, etc.) is left as a tag duplicate so the caller's
+        rejection path fires — fail-loud rather than silently misroute.
+        """
+        # Group by tag, preserving order.
+        groups: dict = {}
+        order: list = []
+        for entry in con_arms:
+            info = entry[0]
+            if info.tag not in groups:
+                groups[info.tag] = []
+                order.append(info.tag)
+            groups[info.tag].append(entry)
+
+        out: list = []
+        for tag in order:
+            arms = groups[tag]
+            if len(arms) == 1:
+                out.append(arms[0])
+                continue
+            collapsed = self._try_collapse_tag_group(arms, loc)
+            if collapsed is None:
+                out.extend(arms)            # caller will reject as duplicate
+            else:
+                out.append(collapsed)
+        return out
+
+    def _try_collapse_tag_group(self, arms: list, loc=None):
+        """See `_collapse_same_tag_arms`.  Returns the collapsed entry or
+        None if the group's shape isn't representable by this pass."""
+        # All arms for the same tag share the same constructor info and the
+        # same field arity (the parser enforces field-count via `con_info`).
+        info = arms[0][0]
+        arity = info.arity
+        if arity == 0:
+            # Nullary constructor — should never have two arms (no fields to
+            # disambiguate on); leave for the caller to reject.
+            return None
+
+        # Identify the "fallback" arm: the last one whose field patterns are
+        # all PatWild or PatVar.  Earlier arms must each have exactly one
+        # literal PatNat at the same field position, with wildcards/vars
+        # everywhere else.
+        def is_var_or_wild(p):
+            return isinstance(p, (PatVar, PatWild))
+
+        fallback_idx = None
+        for i, (_info, fpats, _body, _pat) in enumerate(arms):
+            if all(is_var_or_wild(p) for p in fpats):
+                fallback_idx = i
+        if fallback_idx is None:
+            return None
+        if fallback_idx != len(arms) - 1:
+            # A subsequent arm with literals would be unreachable; the source
+            # is suspect.  Don't try to rewrite.
+            return None
+
+        # Find the distinguishing field position from the literal arms.
+        lit_position: int | None = None
+        for entry in arms[:fallback_idx]:
+            fpats = entry[1]
+            nat_positions = [i for i, p in enumerate(fpats) if isinstance(p, PatNat)]
+            other_positions = [i for i, p in enumerate(fpats)
+                               if not is_var_or_wild(p) and not isinstance(p, PatNat)]
+            if other_positions:
+                return None             # PatTuple / PatCons / etc. — not handled
+            if len(nat_positions) != 1:
+                return None             # multi-literal arm — not handled
+            pos = nat_positions[0]
+            if lit_position is None:
+                lit_position = pos
+            elif lit_position != pos:
+                return None             # literal moves between arms — not handled
+        if lit_position is None:
+            return None
+
+        # Build the synthesised single arm.  Use the fallback arm's variable
+        # binding for the distinguishing field if it has one (so its body
+        # still type-checks); otherwise mint a fresh name.
+        fb_fpats = arms[fallback_idx][1]
+        fb_body = arms[fallback_idx][2]
+        original_pat = arms[fallback_idx][3]
+        fb_pat = fb_fpats[lit_position]
+        if isinstance(fb_pat, PatVar):
+            dispatch_var = fb_pat.name
+        else:
+            dispatch_var = f'_mkpair_dispatch_{id(arms[0]) & 0xFFFF}'
+
+        # All field patterns in the new arm come from the fallback arm, but
+        # with the distinguishing position rebound to `dispatch_var`.
+        loc_for_synth = original_pat.loc
+        new_fpats = []
+        for i, p in enumerate(fb_fpats):
+            if i == lit_position:
+                new_fpats.append(PatVar(name=dispatch_var, loc=loc_for_synth))
+            else:
+                new_fpats.append(p)
+
+        # Synthesised inner match arms: one per literal arm, plus a wildcard
+        # fallback whose body is the original fallback arm's body.
+        inner_arms: list = []
+        for entry in arms[:fallback_idx]:
+            fpats = entry[1]
+            body = entry[2]
+            lit = fpats[lit_position].value
+            inner_arms.append((
+                PatNat(value=lit, loc=loc_for_synth),
+                None,
+                body,
+            ))
+        inner_arms.append((
+            PatWild(loc=loc_for_synth),
+            None,
+            fb_body,
+        ))
+        from bootstrap.ast import QualName
+        dispatch_expr = ExprVar(
+            name=QualName(parts=[dispatch_var], loc=loc_for_synth),
+            loc=loc_for_synth,
+        )
+        new_body = ExprMatch(
+            scrutinee=dispatch_expr,
+            arms=inner_arms,
+            loc=loc_for_synth,
+        )
+        # Build a fresh PatCon matching the original's constructor name.
+        new_pat = PatCon(name=original_pat.name, args=new_fpats, loc=loc_for_synth)
+        return (info, new_fpats, new_body, new_pat)
+
     def _compile_con_match(self, scrutinee: Any, arms: list, env: Env, name_hint: str, loc=None) -> Any:
         """
         Compile match on algebraic type constructors.
@@ -2128,43 +2277,53 @@ class Compiler:
                         f'codegen: unknown constructor {fq!r}',
                         getattr(pat, 'loc', None) or loc,
                     )
-                con_arms.append((info, pat.args, body))
+                con_arms.append((info, pat.args, body, pat))
             elif isinstance(pat, (PatWild, PatVar)):
                 wild_arm = (pat, body)
 
         if not con_arms:
             return self._compile_fallback_match(scrutinee, arms, env, name_hint, loc=loc)
 
-        # Reject duplicate constructors in the arm list.  When the source has
-        # two arms for the same constructor differing only in a literal field
-        # pattern (`| MkPair 0 _ → A | MkPair n r → B`), the dispatch we build
-        # below routes purely by tag — so both arms land at the same tag and
-        # the first one fires unconditionally, silently making the second arm
-        # unreachable.  This was the root cause of the Phase G3 300s timeout
-        # on `let xx = 42`: `parse_decl` used this shape and the literal `0`
-        # sentinel branch always won, so the parser never advanced.
+        # Two arms that match the same constructor and differ only by literal
+        # field patterns (`| MkPair 0 _ → A | MkPair n r → B`) used to silently
+        # miscompile under the dispatch built below — both arms grouped under
+        # the same tag, the dispatch had no mechanism to inspect field values,
+        # and the first arm fired unconditionally.  Root cause of the Phase G3
+        # 300s timeout on `parse_decl`.
         #
-        # The compile-time error here points the user at the workaround
-        # pattern used throughout `compiler/src/Compiler.gls`: bind the field
-        # to a variable and dispatch on it with a nested `match`.  See
-        # `parse_lambda_params` for the canonical shape.  A full codegen fix
-        # would group same-tag arms and emit a synthesized nested dispatch on
-        # the field values; that's deferred to keep this fix minimal.
+        # `_collapse_same_tag_arms` rewrites such groups into a single arm
+        # whose body is a synthesised nested `ExprMatch` on the
+        # distinguishing field.  After this pass each tag appears in exactly
+        # one entry of `con_arms`, so the rest of `_compile_con_match` is
+        # unaffected.  Patterns the collapse cannot represent (literals in
+        # multiple field positions across a tag group, etc.) still fall
+        # through to the duplicate-tag rejection below.
+        con_arms = self._collapse_same_tag_arms(con_arms, loc)
+
+        # The collapse handles the canonical extract-then-dispatch shape.
+        # Anything we couldn't collapse — still two arms with the same tag —
+        # remains a hard error rather than a silent miscompile.  AUDIT.md D9.
         seen_tags: dict = {}
-        for info, _, _ in con_arms:
+        for entry in con_arms:
+            info = entry[0]
             if info.tag in seen_tags:
                 raise CodegenError(
                     f'codegen: two arms match the same constructor '
-                    f'{info.fq_name!r} (tag {info.tag}). The bootstrap codegen '
-                    f'does not disambiguate arms by field value — both arms '
-                    f'would dispatch on the same tag and the first one would '
-                    f'fire unconditionally. Workaround: extract the field as a '
-                    f'variable in a single arm, then dispatch on it with a '
-                    f'nested `match`. See `compiler/src/Compiler.gls` — '
-                    f'`parse_lambda_params` is the canonical shape.',
+                    f'{info.fq_name!r} (tag {info.tag}), and the codegen '
+                    f"couldn't combine them — the field patterns differ in "
+                    f'a shape this pass does not yet handle (e.g. literals '
+                    f'in multiple field positions). Workaround: extract the '
+                    f'fields into variables in a single arm, then dispatch '
+                    f'on them with a nested `match`. See '
+                    f'`compiler/src/Compiler.gls::parse_lambda_params` for '
+                    f'the canonical shape.',
                     loc,
                 )
             seen_tags[info.tag] = info.fq_name
+
+        # Strip the original-pattern element that `_collapse_same_tag_arms`
+        # carried for diagnostic use; downstream consumers expect 3-tuples.
+        con_arms = [(info, args, body) for info, args, body, _pat in con_arms]
 
         # Sort by tag
         con_arms.sort(key=lambda t: t[0].tag)

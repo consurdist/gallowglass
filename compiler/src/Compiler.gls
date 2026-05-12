@@ -5820,6 +5820,12 @@ let cg_pass3 : List Decl → Nat → CEnv → List (Pair Nat (Pair Nat Nat)) →
       }
 
 -- compile_program: compile a full program to a list of (fq_name, PlanVal) pairs
+-- compile_program: thread the four codegen passes and reverse the
+-- accumulated bindings so the output is in source declaration order.
+-- Each pass prepends to its `compiled` accumulator (cheap), so the
+-- internal list ends up reversed; we reverse once at the boundary so
+-- the contract matches the Python bootstrap (`bootstrap/codegen.py::
+-- compile_program` returns a dict in insertion order).
 let compile_program : List Decl → Nat → List (Pair Nat PlanVal)
   = λ decls mod_name →
       let env0 = cg_register_builtins cenv_empty in
@@ -5834,7 +5840,7 @@ let compile_program : List Decl → Nat → List (Pair Nat PlanVal)
                           | MkPair env3 rest3 →
                               match rest3 {
                                 | MkPair compiled3 _ →
-                                    cg_pass3 decls mod_name env3 ctab1 compiled3
+                                    reverse (cg_pass3 decls mod_name env3 ctab1 compiled3)
                               }
                         }
                   }
