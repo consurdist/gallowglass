@@ -284,15 +284,13 @@ class TestPhaseG3ByteIdentity(unittest.TestCase):
         self._assert_byte_identical('let xx = 42')
 
     def test_identity_function(self):
-        """``let f = fn x -> x`` — Law emit; validates lambda codegen.
+        """``let id = fn x -> x`` — Law emit; validates lambda codegen.
 
-        Short names keep identifier nats small (``f`` = 0x66 = 102).
-        ``id_fn`` encodes to 474 billion, which makes every remaining
-        ``nat_eq`` call involving it O(474B) steps under Reaver — timing
-        out the 300s window.  The fixture still exercises the full
-        lambda/Law emit path.
+        ``id`` encodes to strNat 25705 (little-endian 'i'=0x69, 'd'=0x64),
+        keeping nat comparisons cheap.  Exercises the full lambda/Law emit
+        path without triggering multi-billion-step nat_eq calls.
         """
-        self._assert_byte_identical('let f = fn x -> x')
+        self._assert_byte_identical('let id = fn x -> x')
 
 
 if __name__ == '__main__':

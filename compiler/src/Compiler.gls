@@ -319,11 +319,16 @@ let all : ∀ a. (a → Bool) → List a → Bool
 -- =====================================================================
 
 -- assoc_lookup: find a value by key (nat equality)
+-- Uses Reaver.BPLAN.eq (O(1) integer compare) instead of nat_eq (O(min(m,n))
+-- PLAN descent) — critical for large keys like nn_False = 435728179526.
 let assoc_lookup : ∀ a. Nat → List (Pair Nat a) → Option a
   = λ key kvs → match kvs {
     | Nil → None
     | Cons kv rest → match kv {
-      | MkPair k v → if nat_eq key k then Some v else assoc_lookup key rest
+      | MkPair k v → match (Reaver.BPLAN.eq key k) {
+          | 0 → assoc_lookup key rest
+          | _ → Some v
+        }
     }
   }
 
@@ -332,10 +337,10 @@ let assoc_remove : ∀ a. Nat → List (Pair Nat a) → List (Pair Nat a)
   = λ key kvs → match kvs {
     | Nil → Nil
     | Cons kv rest → match kv {
-      | MkPair k v →
-          if nat_eq key k
-          then assoc_remove key rest
-          else Cons kv (assoc_remove key rest)
+      | MkPair k v → match (Reaver.BPLAN.eq key k) {
+          | 0 → Cons kv (assoc_remove key rest)
+          | _ → assoc_remove key rest
+        }
     }
   }
 
@@ -352,7 +357,10 @@ let assoc_has : ∀ a. Nat → List (Pair Nat a) → Bool
   = λ key kvs → match kvs {
     | Nil → False
     | Cons kv rest → match kv {
-      | MkPair k _ → if nat_eq key k then True else assoc_has key rest
+      | MkPair k _ → match (Reaver.BPLAN.eq key k) {
+          | 0 → assoc_has key rest
+          | _ → True
+        }
     }
   }
 
@@ -390,19 +398,19 @@ let bytes_singleton : Nat → Pair Nat Nat
   = λ b → MkPair 1 (bit_and b 255)
 
 -- bytes_concat: concatenate two byte strings
--- content = b_content | (a_content << (b_len * 8))
--- Wait — little-endian nat encoding means bytes[0] is the LSB.
--- So concat(a, b) should produce a||b where a's bytes come first (lower indices).
--- a = [a0, a1, ...], b = [b0, b1, ...]
--- result = [a0, a1, ..., b0, b1, ...]
--- content = a_content | (b_content << (a_len * 8))
+-- content = a_content + (b_content << (a_len * 8))
+-- Little-endian: a's bytes occupy bits [0, 8*a_len), b's occupy [8*a_len, ...).
+-- These ranges are always disjoint (a_content < 2^(8*a_len)), so
+-- bit_or = add here — using add (BPLAN.add via resolver) instead of the
+-- O(bit_length) recursive bit_or cuts the emit path from ~150K PLAN
+-- reductions to ~1 BPLAN call per concat.
 let bytes_concat : Pair Nat Nat → Pair Nat Nat → Pair Nat Nat
   = λ a b →
       let a_len = bytes_length a in
       let a_content = bytes_content a in
       let b_content = bytes_content b in
       let new_len = add a_len (bytes_length b) in
-      let new_content = bit_or a_content (shift_left b_content (mul 8 a_len)) in
+      let new_content = add a_content (shift_left b_content (mul 8 a_len)) in
       MkPair new_len new_content
 
 -- bytes_slice: extract a sub-range [start, start+len)
@@ -1309,8 +1317,15 @@ let tok_tail : List Token → List Token
       }
 
 -- tok_is: 1 if head token equals the given nullary token value
+-- Uses Reaver.BPLAN.eq (O(1) integer compare) instead of nat_eq.  Nat_eq
+-- is recursive predecessor descent: applied to a non-Nat token like
+-- TkNat 42 = P(N 42) or TkIdent n = A(N 2, N n), it fires the Pin/App
+-- arm of PLAN's Elim and returns a garbage Pin/App value instead of 0/1,
+-- propagating wrong control-flow values through the parser.  BPLAN.eq
+-- is a single Haskell structural-equality check: for non-matching shapes
+-- (Nat vs Pin, Nat vs App) it returns N 0, which is the correct answer.
 let tok_is : List Token → Token → Nat
-  = λ toks tok → nat_eq (tok_peek toks) tok
+  = λ toks tok → Reaver.BPLAN.eq (tok_peek toks) tok
 
 -- eat TkIdent; returns Pair name_nat rest (name_nat=0 means not found)
 -- Safe sentinel: all valid ident nats are ≥ 0x30 ('0'), never 0.
@@ -1388,7 +1403,7 @@ let name_append_dot : Pair Nat Nat → Pair Nat Nat
   = λ nb →
       match nb {
         | MkPair len n →
-            MkPair (Core.PLAN.inc len) (bit_or n (shift_left 0x2E (mul 8 len)))
+            MkPair (Core.PLAN.inc len) (add n (shift_left 0x2E (mul 8 len)))
       }
 
 -- parse_qual_name_go: consume additional TkDot TkIdent segments
@@ -1519,12 +1534,15 @@ let desugar_interp_chain : (List Token → Pair Expr (List Token)) → List (Pai
 -- Used during expression/pattern parsing to desugar record syntax.
 
 -- rt_has_field: 1 if field_name is in the list
+-- Uses Reaver.BPLAN.eq (O(1) integer compare) instead of nat_eq.  Field
+-- names are strNat-encoded identifiers (multi-byte) — recursive nat_eq
+-- would be prohibitively slow even for short names.
 let rt_has_field : Nat → List Nat → Nat
   = λ fname fields →
       match fields {
         | Nil → 0
         | Cons f rest →
-            match (nat_eq fname f) {
+            match (Reaver.BPLAN.eq fname f) {
               | 0 → rt_has_field fname rest
               | k → 1
             }
@@ -1582,6 +1600,7 @@ let rt_lookup_subset : List (Pair Nat (List Nat)) → List Nat → Pair Nat (Lis
       }
 
 -- rt_find_field_expr: find expr for field name in parsed (name, expr) pairs
+-- Uses Reaver.BPLAN.eq (O(1)) on strNat field names; see `rt_has_field`.
 let rt_find_field_expr : Nat → List (Pair Nat Expr) → Expr
   = λ fname pairs →
       match pairs {
@@ -1589,7 +1608,7 @@ let rt_find_field_expr : Nat → List (Pair Nat Expr) → Expr
         | Cons p rest →
             match p {
               | MkPair n e →
-                  match (nat_eq n fname) {
+                  match (Reaver.BPLAN.eq n fname) {
                     | 0 → rt_find_field_expr fname rest
                     | k → e
                   }
@@ -1614,6 +1633,7 @@ let build_con_app : Expr → List Expr → Expr
       }
 
 -- rt_find_update_expr: find expr for field in updates; if not found, use EVar(field)
+-- Uses Reaver.BPLAN.eq (O(1)) on strNat field names; see `rt_has_field`.
 let rt_find_update_expr : Nat → List (Pair Nat Expr) → Expr
   = λ fname updates →
       match updates {
@@ -1621,7 +1641,7 @@ let rt_find_update_expr : Nat → List (Pair Nat Expr) → Expr
         | Cons p rest →
             match p {
               | MkPair n e →
-                  match (nat_eq n fname) {
+                  match (Reaver.BPLAN.eq n fname) {
                     | 0 → rt_find_update_expr fname rest
                     | k → e
                   }
@@ -1744,6 +1764,7 @@ let parse_record_pat_fields : List Token → Pair (List (Pair Nat Nat)) (List To
       }
 
 -- rt_find_pat_var: find var name for field in parsed (fname, var) pairs
+-- Uses Reaver.BPLAN.eq (O(1)) on strNat field names; see `rt_has_field`.
 let rt_find_pat_var : Nat → List (Pair Nat Nat) → Nat
   = λ fname pairs →
       match pairs {
@@ -1751,7 +1772,7 @@ let rt_find_pat_var : Nat → List (Pair Nat Nat) → Nat
         | Cons p rest →
             match p {
               | MkPair n v →
-                  match (nat_eq n fname) {
+                  match (Reaver.BPLAN.eq n fname) {
                     | 0 → rt_find_pat_var fname rest
                     | k → v
                   }
@@ -2976,9 +2997,16 @@ let parse_decl : List (Pair Nat (List Nat)) → List Token → Pair Decl (List T
                   }
             }
         | k →
+            -- Two arms with the SAME constructor (MkPair) but a literal
+            -- in the first field don't disambiguate under the bootstrap
+            -- codegen (see read_all_loop's comment).  Extract `name` first,
+            -- then dispatch on it as a Nat.
             match (tok_eat_ident (tok_tail toks)) {
-              | MkPair 0 _ → MkPair (DLet 0 (EVar 0)) toks
-              | MkPair name toks2 → parse_let_decl rt name toks2
+              | MkPair name toks2 →
+                  match name {
+                    | 0 → MkPair (DLet 0 (EVar 0)) toks
+                    | _ → parse_let_decl rt name toks2
+                  }
             }
       }
 
@@ -3027,14 +3055,23 @@ let collect_record_types_go : List Token → List (Pair Nat (List Nat)) → List
 let collect_record_types : List Token → List (Pair Nat (List Nat))
   = λ toks → collect_record_types_go toks Nil
 
+-- parse_program: rewrite the TkEof check to use BPLAN.eq instead of
+-- direct token-constructor matching.  `match v { | TkEof → A | _ → B }`
+-- where TkEof = N(29) compiles to a 29-deep nested Elim succ-chain — and
+-- the wildcard body B is replicated at every level (it has to occupy the
+-- Pin/Law/App arms of each Elim).  For parse_program that meant the
+-- ~3 KB wildcard body (which itself contains the recursive parse_program
+-- call) expanded to a 40 KB body the Reaver evaluator must kal-walk on
+-- every invocation, including the base case.  A two-arm BPLAN.eq match
+-- collapses this to one constant-time check.
 let parse_program : List (Pair Nat (List Nat)) → List Token → List Decl
   = λ rt toks →
-      match (tok_peek toks) {
-        | TkEof → Nil
-        | _ →
+      match (Reaver.BPLAN.eq (tok_peek toks) TkEof) {
+        | 0 →
             match (parse_decl rt toks) {
               | MkPair decl rest → Cons decl (parse_program rt rest)
             }
+        | _ → Nil
       }
 
 -- =====================================================================
@@ -3518,12 +3555,16 @@ let decl_get_inst_body : Decl → Pair Nat (List (Pair Nat Expr))
 -- -------------------------------------------------------------------
 
 -- cg_name_in_list: 1 if name appears in list
+-- Uses Reaver.BPLAN.eq (O(1) integer compare) instead of nat_eq.  Names
+-- in the codegen environment can be multi-byte strNats (identifiers like
+-- "parse_expr_dispatch"); recursive nat_eq would take O(min(m,n)) PLAN
+-- reduction steps which is impractical for anything beyond short identifiers.
 let cg_name_in_list : Nat → List Nat → Nat
   = λ name lst →
       match lst {
         | Nil → 0
         | Cons h rest →
-            match (nat_eq name h) {
+            match (Reaver.BPLAN.eq name h) {
               | 0 → cg_name_in_list name rest
               | _ → 1
             }
@@ -3918,7 +3959,7 @@ let cg_hv_dispatch : (Expr → Nat → Nat) → Expr → Nat → Nat
             }
         | _ →
             match expr {
-              | EVar n → nat_eq n name
+              | EVar n → Reaver.BPLAN.eq n name
               | _ → 0
             }
       }
@@ -5281,20 +5322,23 @@ let cg_compile_expr : Expr → CEnv → List (Pair Nat (Pair Nat Nat)) → Nat �
 -- -------------------------------------------------------------------
 
 -- name_concat_dot: "mod" ++ "." ++ "item" as little-endian nat
+-- Uses add (BPLAN.add) instead of bit_or: the three segments are in
+-- non-overlapping bit ranges by construction, so add = bit_or there.
 let name_concat_dot : Nat → Nat → Nat
   = λ mod_name item_name →
       let blen = nat_byte_len mod_name in
       let dot = shift_left 0x2E (mul 8 blen) in
       let item_shifted = shift_left item_name (mul 8 (add blen 1)) in
-      bit_or (bit_or mod_name dot) item_shifted
+      add (add mod_name dot) item_shifted
 
 -- name_concat_under: "a" ++ "_" ++ "b" as little-endian nat
+-- Same non-overlapping invariant → add = bit_or.
 let name_concat_under : Nat → Nat → Nat
   = λ a_name b_name →
       let blen = nat_byte_len a_name in
       let under = shift_left 0x5F (mul 8 blen) in
       let b_shifted = shift_left b_name (mul 8 (add blen 1)) in
-      bit_or (bit_or a_name under) b_shifted
+      add (add a_name under) b_shifted
 
 -- Precomputed name nats for Core.PLAN externals (used by name lookup)
 -- These are int.from_bytes(s.encode('utf-8'), 'little') values
