@@ -260,6 +260,24 @@ a lifted law of arity `n_cap + 1`, partial-apply at the outer env's
 perspective. (AUDIT.md A1; regression tests `test_a1_*` in
 `tests/bootstrap/test_codegen.py`.)
 
+**Same-constructor literal-field disambiguation (`_compile_con_match`).**
+Two arms that match the *same* constructor and differ only by a literal
+in a field position (`match p { | MkPair 0 _ → A | MkPair n r → B }`) used
+to silently miscompile: both arms got grouped under the same tag, the
+dispatch had no mechanism to inspect field values, and the first arm fired
+unconditionally. Root cause of the Phase G3 300s timeout — `parse_decl`
+used this shape, so the `MkPair 0 _ → MkPair (DLet 0 (EVar 0)) toks`
+sentinel always won and the parser never advanced. The codegen now rejects
+this pattern at compile time with a clear error pointing at the workaround:
+extract the literal-bound field into a variable in a single arm, then
+dispatch on it with a nested `match`. Canonical workaround:
+`compiler/src/Compiler.gls::parse_lambda_params`. A full codegen fix
+(group same-tag arms, synthesise a nested field dispatch) is future work;
+the current behaviour is fail-loud rather than fail-silent. Regression
+tests: `test_same_constructor_literal_field_rejected` and
+`test_same_constructor_no_literal_still_ok` in
+`tests/bootstrap/test_codegen.py`. AUDIT.md D9.
+
 The **prelude types** (Option, Result, List) only use 2-constructor matches.
 The above bugs surface in user-defined types with three or more constructors
 in mixed-arity combinations — write tests when you add such a type.

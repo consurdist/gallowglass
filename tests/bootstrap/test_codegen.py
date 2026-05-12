@@ -1965,3 +1965,52 @@ def test_top_level_nat_unchanged():
     # No body context, so bare N(12345) is fine (and will round-trip
     # through emit_pla as a bare numeric literal).
     assert is_nat(val) and val == 12345, f'top-level nat literal: {val!r}'
+
+
+# ---------------------------------------------------------------------------
+# Same-constructor literal-field disambiguation
+# ---------------------------------------------------------------------------
+#
+# When two arms match the same constructor and one binds a literal in a
+# field position (`| MkPair 0 _ → A | MkPair n r → B`), the codegen has no
+# way to inspect field values — it would dispatch both arms on the same
+# tag and the first would fire unconditionally.  Until the full fix lands
+# (group same-tag arms and synthesise a nested field dispatch), the
+# codegen rejects the pattern with a clear error pointing at the
+# extract-then-dispatch workaround.  Root cause of the Phase G3 300s
+# timeout; commits 40d2199 / 18e6f5b / 0df4ef6 worked around it at every
+# affected call site in `Compiler.gls`.
+
+def test_same_constructor_literal_field_rejected():
+    """`match p { | MkPair 0 _ → A | MkPair n r → B }` raises CodegenError."""
+    src = (
+        'type Pair a b = | MkPair a b\n'
+        'let test : Nat\n'
+        '  = match (MkPair 5 0) {\n'
+        '    | MkPair 0 _ → 1\n'
+        '    | MkPair n _ → 2\n'
+        '  }\n'
+    )
+    try:
+        pipeline(src)
+    except CodegenError as e:
+        msg = str(e)
+        assert 'MkPair' in msg, f'error should name the offending constructor: {msg!r}'
+        assert 'nested `match`' in msg or 'extract' in msg, \
+            f'error should describe the workaround: {msg!r}'
+        return
+    raise AssertionError('expected CodegenError for same-constructor literal-field pattern')
+
+
+def test_same_constructor_no_literal_still_ok():
+    """A match with a single arm per constructor compiles fine."""
+    src = (
+        'type Pair a b = | MkPair a b\n'
+        'let test : Nat\n'
+        '  = match (MkPair 5 7) {\n'
+        '    | MkPair x _ → x\n'
+        '  }\n'
+    )
+    # Should not raise.
+    compiled = pipeline(src)
+    assert 'Test.test' in compiled

@@ -1130,6 +1130,15 @@ let lex_one : Pair Nat Nat → LexPos → Pair Token LexPos
                                                                                       | 0 →
                                                                                           match (Reaver.BPLAN.eq b 0x22) {   -- '"'
                                                                                             | 0 →
+                                                                                                -- 0x2D '-': ASCII alt for arrow `->`.
+                                                                                                -- `lex_skip_ws` already swallows `--` line
+                                                                                                -- comments before we get here, so a bare `-`
+                                                                                                -- followed by `>` is the only legal `-`
+                                                                                                -- prefix in token position.  Matches the
+                                                                                                -- Unicode `→` arm below and the Python
+                                                                                                -- bootstrap lexer's ASCII fallback.
+                                                                                                match (Reaver.BPLAN.eq b 0x2D) {
+                                                                                                  | 0 →
                                                                                                 -- 0xE2: lead byte for → ← ∀
                                                                                                 match (Reaver.BPLAN.eq b 0xE2) {
                                                                                                   | 0 →
@@ -1160,6 +1169,13 @@ let lex_one : Pair Nat Nat → LexPos → Pair Token LexPos
                                                                                                               | k → MkPair TkBackArrow pos3
                                                                                                             }
                                                                                                         | k → MkPair TkArrow pos3
+                                                                                                      }
+                                                                                                }
+                                                                                                  | k →
+                                                                                                      -- ASCII `->`: require `>` next.
+                                                                                                      match (Reaver.BPLAN.eq (bytes_at src (lexpos_offset pos1)) 0x3E) {
+                                                                                                        | 0 → MkPair (TkErr b) pos1
+                                                                                                        | k → MkPair TkArrow (lexpos_advance pos1)
                                                                                                       }
                                                                                                 }
                                                                                             | k →
@@ -1337,12 +1353,16 @@ let tok_eat_ident : List Token → Pair Nat (List Token)
       }
 
 -- skip tokens until TkEqual is consumed; used to discard type annotations
+-- tok_skip_to_equal: walk tokens until we hit the `=` that ends a type
+-- annotation.  Uses Reaver.BPLAN.eq instead of nat_eq because `t` may be
+-- a field-bearing token (TkNat, TkIdent, TkText, TkInterp) — a PLAN App
+-- or Pin, not a bare Nat.  See `tok_is` for the failure mode.
 let tok_skip_to_equal : List Token → List Token
   = λ toks →
       match toks {
         | Nil → Nil
         | Cons t rest →
-            match (nat_eq t TkEqual) {
+            match (Reaver.BPLAN.eq t TkEqual) {
               | 0 → tok_skip_to_equal rest
               | k → rest
             }
@@ -1406,13 +1426,15 @@ let name_append_dot : Pair Nat Nat → Pair Nat Nat
             MkPair (Core.PLAN.inc len) (add n (shift_left 0x2E (mul 8 len)))
       }
 
--- parse_qual_name_go: consume additional TkDot TkIdent segments
+-- parse_qual_name_go: consume additional TkDot TkIdent segments.
+-- Uses Reaver.BPLAN.eq instead of nat_eq because `t1` may be a
+-- field-bearing token (App or Pin), not a bare Nat — see `tok_is`.
 let parse_qual_name_go : List Token → Pair Nat Nat → Pair Nat (List Token)
   = λ toks acc →
       match toks {
         | Nil → match acc { | MkPair len n → MkPair n Nil }
         | Cons t1 rest1 →
-            match (nat_eq t1 TkDot) {
+            match (Reaver.BPLAN.eq t1 TkDot) {
               | 0 → match acc { | MkPair len n → MkPair n toks }
               | k →
                   match rest1 {
@@ -1448,7 +1470,10 @@ let parse_qual_name : List Token → Pair Nat (List Token)
 -- =====================================================================
 
 -- is_atom_start: 1 if current token can begin an atom expression
--- Handles TkNat, TkText, TkIdent, TkInterp (App arms), TkLParen, TkMatch, TkLBracket (nat_eq chain)
+-- Handles TkNat, TkText, TkIdent, TkInterp (App arms), TkLParen, TkMatch, TkLBracket
+-- via BPLAN.eq chain.  An unrecognised App-tag token like TkErr would otherwise
+-- slip through the App arms above and fire nat_eq's App-arm Elim with garbage
+-- output — same failure mode as the pre-fix tok_is.
 let is_atom_start : List Token → Nat
   = λ toks →
       match (tok_peek toks) {
@@ -1458,10 +1483,10 @@ let is_atom_start : List Token → Nat
         | TkInterp _ → 1
         | _ →
             let t = tok_peek toks in
-            match (nat_eq t TkLParen) {
+            match (Reaver.BPLAN.eq t TkLParen) {
               | 0 →
-                  match (nat_eq t TkMatch) {
-                    | 0 → nat_eq t TkLBracket
+                  match (Reaver.BPLAN.eq t TkMatch) {
+                    | 0 → Reaver.BPLAN.eq t TkLBracket
                     | k → 1
                   }
               | k → 1
@@ -2458,27 +2483,31 @@ let skip_type_params : List Token → List Token
       }
 
 -- is_arity_stop: 1 if token ends a constructor field list (| } EOF let type external eff class instance)
--- Uses nat_eq chains (each with 1 named arm) — avoids multi-nat-arm pred_env bug.
+-- Uses Reaver.BPLAN.eq chains so an App-form token (TkText, TkIdent, TkInterp,
+-- TkErr) compares cleanly to N(0) rather than firing nat_eq's App-arm Elim
+-- and returning garbage.  The multi-nat-arm pred_env bug noted in the
+-- previous comment is independently avoided by keeping one named arm per
+-- match.
 let is_arity_stop : Nat → Nat
   = λ t →
-      match (nat_eq t TkBar) {
+      match (Reaver.BPLAN.eq t TkBar) {
         | 0 →
-            match (nat_eq t TkRBrace) {
+            match (Reaver.BPLAN.eq t TkRBrace) {
               | 0 →
-                  match (nat_eq t TkEof) {
+                  match (Reaver.BPLAN.eq t TkEof) {
                     | 0 →
-                        match (nat_eq t TkLet) {
+                        match (Reaver.BPLAN.eq t TkLet) {
                           | 0 →
-                              match (nat_eq t TkType) {
+                              match (Reaver.BPLAN.eq t TkType) {
                                 | 0 →
-                                    match (nat_eq t TkExternal) {
+                                    match (Reaver.BPLAN.eq t TkExternal) {
                                       | 0 →
-                                          match (nat_eq t TkEff) {
+                                          match (Reaver.BPLAN.eq t TkEff) {
                                             | 0 →
-                                                match (nat_eq t TkClass) {
+                                                match (Reaver.BPLAN.eq t TkClass) {
                                                   | 0 →
-                                                      match (nat_eq t TkInstance) {
-                                                        | 0 → nat_eq t TkUse
+                                                      match (Reaver.BPLAN.eq t TkInstance) {
+                                                        | 0 → Reaver.BPLAN.eq t TkUse
                                                         | k → 1
                                                       }
                                                   | k → 1
@@ -2702,7 +2731,11 @@ let parse_ext_decl : Nat → List Token → Pair Decl (List Token)
 let nn_inst : Nat = 0x74736e69  -- "inst"
 
 -- tok_is_class_member_start: 1 if next two tokens are TkIdent + TkColon
--- (signals the start of a class method declaration)
+-- (signals the start of a class method declaration).  The `match _mkpair_n`
+-- inner dispatch is the bootstrap-codegen workaround for two arms with the
+-- same constructor and a literal field — see `parse_lambda_params` for the
+-- canonical shape and `CLAUDE.md §Bootstrap Codegen Pitfalls` for the
+-- underlying bug (AUDIT.md D9).
 let tok_is_class_member_start : List Token → Nat
   = λ toks →
       match (tok_eat_ident toks) {
@@ -2764,7 +2797,9 @@ let parse_class_decl : List Token → Pair Decl (List Token)
       }
 
 -- tok_is_inst_member_start: 1 if next two tokens are TkIdent + TkEqual
--- (signals the start of an instance method binding)
+-- (signals the start of an instance method binding).  Inner `match
+-- _mkpair_n` is the same-constructor-literal-field workaround; see
+-- `tok_is_class_member_start` above for the full reference.
 let tok_is_inst_member_start : List Token → Nat
   = λ toks →
       match (tok_eat_ident toks) {

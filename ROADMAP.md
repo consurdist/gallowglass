@@ -746,9 +746,10 @@ treats that name as the entry point and applies it to the rest of the args:
    runs the pure `main : Bytes → Bytes` pipeline, emits output via
    `Reaver.RPLAN.output (bytesBar_encode result)`.
 3. ✅ **`tests/reaver/test_selfhost.py`.** Phase G #2 smoke (`TestPhaseG2Smoke`:
-   load + empty-source) and Phase G #3 byte-identity gate
-   (`TestPhaseG3ByteIdentity`: `let xx = 42` and `let id_fn = fn x -> x`
-   fixtures, byte-identical to Python bootstrap with module name `Compiler`).
+   load + empty-source — empty stdin now produces `b'@boot\n'`, just the
+   prelude) and Phase G #3 byte-identity gate (`TestPhaseG3ByteIdentity`:
+   `let xx = 42` and `let id = fn x -> x` fixtures, byte-identical to the
+   Python bootstrap with module name `Compiler`).
 4. ✅ **CI gate.** `selfhost` matrix entry in `.github/workflows/ci.yml` runs
    `tests/reaver/test_selfhost.py` in the `reaver` job alongside `smoke`
    and `differential`.

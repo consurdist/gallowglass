@@ -2135,6 +2135,37 @@ class Compiler:
         if not con_arms:
             return self._compile_fallback_match(scrutinee, arms, env, name_hint, loc=loc)
 
+        # Reject duplicate constructors in the arm list.  When the source has
+        # two arms for the same constructor differing only in a literal field
+        # pattern (`| MkPair 0 _ → A | MkPair n r → B`), the dispatch we build
+        # below routes purely by tag — so both arms land at the same tag and
+        # the first one fires unconditionally, silently making the second arm
+        # unreachable.  This was the root cause of the Phase G3 300s timeout
+        # on `let xx = 42`: `parse_decl` used this shape and the literal `0`
+        # sentinel branch always won, so the parser never advanced.
+        #
+        # The compile-time error here points the user at the workaround
+        # pattern used throughout `compiler/src/Compiler.gls`: bind the field
+        # to a variable and dispatch on it with a nested `match`.  See
+        # `parse_lambda_params` for the canonical shape.  A full codegen fix
+        # would group same-tag arms and emit a synthesized nested dispatch on
+        # the field values; that's deferred to keep this fix minimal.
+        seen_tags: dict = {}
+        for info, _, _ in con_arms:
+            if info.tag in seen_tags:
+                raise CodegenError(
+                    f'codegen: two arms match the same constructor '
+                    f'{info.fq_name!r} (tag {info.tag}). The bootstrap codegen '
+                    f'does not disambiguate arms by field value — both arms '
+                    f'would dispatch on the same tag and the first one would '
+                    f'fire unconditionally. Workaround: extract the field as a '
+                    f'variable in a single arm, then dispatch on it with a '
+                    f'nested `match`. See `compiler/src/Compiler.gls` — '
+                    f'`parse_lambda_params` is the canonical shape.',
+                    loc,
+                )
+            seen_tags[info.tag] = info.fq_name
+
         # Sort by tag
         con_arms.sort(key=lambda t: t[0].tag)
         max_tag = con_arms[-1][0].tag

@@ -281,16 +281,16 @@ class TestPhaseG3ByteIdentity(unittest.TestCase):
         self._assert_byte_identical('let xx = 42')
 
     def test_identity_function(self):
-        """``let id = fn x → x`` — Law emit; validates lambda codegen.
+        """``let id = fn x -> x`` — Law emit; validates lambda codegen.
 
         ``id`` encodes to strNat 25705 (little-endian 'i'=0x69, 'd'=0x64),
         keeping nat comparisons cheap.  Exercises the full lambda/Law emit
         path without triggering multi-billion-step nat_eq calls.
 
-        Uses Unicode arrow ``→`` (E2 86 92) — Compiler.gls's lexer only
-        recognises the Unicode form; ASCII ``->`` is a future-work item.
+        Uses ASCII ``->`` to exercise the lexer's ASCII arrow path
+        alongside the Unicode ``→`` recognition.
         """
-        self._assert_byte_identical('let id = fn x → x')
+        self._assert_byte_identical('let id = fn x -> x')
 
 
 if __name__ == '__main__':

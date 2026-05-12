@@ -480,6 +480,27 @@ so future sessions can pick up where the current one stopped.)
       next bottleneck rather than this codegen bug.
       (PR: fix/d8-nested-let-lambda-lift)
 
+- [x] **D9. `_compile_con_match` did not disambiguate same-constructor
+      arms with literal field patterns.** `match p { | MkPair 0 _ → A |
+      MkPair n r → B }` collected both arms under the same tag and
+      dispatched purely by tag, so the first arm fired unconditionally and
+      the `n` case became silently unreachable. Root cause of the
+      Phase G3 300s timeout — `parse_decl`'s let branch used this exact
+      shape, so the `MkPair 0 _ → MkPair (DLet 0 (EVar 0)) toks` sentinel
+      always won, `parse_program` recursed forever on the same input, and
+      `length` walked an infinite Cons spine. Fix is fail-loud rather than
+      full transformation: `_compile_con_match` now raises `CodegenError`
+      with a message naming the offending constructor and pointing at
+      the extract-then-dispatch workaround (`compiler/src/Compiler.gls::
+      parse_lambda_params` is the canonical shape). All 25 affected sites
+      in `Compiler.gls` were refactored to the workaround in commits
+      40d2199 / 18e6f5b / 0df4ef6 — none trip the new error. A proper fix
+      (group same-tag arms and synthesise a nested field dispatch) is
+      future work; the current behaviour ensures the bug can never bite
+      silently again. Pinned by `test_same_constructor_literal_field_rejected`
+      and `test_same_constructor_no_literal_still_ok` in
+      `tests/bootstrap/test_codegen.py`.
+
 D1–D4 above were the IDE-tooling prerequisites that landed
 back-to-back in support of the new `bootstrap/mcp_server.py` (PR #74) —
 a stdio MCP server exposing `compile_snippet`, `infer_type`,
