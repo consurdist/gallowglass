@@ -2763,7 +2763,27 @@ class Compiler:
                     arm_env.locals[pats[0].name] = field1_idx
                 if len(pats) >= 2 and isinstance(pats[1], PatVar):
                     arm_env.locals[pats[1].name] = field2_inner_idx
-                inner_law_body = self._compile_expr(body, arm_env, f'{name_hint}_{info.fq_name.split(".")[-1]}')
+                arm_compiled = self._compile_expr(
+                    body, arm_env, f'{name_hint}_{info.fq_name.split(".")[-1]}',
+                )
+                # When the surrounding match has a wildcard, dispatch on
+                # `inner_tag` so non-matching constructors (e.g. another
+                # 2-field App with a different tag) correctly fall through
+                # to the wild body.  Without this check the inner handler
+                # fires arm_compiled for every binary App regardless of tag
+                # — the classic "wildcard arm drop" bug, but for binary
+                # single-arm matches.  Symptom: `match e { | Foo _ _ → A |
+                # _ → B }` returns A for any 2-field App, not just Foo.
+                # Discovered when `cg_is_lam` matched EApp as if it were
+                # ELam, breaking `cg_flatten_lam` for nested lambdas.
+                if wild_body is not None:
+                    inner_law_body = self._build_tag_chain(
+                        [(info.tag, arm_compiled)], wild_body, wild_var_con,
+                        N(inner_tag_idx), inner_env,
+                        f'{name_hint}_inner_single_tag',
+                    )
+                else:
+                    inner_law_body = arm_compiled
             else:
                 tag_val_pairs = []
                 for info, pats, body in field_sorted:

@@ -2070,3 +2070,51 @@ def test_same_constructor_no_literal_still_ok():
     # Should not raise.
     compiled = pipeline(src)
     assert 'Test.test' in compiled
+
+
+# ---------------------------------------------------------------------------
+# Binary single-arm tag dispatch (the cg_is_lam class of bugs)
+# ---------------------------------------------------------------------------
+#
+# `match e { | Con field1 field2 → body | _ → wild }` for a 2-field
+# constructor used to compile without inspecting the tag — the
+# binary-single-arm path in `_build_field_arm_law` fired the arm body
+# for ANY 2-field App, regardless of which constructor it actually was.
+# Symptom: `cg_is_lam (EApp f g)` returned 1 (the ELam arm body) instead
+# of 0 (wildcard).  Discovered when `let ap = fn ff -> fn xx -> ff xx`
+# diverged between bootstrap (arity 2) and self-host (arity 3) —
+# `cg_flatten_lam` over-collected because `cg_is_lam` mis-fired on EApp.
+# Same class as the older "wildcard arm drop" bug for unary
+# constructors, documented in CLAUDE.md.
+
+def test_binary_single_arm_tag_check_fires_arm():
+    """A 2-field-constructor single-arm match returns the arm body
+    when the scrutinee is that constructor."""
+    src = (
+        'type T = | Foo Nat Nat | Bar Nat Nat\n'
+        'let test : Nat = match (Foo 7 11) { | Foo a b → 1 | _ → 99 }\n'
+    )
+    compiled = pipeline(src)
+    assert evaluate(compiled['Test.test']) == 1
+
+
+def test_binary_single_arm_tag_check_dispatches_to_wild():
+    """A 2-field-constructor single-arm match falls through to the
+    wildcard when the scrutinee is a sibling 2-field constructor."""
+    src = (
+        'type T = | Foo Nat Nat | Bar Nat Nat\n'
+        'let test : Nat = match (Bar 7 11) { | Foo a b → 1 | _ → 99 }\n'
+    )
+    compiled = pipeline(src)
+    assert evaluate(compiled['Test.test']) == 99
+
+
+def test_binary_single_arm_no_wild_fires_arm():
+    """A 2-field-constructor single-arm match with no wildcard still
+    fires the arm body (no defensive dispatch added)."""
+    src = (
+        'type Pair a b = | MkPair a b\n'
+        'let test : Nat = match (MkPair 5 11) { | MkPair a _ → a }\n'
+    )
+    compiled = pipeline(src)
+    assert evaluate(compiled['Test.test']) == 5

@@ -327,18 +327,18 @@ class TestPhaseG3ByteIdentity(unittest.TestCase):
         """
         self._assert_byte_identical('let kk = fn x -> fn y -> x')
 
-    @unittest.expectedFailure
     def test_application_in_body(self):
         """``let ap = fn ff -> fn xx -> ff xx`` — emits an App in the law body.
 
-        The previous fixtures only emitted bare slot references in
-        bodies; this fixture should pin the ``(_1 _2)`` body-apply form
-        (``emit_bval_papp_*``).  Currently xfail: the Gallowglass
-        self-host emits arity 3 + body ``_2`` while the Python bootstrap
-        emits arity 2 + body ``(_1 _2)``.  Looks like a self-host
-        ``cg_flatten_lam`` / lambda-lifting divergence pre-dating this
-        PR — out of scope for the rc1 → 1.0 work but pinned here so the
-        next session can pick it up.
+        Pins the ``(_1 _2)`` body-apply form (``emit_bval_papp_*``).
+        Previously xfailed: the self-host's ``cg_is_lam`` (single-arm
+        binary constructor match) miscompiled and treated ``EApp`` as
+        ``ELam``, so ``cg_flatten_lam`` over-collected params, producing
+        arity 3 + body ``_2`` instead of arity 2 + body ``(_1 _2)``.
+        Fixed by adding a tag check to the binary single-arm path in
+        ``bootstrap/codegen.py::_build_field_arm_law`` (same class of bug
+        as the unary "wildcard arm drop" already documented in
+        ``CLAUDE.md §Bootstrap Codegen Pitfalls``).
         """
         self._assert_byte_identical('let ap = fn ff -> fn xx -> ff xx')
 

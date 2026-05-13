@@ -5037,10 +5037,10 @@ let cg_compile_lam : Expr → CEnv → List (Pair Nat (Pair Nat Nat)) → Nat �
         | MkPair params body_expr →
             match (nat_eq (cenv_arity env) 0) {
               | 0 →
-                  -- Top-level: compile as named law
+                  -- Inside a law body: lambda-lift any free vars + params
                   cg_compile_lam_lifted params body_expr env ce ctab hint
               | _ →
-                  -- Top-level (arity=0): compile as named law
+                  -- Top-level (env.arity == 0): compile as a named law.
                   cg_compile_lam_as_law params body_expr env ce ctab hint
             }
       }

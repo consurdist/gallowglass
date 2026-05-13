@@ -228,7 +228,16 @@ through to `_compile_adt_dispatch`; if it is not, all constructors (being
 PLAN Apps) match the single arm and the wildcard body is silently unreachable.
 Pattern: `| Con x → body | _ → default`. Symptom: `f(OtherConstructor)`
 returns the same result as `f(Con ...)`. Fix: pass `wild_arm` explicitly.
-This first surfaced for `planval_is_nat`, `planval_is_app`, etc.
+This first surfaced for `planval_is_nat`, `planval_is_app`, etc., and was
+later rediscovered in the **binary single-arm** path inside
+`_build_field_arm_law` (line ~2759): the unary single-arm path correctly
+synthesised a tag check around the arm body, but the binary path did not,
+so `match e { | Foo a b → A | _ → B }` returned A for *every* 2-field App.
+This bit `cg_is_lam` directly — it claimed `EApp` was an `ELam`, breaking
+`cg_flatten_lam` for nested lambdas (every multi-param function in
+`Compiler.gls` was at risk).  Fix: wrap the binary single-arm body in
+`_build_tag_chain` when `wild_body is not None`.  Pinned by
+`test_binary_single_arm_tag_check_*` in `tests/bootstrap/test_codegen.py`.
 
 **Mixed-arity binary path (`_build_field_arm_law`).** When a type has both
 unary (arity=1) and binary (arity=2) field-bearing constructors, the binary
