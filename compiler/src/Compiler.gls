@@ -6369,6 +6369,19 @@ let emit_asm_pin : Bytes → Bytes
                 (bytes_concat (bytes_singleton 0x20)
                   (bytes_concat inner_asm (bytes_singleton 0x29)))))))
 
+-- "Elim" as raw bytes: 0x45 'E', 0x6C 'l', 0x69 'i', 0x6D 'm'.  Used to
+-- translate a Pin'd Elim opcode (`PPin (PNat 2)`) to Reaver's named
+-- primitive, since Reaver gives `(#pin 2)` arity 1 rather than the
+-- 6-arity Elim semantics gallowglass codegen expects.  Boot.plan binds
+-- `Elim` to the BPLAN-named Elim primitive — see
+-- `bootstrap/emit_pla.py::emit_top` for the canonical translation.
+let emit_elim_symbol : Bytes
+  = bytes_concat
+      (bytes_singleton 0x45)
+      (bytes_concat (bytes_singleton 0x6C)
+        (bytes_concat (bytes_singleton 0x69)
+          (bytes_singleton 0x6D)))
+
 -- ---------------------------------------------------------------------------
 -- emit_law_sig_go: emit " _i ... _k" (space-prefixed args beyond _0)
 -- Self-recursive; terminates when i > k.
@@ -6522,7 +6535,16 @@ let emit_bval_dispatch
             else
               emit_asm_app (ebv f depth) (ebv x depth)
         | PPin v →
-            emit_asm_pin (ep v)
+            -- Translate `P(N 2)` (Elim opcode) to the bare `Elim` symbol.
+            -- See `emit_pval_dispatch`'s PPin arm for the rationale.
+            match (planval_is_nat v) {
+              | 0 → emit_asm_pin (ep v)
+              | _ →
+                  match (Reaver.BPLAN.eq (planval_get_nat v) 2) {
+                    | 0 → emit_asm_pin (ep v)
+                    | _ → emit_elim_symbol
+                  }
+            }
         | PLaw _ _ →
             -- Lambda-lifted laws appear as PPin(PLaw ...) in law bodies.
             ep pval
@@ -6579,7 +6601,19 @@ let emit_pval_dispatch : (PlanVal → Bytes) → PlanVal → Bytes
         | PApp f x → emit_asm_app (ep f) (ep x)
         | PLaw name ap →
             emit_plaw ep name (pair_nat_planval_fst ap) (pair_nat_planval_snd ap)
-        | PPin v → emit_asm_pin (ep v)
+        | PPin v →
+            -- `P(N 2)` is the Elim opcode; Reaver's `(#pin 2)` has arity 1
+            -- which is wrong for our 6-arg Elim dispatch.  Translate to
+            -- the bare `Elim` symbol so boot.plan's `bplan` macro binds
+            -- it to the named primitive.  Mirrors emit_pla.py::emit_top.
+            match (planval_is_nat v) {
+              | 0 → emit_asm_pin (ep v)
+              | _ →
+                  match (Reaver.BPLAN.eq (planval_get_nat v) 2) {
+                    | 0 → emit_asm_pin (ep v)
+                    | _ → emit_elim_symbol
+                  }
+            }
       }
 
 -- emit_pval: ties the knot for emit_pval_dispatch.
