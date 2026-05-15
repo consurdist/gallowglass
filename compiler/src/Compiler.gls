@@ -537,6 +537,14 @@ type PlanVal =
   | PApp PlanVal PlanVal
   | PLaw Nat (Pair Nat PlanVal)     -- name_nat, (arity, body)
   | PPin PlanVal
+  | PNamed Nat PlanVal              -- cross-binding tag: (fq_name, val) — emit
+                                    -- renders as bare `Module_foo` symbol
+                                    -- instead of inlining val.  Mirrors
+                                    -- bootstrap/emit_pla.py::_maybe_symbol.
+                                    -- Tagged at cg_var_from_env, stripped at
+                                    -- emit_pval/emit_body_val.  All other
+                                    -- helpers see PNamed as opaque (fall
+                                    -- through their wildcard arms).
 
 -- Compilation environment (4 fields → nested Pairs)
 -- globals : List (Pair Nat PlanVal)
@@ -1500,14 +1508,29 @@ let is_upper_first_byte : Nat → Nat
 -- parse_ident_list: collect TkIdent tokens (constructor field names)
 let parse_ident_list : List Token → Pair (List Nat) (List Token)
   = λ toks →
-      match (tok_eat_ident toks) {
-        | MkPair n rest →
-            match n {
-              | 0 → MkPair Nil toks
-              | _ →
-                  match (parse_ident_list rest) {
-                    | MkPair names rest2 → MkPair (Cons n names) rest2
+      -- Wildcard `_` in field-pattern position (e.g. `Cons _ rest`) is a
+      -- pattern atom that occupies a slot but is never referenced.  Python's
+      -- _parse_pattern returns PatWild for `_`; we use the sentinel name 0
+      -- so downstream `cg_arm_con_arity` counts the field while
+      -- `cenv_bind_local 0 slot` adds a never-looked-up entry.  Use
+      -- `Reaver.BPLAN.eq` to peek the token (TkUnderscore is a nullary
+      -- constructor, i.e. a bare Nat) and recurse, otherwise fall through
+      -- to the original ident-only path.
+      match (Reaver.BPLAN.eq (tok_peek toks) TkUnderscore) {
+        | 0 →
+            match (tok_eat_ident toks) {
+              | MkPair n rest →
+                  match n {
+                    | 0 → MkPair Nil toks
+                    | _ →
+                        match (parse_ident_list rest) {
+                          | MkPair names rest2 → MkPair (Cons n names) rest2
+                        }
                   }
+            }
+        | _ →
+            match (parse_ident_list (tok_tail toks)) {
+              | MkPair names rest → MkPair (Cons 0 names) rest
             }
       }
 
@@ -2259,27 +2282,40 @@ let parse_atom_expr_pe : List (Pair Nat (List Nat)) → (List Token → Pair Exp
       }
 
 -- parse_app_go_pe: fold additional atoms into application spine
--- When is_atom_start returns 0, checks for { to handle record updates: acc { field = expr }
+-- When is_atom_start returns 0, checks for { to handle record updates:
+-- acc { field = expr }.  CRITICAL: only consume `{` as a record update when
+-- the token AFTER it is an identifier (a field name).  Without this
+-- lookahead, `match scrut { | ... }` mis-parses scrut and `{` as the start
+-- of a record update, eats the `|` arms as garbage record fields, and
+-- leaves parse_match_expr_pe with an empty arms list and trailing junk
+-- tokens.  Mirrors bootstrap/parser.py:972-983.
 let parse_app_go_pe : List (Pair Nat (List Nat)) → (List Token → Pair Expr (List Token)) → Expr → List Token → Pair Expr (List Token)
   = λ rt pe acc toks →
       match (is_atom_start toks) {
         | 0 →
-            -- Record update: acc { field = expr, ... }
             match (tok_is toks TkLBrace) {
               | 0 → MkPair acc toks
               | k →
-                  match (parse_record_expr_fields_pe pe (tok_tail toks)) {
-                    | MkPair upd_pairs rest_ru →
-                        let upd_fnames = collect_field_names upd_pairs in
-                        match (rt_lookup_subset rt upd_fnames) {
-                          | MkPair type_name decl_fields →
-                              -- Desugar: match acc { | Type f1 f2 ... → Type e1' e2' ... }
-                              let body_exprs = build_update_body_exprs decl_fields upd_pairs in
-                              let rebuild = build_con_app (EVar type_name) body_exprs in
-                              let arm = ArmCon type_name (MkPair decl_fields rebuild) in
-                              let result = EMatch acc (Cons arm Nil) in
-                              parse_app_go_pe rt pe result rest_ru
+                  -- Lookahead: only treat as record update if the next
+                  -- token after `{` is an identifier (field name).  Bare
+                  -- `{ |` etc. is NOT a record update — return acc and
+                  -- let the caller handle the brace.
+                  match (tok_peek (tok_tail toks)) {
+                    | TkIdent _ →
+                        match (parse_record_expr_fields_pe pe (tok_tail toks)) {
+                          | MkPair upd_pairs rest_ru →
+                              let upd_fnames = collect_field_names upd_pairs in
+                              match (rt_lookup_subset rt upd_fnames) {
+                                | MkPair type_name decl_fields →
+                                    -- Desugar: match acc { | Type f1 f2 ... → Type e1' e2' ... }
+                                    let body_exprs = build_update_body_exprs decl_fields upd_pairs in
+                                    let rebuild = build_con_app (EVar type_name) body_exprs in
+                                    let arm = ArmCon type_name (MkPair decl_fields rebuild) in
+                                    let result = EMatch acc (Cons arm Nil) in
+                                    parse_app_go_pe rt pe result rest_ru
+                              }
                         }
+                    | _ → MkPair acc toks
                   }
             }
         | k →
@@ -2527,14 +2563,52 @@ let is_arity_stop : Nat → Nat
         | k → 1
       }
 
--- parse_con_arity: count tokens before next | } let type external (arity)
--- Uses is_arity_stop (1 named nat arm) — avoids multi-nat-arm pred_env bug.
-let parse_con_arity : List Token → Nat → Pair Nat (List Token)
-  = λ toks acc →
-      match (is_arity_stop (tok_peek toks)) {
-        | 0 → parse_con_arity (tok_tail toks) (Core.PLAN.inc acc)
+-- parse_con_arity_go: scan tokens counting atom types until a stop token
+-- at depth 0.  An atom is either a single non-paren token OR a balanced
+-- paren group `(...)`.  Mirrors Python's parser, which reads one atom-type
+-- per field via `_parse_atom_type` (bootstrap/parser.py L330).  The
+-- previous token-count version produced arity 5 for `Cons a (List a)`
+-- (counting `a`, `(`, `List`, `a`, `)`) instead of 2.
+let parse_con_arity_go : List Token → Nat → Nat → Pair Nat (List Token)
+  = λ toks depth acc →
+      let t = tok_peek toks in
+      -- Hoist `is_arity_stop` above the depth branch so EOF terminates
+      -- the scan at any depth.  Without this, malformed input like
+      -- `type Foo = | Bar (Nat` (unbalanced open paren) recurses
+      -- forever once the token stream runs dry — the depth > 0 branch
+      -- never consults `is_arity_stop` and `tok_peek` on an exhausted
+      -- list returns `TkEof` indefinitely.  Stop tokens (`|`, `}`,
+      -- `let`, ...) legally occur only at depth 0; finding one inside
+      -- parens means the source is malformed and stopping is correct.
+      match (is_arity_stop t) {
+        | 0 →
+            match (Reaver.BPLAN.eq depth 0) {
+              | 0 →
+                  -- Inside parens (depth > 0): track depth, don't count.
+                  match (Reaver.BPLAN.eq t TkLParen) {
+                    | 0 →
+                        match (Reaver.BPLAN.eq t TkRParen) {
+                          | 0 → parse_con_arity_go (tok_tail toks) depth acc
+                          | _ → parse_con_arity_go (tok_tail toks) (sub depth 1) acc
+                        }
+                    | _ → parse_con_arity_go (tok_tail toks) (add depth 1) acc
+                  }
+              | _ →
+                  -- At depth 0, this is the start of a new atom —
+                  -- count it and advance (entering paren depth if it's `(`).
+                  match (Reaver.BPLAN.eq t TkLParen) {
+                    | 0 → parse_con_arity_go (tok_tail toks) 0 (Core.PLAN.inc acc)
+                    | _ → parse_con_arity_go (tok_tail toks) 1 (Core.PLAN.inc acc)
+                  }
+            }
         | k → MkPair acc toks
       }
+
+-- parse_con_arity: count atom types before next stop token, returning
+-- (arity, remaining_toks).  Thin wrapper that starts parse_con_arity_go
+-- at depth 0.
+let parse_con_arity : List Token → Nat → Pair Nat (List Token)
+  = λ toks acc → parse_con_arity_go toks 0 acc
 
 -- parse_con_def: parse  | Name fields...
 let parse_con_def : List Token → Pair ConDef (List Token)
@@ -2573,16 +2647,35 @@ let is_ext_type_body_stop : Nat → Nat
         | k → 1
       }
 
--- tok_skip_ext_type_body: skip past type tokens until next ident or } or EOF
--- Uses tok_eat_ident (1 App arm) + is_ext_type_body_stop (nat_eq) to avoid
--- multi-nullary-arm pred_env bug.
+-- tok_skip_ext_type_body: skip the type-tokens of an external-decl item.
+--
+-- Stops at the next item's name (an ident followed by `:`) or at the
+-- closing `}` / EOF.  Idents that are part of the current item's type
+-- (e.g., `Nat` in `sub : Nat → Nat → Nat`) are NOT stops — they get
+-- skipped over and the walk continues.
+--
+-- Previous version stopped at the FIRST ident regardless, which mis-
+-- treated every type-Ident as the next item's name and produced
+-- garbage items + an out-of-position toks cursor.  Reproduction:
+-- `external mod Reaver.BPLAN { sub : Nat → Nat → Nat }` (or any
+-- multi-Ident type signature).  Mirrors Python parser.py:518-522
+-- in spirit (Python actually parses the type; we just need to skip).
 let tok_skip_ext_type_body : List Token → List Token
   = λ toks →
       match (tok_eat_ident toks) {
-        | MkPair n _ →
+        | MkPair n rest →
             match (nat_eq n 0) {
-              | 0 → toks
+              | 0 →
+                  -- Found an ident.  If the token after it is `:`, this
+                  -- ident is the next item's NAME — stop here so
+                  -- parse_ext_items eats it next.  Otherwise it's a
+                  -- type token (e.g., `Nat`); advance past and continue.
+                  match (tok_is rest TkColon) {
+                    | 0 → tok_skip_ext_type_body rest
+                    | _ → toks
+                  }
               | k →
+                  -- Non-ident token; stop at `}` / EOF, else advance.
                   match (is_ext_type_body_stop (tok_peek toks)) {
                     | 0 → tok_skip_ext_type_body (tok_tail toks)
                     | k → toks
@@ -2598,15 +2691,17 @@ let tok_skip_ext_type : List Token → List Token
         | k → tok_skip_ext_type_body (tok_tail toks)
       }
 
--- parse_ext_items: parse  name : Type  items inside external mod { }
--- Uses tok_is chain instead of multi-nullary constructor match to avoid pred_env bug.
+-- parse_ext_items: parse  name : Type  items inside external mod { }.
+-- Stops at `}` or EOF.  Previous version had the inner EOF arms swapped —
+-- the `| 0 →` (NOT EOF) arm returned Nil instead of continuing, so any
+-- non-empty external mod body produced an empty items list AND left the
+-- token cursor mid-body, triggering sentinel DLet runs in parse_program.
 let parse_ext_items : List Token → Pair (List Nat) (List Token)
   = λ toks →
       match (tok_is toks TkRBrace) {
         | 0 →
             match (tok_is toks TkEof) {
-              | 0 → MkPair Nil toks
-              | k →
+              | 0 →
                   match (tok_eat_ident toks) {
                     | MkPair name toks1 →
                         match name {
@@ -2617,6 +2712,7 @@ let parse_ext_items : List Token → Pair (List Nat) (List Token)
                             }
                         }
                   }
+              | k → MkPair Nil toks
             }
         | k → MkPair Nil toks
       }
@@ -3270,6 +3366,37 @@ let cenv_bind_global : CEnv → Nat → PlanVal → CEnv
                 (cenv_arity env)
                 (cenv_self env)
 
+-- nn_top_of_law: sentinel local-name encoding "__top_of_law__" LE-packed.
+-- Used as a flag marker in cenv_locals: present ↔ top_of_law=True, absent
+-- ↔ False.  No user identifier can collide because Gallowglass identifiers
+-- don't start with `__` (and even if they could, this exact 14-byte string
+-- is reserved for this flag).  Mirrors Python's `env.top_of_law: bool`
+-- (bootstrap/codegen.py L155).  See cg_compile_elet for why we track this:
+-- native PLAN let form `(1 rhs body)` is only valid at a law's body root,
+-- so nested lets must be lambda-lifted to sub-laws instead.
+let nn_top_of_law : Nat = 1934392534279512447088758627786591
+
+-- cenv_top_of_law: 1 if env is at the body root of some law, 0 otherwise.
+let cenv_top_of_law : CEnv → Nat
+  = λ env →
+      match (assoc_lookup nn_top_of_law (cenv_locals env)) {
+        | Some _ → 1
+        | None → 0
+      }
+
+-- cenv_mark_top_of_law: mark env as being at a law's body root.  The
+-- payload slot value (0) is arbitrary — only presence/absence matters.
+let cenv_mark_top_of_law : CEnv → CEnv
+  = λ env → cenv_bind_local env nn_top_of_law 0
+
+-- cenv_clear_top_of_law: drop the top_of_law marker.  Called by
+-- `cg_dispatch`'s chokepoint when entering a non-let, non-pin expression.
+let cenv_clear_top_of_law : CEnv → CEnv
+  = λ env → cenv_make (cenv_globals env)
+                      (assoc_remove nn_top_of_law (cenv_locals env))
+                      (cenv_arity env)
+                      (cenv_self env)
+
 let cenv_local_lookup : CEnv → Nat → Option Nat
   = λ env name → assoc_lookup name (cenv_locals env)
 
@@ -3340,17 +3467,18 @@ let planval_get_pin_inner : PlanVal → PlanVal
 -- Layer 2: PLAN value builders
 -- -------------------------------------------------------------------
 
--- cg_quote_nat: literal k inside law body with given arity
--- k <= arity → quote form PApp(PNat 0)(PNat k); else PNat k
+-- cg_quote_nat: literal nat k compiled in a law-body (arity > 0) or top-level
+-- (arity = 0) context.  In body context the result is ALWAYS the quote form
+-- PApp(PNat 0)(PNat k) — never bare PNat — because the Plan Assembler emits
+-- every bare body-context PNat as `_k` (a de Bruijn slot ref).  A bare-nat-
+-- as-literal would silently mis-emit as a slot ref for the value k.
+-- Mirrors bootstrap/codegen.py::_compile_nat_literal (the "always-quote-wrap"
+-- discipline from PR #48; see the docstring there for the full rationale).
 let cg_quote_nat : Nat → Nat → PlanVal
   = λ k arity →
       match (nat_eq arity 0) {
-        | 0 →
-            match (lte k arity) {
-              | 0 → PNat k
-              | _ → PApp (PNat 0) (PNat k)
-            }
-        | _ → PNat k
+        | 0 → PApp (PNat 0) (PNat k)   -- body context: always quote
+        | _ → PNat k                    -- top level: bare nat is safe
       }
 
 -- cg_bapp: A(A(N(0), f), x) — application inside a law body
@@ -3369,29 +3497,75 @@ let cg_apply : PlanVal → PlanVal → Nat → PlanVal
 let cg_ensure_pin : PlanVal → PlanVal
   = λ v → match v { | PPin _ → v | _ → PPin v }
 
--- cg_build_op2: Case_(id, id, id, z, m, scr) — nat dispatch
--- arity=0 → top-level (direct Apps); arity>0 → law body (bapp)
+-- cg_build_op2: BPLAN-66-wrapped Elim dispatch — ((#pin 66) (Elim id id id z m scr))
+-- Mirrors bootstrap/codegen.py::_elim_app (arity=0) / _elim_body (arity>0).
+-- The Pin'd nat 66 is BPLAN's named-op gateway ('B'); the inner head is the
+-- name nat for "Elim", which Reaver's `op 66` dispatch decodes back to the
+-- 6-arg Elim primitive. Reaver's runtime hardcodes `arity (P _ _ _) = 1`, so
+-- the legacy `(#pin 2) ...` direct-dispatch form would fire after one arg.
 let cg_build_op2 : PlanVal → PlanVal → PlanVal → Nat → PlanVal
   = λ z m scr arity →
-      let op3 = PPin (PNat 2) in
+      let bplan_pin = PPin (PNat 66) in
+      let elim_head = PNat 1835625541 in  -- nn_bplan_Elim ("Elim" packed LE; see line 5484)
       let id_pin = PPin id_law in
       match (nat_eq arity 0) {
         | 0 →
-            cg_bapp (cg_bapp (cg_bapp (cg_bapp (cg_bapp (cg_bapp op3 id_pin) id_pin) id_pin) z) m) scr
+            -- Body context: quote-wrap constants, build via cg_bapp.
+            let name_quoted = PApp (PNat 0) elim_head in
+            let bplan_quoted = PApp (PNat 0) bplan_pin in
+            let inner = cg_bapp (cg_bapp (cg_bapp (cg_bapp (cg_bapp (cg_bapp name_quoted id_pin) id_pin) id_pin) z) m) scr in
+            cg_bapp bplan_quoted inner
         | _ →
-            PApp (PApp (PApp (PApp (PApp (PApp op3 id_pin) id_pin) id_pin) z) m) scr
+            -- Top level: direct App spine; outer wrap is the BPLAN-66 pin.
+            let inner = PApp (PApp (PApp (PApp (PApp (PApp elim_head id_pin) id_pin) id_pin) z) m) scr in
+            PApp bplan_pin inner
       }
 
--- cg_build_reflect_dispatch: Case_(id, id, app_fn, z, m, scr)
+-- cg_b_decimal_go: build the LE-packed-bytes nat of n's decimal digits.
+-- `acc` accumulates digits from least-significant up; `shift` is the byte
+-- offset (in bytes, not bits) of the NEXT digit to place.  Local to the
+-- codegen layer; `nat_to_decimal_go` in the emit layer is later in the
+-- file and not lexicographically reachable from cg_build_nat_dispatch
+-- (SCC ordering is by name).  This is a Nat → Nat function — it returns
+-- the content nat, not a Bytes pair, so it can be fed directly into
+-- name_concat_under.
+let cg_b_decimal_go : Nat → Nat → Nat → Nat
+  = λ n acc shift →
+      match (nat_eq n 0) {
+        | 0 →
+            let digit = mod_nat n 10 in
+            let new_acc = add acc (shift_left (add 0x30 digit) (mul 8 shift)) in
+            cg_b_decimal_go (div_nat n 10) new_acc (add shift 1)
+        | _ → acc
+      }
+
+-- cg_b_decimal: convert a Nat to the content_nat of its decimal byte string.
+-- Examples: cg_b_decimal 0 = 0x30; cg_b_decimal 1 = 0x31;
+-- cg_b_decimal 12 = 0x32_31 = 12849 (LE bytes "12").
+let cg_b_decimal : Nat → Nat
+  = λ n →
+      match (nat_eq n 0) {
+        | 0 → cg_b_decimal_go n 0 0
+        | _ → 0x30
+      }
+
+-- cg_build_reflect_dispatch: BPLAN-66-wrapped Elim with custom app handler —
+-- ((#pin 66) (Elim id id app_fn z m scr)).  Same shape as cg_build_op2 but
+-- `app_fn` replaces the `id` handler for the App case (used by reflect/show).
 let cg_build_reflect_dispatch : PlanVal → PlanVal → PlanVal → PlanVal → Nat → PlanVal
   = λ app_fn z m scr arity →
-      let op3 = PPin (PNat 2) in
+      let bplan_pin = PPin (PNat 66) in
+      let elim_head = PNat 1835625541 in  -- nn_bplan_Elim ("Elim" packed LE; see line 5484)
       let id_pin = PPin id_law in
       match (nat_eq arity 0) {
         | 0 →
-            cg_bapp (cg_bapp (cg_bapp (cg_bapp (cg_bapp (cg_bapp op3 id_pin) id_pin) app_fn) z) m) scr
+            let name_quoted = PApp (PNat 0) elim_head in
+            let bplan_quoted = PApp (PNat 0) bplan_pin in
+            let inner = cg_bapp (cg_bapp (cg_bapp (cg_bapp (cg_bapp (cg_bapp name_quoted id_pin) id_pin) app_fn) z) m) scr in
+            cg_bapp bplan_quoted inner
         | _ →
-            PApp (PApp (PApp (PApp (PApp (PApp op3 id_pin) id_pin) app_fn) z) m) scr
+            let inner = PApp (PApp (PApp (PApp (PApp (PApp elim_head id_pin) id_pin) app_fn) z) m) scr in
+            PApp bplan_pin inner
       }
 
 -- cg_build_reflect_app: Case_(id, id, app_fn, z, const2(0), scr)
@@ -3400,7 +3574,7 @@ let cg_build_reflect_app : PlanVal → PlanVal → PlanVal → Nat → PlanVal
   = λ app_fn z scr arity →
       let const2_pin = PPin const2_law in
       let m = match (nat_eq arity 0) {
-                | 0 → cg_bapp const2_pin (PPin (PNat 0))
+                | 0 → cg_bapp const2_pin (PApp (PNat 0) (PNat 0))
                 | _ → PApp const2_pin (PNat 0)
               } in
       cg_build_reflect_dispatch app_fn z m scr arity
@@ -3922,17 +4096,24 @@ let cg_keep_free_locals : List (Pair Nat Nat) → List Nat → List Nat → List
             }
       }
 
--- cg_free_vars: names in cenv_locals order that appear free in expr (not in bound)
+-- cg_free_vars: names in INSERTION order that appear free in expr (not in
+-- bound).  The locals list is stored newest-first (assoc_insert prepends);
+-- Python's `env.locals` is a dict iterated in insertion order (oldest
+-- first).  Reversing the locals list before keep-filtering matches
+-- Python's order, which downstream callers use to lay out lifted-law
+-- capture slots and partial-apply them at the call site — that ordering
+-- has to be byte-identical for compile-self.
 let cg_free_vars : Expr → List Nat → CEnv → List Nat
   = λ expr bound env →
       let found = cg_collect_free expr bound env Nil in
-      cg_keep_free_locals (cenv_locals env) found bound
+      cg_keep_free_locals (reverse (cenv_locals env)) found bound
 
--- cg_free_vars_bodies: free locals across multiple bodies (union)
+-- cg_free_vars_bodies: free locals across multiple bodies (union).  Same
+-- reversal as `cg_free_vars` so callers get Python-compatible ordering.
 let cg_free_vars_bodies : List Expr → List Nat → CEnv → List Nat
   = λ bodies bound env →
       let all_found = foldl (λ acc body → cg_collect_free body bound env acc) Nil bodies in
-      cg_keep_free_locals (cenv_locals env) all_found bound
+      cg_keep_free_locals (reverse (cenv_locals env)) all_found bound
 
 -- -------------------------------------------------------------------
 -- Layer 4b: Self-reference detection (same pass-self pattern)
@@ -4092,12 +4273,57 @@ let cg_hv_dispatch : (Expr → Nat → Nat) → Expr → Nat → Nat
 let cg_has_var : Expr → Nat → Nat
   = λ expr name → cg_hv_dispatch cg_has_var expr name
 
+-- cg_short_after_dot_go: scan body of cg_short_after_dot.  Walks `n` byte
+-- by byte, recording the position just after the highest-indexed '.' seen
+-- so far.  `pos` is the current byte index; `len` is the total byte count;
+-- `best` is "first index past last dot" (0 = no dot found yet).
+let cg_short_after_dot_go : Nat → Nat → Nat → Nat → Nat
+  = λ n pos len best →
+      match (lte len pos) {
+        | 0 →
+            match (Reaver.BPLAN.eq (byte_at n pos) 0x2E) {
+              | 0 → cg_short_after_dot_go n (Core.PLAN.inc pos) len best
+              | _ → cg_short_after_dot_go n (Core.PLAN.inc pos) len (Core.PLAN.inc pos)
+            }
+        | _ → best
+      }
+
+-- cg_short_after_dot: extract the segment after the LAST '.' (0x2E) byte
+-- in a little-endian-encoded name nat.  E.g. `Compiler.count_down` →
+-- `count_down`.  If the name contains no '.', returns `n` unchanged.
+-- Mirrors Python's `fq.split('.')[-1]` for self-ref detection when
+-- sr_dispatch failed to qualify a bare EVar to its FQ form.
+let cg_short_after_dot : Nat → Nat
+  = λ n →
+      let len = nat_byte_len n in
+      let pos = cg_short_after_dot_go n 0 len 0 in
+      match (nat_eq pos 0) {
+        | 0 → shift_right n (mul 8 pos)
+        | _ → n
+      }
+
 -- cg_body_uses_self: does expr reference env's self_ref?
+--
+-- Checks both the FQ name and its short tail (after the last '.') —
+-- mirrors Python's `_body_uses_self_ref` safety net for bare EVars
+-- that sr_dispatch failed to qualify.  IMPORTANT: comparisons against
+-- the encoded FQ name use `Reaver.BPLAN.eq` (O(1)) rather than the
+-- recursive `nat_eq` (O(min m n)) — encoded names are ~2^100+ nats,
+-- so `nat_eq` would walk a Case_ chain of cosmic length.
 let cg_body_uses_self : Expr → CEnv → Nat
   = λ expr env →
       match (cenv_self env) {
         | None → 0
-        | Some fq_nat → cg_has_var expr fq_nat
+        | Some fq_nat →
+            match (cg_has_var expr fq_nat) {
+              | 0 →
+                  let short = cg_short_after_dot fq_nat in
+                  match (Reaver.BPLAN.eq short fq_nat) {
+                    | 0 → cg_has_var expr short
+                    | _ → 0
+                  }
+              | _ → 1
+            }
       }
 
 -- cg_flatten_lam: collect params and find body (workaround: no multi-arm match)
@@ -4223,8 +4449,23 @@ let cg_apply_free_locals : PlanVal → List Nat → CEnv → PlanVal
             }
       }
 
+-- cg_concat_under: local mirror of name_concat_under (defined far below) for
+-- use by cg_make_pred_succ_law.  Bootstrap SCC ordering is lexicographic and
+-- doesn't permit forward references across SCCs, so this duplicate exists to
+-- keep the lifted-law name computation byte-identical to Python's
+-- encode_name(hint + "_succ") without reordering the file.
+let cg_concat_under : Nat → Nat → Nat
+  = λ a_name b_name →
+      let blen = nat_byte_len a_name in
+      let under = shift_left 0x5F (mul 8 blen) in
+      let b_shifted = shift_left b_name (mul 8 (add blen 1)) in
+      add (add a_name under) b_shifted
+
 -- cg_make_pred_succ_law: 1-arg succ function binding wild_var to predecessor
--- Captures free locals and self_ref via lambda lifting
+-- Captures free locals and self_ref via lambda lifting.
+-- The lifted law's name nat is `<hint>_succ` (= encode_name(hint + "_succ")),
+-- matching bootstrap/codegen.py::_make_pred_succ_law line 3138.  When hint=0
+-- (no enclosing name) the result is just "_succ" (a leading underscore).
 let cg_make_pred_succ_law : Expr → Nat → CEnv
                            → (Expr → CEnv → List (Pair Nat (Pair Nat Nat)) → Nat → PlanVal)
                            → List (Pair Nat (Pair Nat Nat)) → Nat → PlanVal
@@ -4237,15 +4478,33 @@ let cg_make_pred_succ_law : Expr → Nat → CEnv
                    | 0 →
                        match (cenv_self env) {
                          | None → env0
-                         | Some fq → cenv_new_param env0 fq
+                         | Some fq →
+                             let env_fq = cenv_new_param env0 fq in
+                             let short = cg_short_after_dot fq in
+                             match (Reaver.BPLAN.eq short fq) {
+                               | 0 → cenv_bind_local env_fq short (cenv_arity env_fq)
+                               | _ → env_fq
+                             }
                        }
                    | _ → env0
                  } in
       let env2 = cg_bind_params free_vars env1 in
+      -- Python's _make_pred_succ_law (codegen.py L3118) does NOT set
+      -- `lifted_env.top_of_law = True`, so any let in wild_body gets
+      -- lambda-lifted rather than emitted as a native `(1 …)` form.
+      -- Match that here — top_of_law stays default (0).
       let env3 = cenv_new_param env2 wild_var in
-      let body_val = ce wild_body env3 ctab 0 in
+      -- Thread `_pred` into the body's compile hint so nested lifted
+      -- laws inside the wild body get names like `<hint>_pred_wild_succ`
+      -- instead of the empty-hint default `_wild_succ`.  Mirrors
+      -- Python's _make_pred_succ_law (codegen.py L3137).
+      let nn_pred = 1684370032 in  -- "pred" LE
+      let body_hint = cg_concat_under hint nn_pred in
+      let body_val = ce wild_body env3 ctab body_hint in
       let arity = cenv_arity env3 in
-      let lifted_law = PPin (PLaw 0 (MkPair arity body_val)) in
+      let nn_succ = 1667462515 in  -- = encode_name("succ")
+      let law_name = cg_concat_under hint nn_succ in
+      let lifted_law = PPin (PLaw law_name (MkPair arity body_val)) in
       let result0 = match (nat_eq uses_self 0) {
                       | 0 →
                           match (nat_eq (cenv_arity env) 0) {
@@ -4257,11 +4516,22 @@ let cg_make_pred_succ_law : Expr → Nat → CEnv
       cg_apply_free_locals result0 free_vars env
 
 -- cg_make_wild_succ: build succ function for the wild arm (no more named arms)
+--
+-- Mirrors bootstrap/codegen.py::_build_nat_dispatch::dispatch lines 1988-1997.
+-- At arity > 0 (in-law), the wildcard body is lambda-lifted via
+-- cg_make_pred_succ_law so outer-local captures and self-ref are threaded
+-- through.  A truly-wildcard arm (`| _ → body`) has no user-bound name; we
+-- use the sentinel nn_pat_wild ("__pat_wild__" packed LE) for the
+-- unreferenced predecessor slot — the body never reads it.  At arity = 0
+-- (top level) there are no captures to thread, so const2-wrap the body.
 let cg_make_wild_succ : Option (Pair (Option Nat) Expr) → CEnv
                        → (Expr → CEnv → List (Pair Nat (Pair Nat Nat)) → Nat → PlanVal)
                        → List (Pair Nat (Pair Nat Nat)) → Nat → PlanVal
   = λ wild env ce ctab hint →
       let const2_pin = PPin const2_law in
+      let nn_pat_wild = 29516398122387466075270831967 in  -- "__pat_wild__" LE
+      let nn_wild = 1684826487 in                          -- "wild" LE
+      let wild_hint = cg_concat_under hint nn_wild in
       match wild {
         | None →
             let fallback = cg_quote_nat 0 (cenv_arity env) in
@@ -4274,24 +4544,35 @@ let cg_make_wild_succ : Option (Pair (Option Nat) Expr) → CEnv
               | MkPair wild_name_opt wild_body →
                   match wild_name_opt {
                     | None →
-                        let wv = ce wild_body env ctab hint in
                         match (nat_eq (cenv_arity env) 0) {
-                          | 0 → cg_bapp const2_pin wv
-                          | _ → PApp const2_pin wv
+                          | 0 →
+                              -- In-law: lambda-lift so the wild body sees
+                              -- outer captures and self-ref through the
+                              -- lifted law's slots.  Hint is `<hint>_wild`
+                              -- so the lifted law gets name `<hint>_wild_succ`,
+                              -- matching Python.
+                              cg_make_pred_succ_law wild_body nn_pat_wild env ce ctab wild_hint
+                          | _ →
+                              -- Top level: no captures; const2-wrap directly.
+                              let wv = ce wild_body env ctab hint in
+                              PApp const2_pin wv
                         }
                     | Some wild_var →
-                        cg_make_pred_succ_law wild_body wild_var env ce ctab hint
+                        cg_make_pred_succ_law wild_body wild_var env ce ctab wild_hint
                   }
             }
       }
 
--- cg_build_nat_dispatch: build nat dispatch using Case_ (opcode 3)
--- Self-recursive on the arm list; uses fresh pred_env for arms[1+]
+-- cg_build_nat_dispatch: build nat dispatch using Case_ (opcode 3).
+-- `idx` is the position-in-the-original-arms-list of arms[0].  The succ law
+-- that handles arms[1+] is named `<hint>_succ_<idx+1>` (matching Python's
+-- _build_nat_dispatch.make_succ_law line 1969).  Each recursive call
+-- increments idx so successive succ laws get successive numbers.
 let cg_build_nat_dispatch : List (Pair Nat Expr) → Option (Pair (Option Nat) Expr)
                            → PlanVal → CEnv
                            → (Expr → CEnv → List (Pair Nat (Pair Nat Nat)) → Nat → PlanVal)
-                           → List (Pair Nat (Pair Nat Nat)) → Nat → PlanVal
-  = λ arms wild scr env ce ctab hint →
+                           → List (Pair Nat (Pair Nat Nat)) → Nat → Nat → PlanVal
+  = λ arms wild scr env ce ctab hint idx →
       match arms {
         | Nil →
             match wild {
@@ -4301,16 +4582,77 @@ let cg_build_nat_dispatch : List (Pair Nat Expr) → Option (Pair (Option Nat) E
             }
         | Cons arm0 rest →
             match arm0 {
-              | MkPair _ body0 →
-                  let zero_val = ce body0 env ctab hint in
+              | MkPair tag body0 →
+                  -- Thread `_{tag}` into the arm-body's hint so nested
+                  -- lifted laws inside the arm body get distinct names
+                  -- like `nat_eq_0_wild_succ` instead of colliding on
+                  -- `nat_eq_wild_succ`.  Mirrors Python's
+                  -- `_compile_expr(body_expr, cur_env, f'{name_hint}_{tag}')`
+                  -- in `_build_nat_dispatch.dispatch` (codegen.py L1983).
+                  let body_hint = cg_concat_under hint (cg_b_decimal tag) in
+                  let zero_val = ce body0 env ctab body_hint in
                   let succ = match rest {
                                 | Nil →
                                     cg_make_wild_succ wild env ce ctab hint
                                 | Cons _ _ →
+                                    let nn_succ = 1667462515 in  -- "succ" LE
+                                    let next_idx = add idx 1 in
+                                    let idx_name = cg_b_decimal next_idx in
+                                    let succ_base = cg_concat_under hint nn_succ in
+                                    let succ_name = cg_concat_under succ_base idx_name in
+                                    -- Free-var analysis: capture only the outer
+                                    -- locals that remaining arm bodies (or the
+                                    -- wild body) actually reference.  Mirrors
+                                    -- Python's `make_succ_law`.  Without this,
+                                    -- a body like `match s { | Red → d | Green
+                                    -- → d | Blue → d }` (with `d` an outer
+                                    -- lambda param) compiles `d` to PNat 0
+                                    -- (the succ-law's own self) instead of the
+                                    -- captured slot.
+                                    let rest_bodies = map (λ p →
+                                          match p { | MkPair _ b → b }) rest in
+                                    let all_bodies = match wild {
+                                          | None → rest_bodies
+                                          | Some p → match p {
+                                              | MkPair _ wb → Cons wb rest_bodies
+                                            }
+                                        } in
+                                    let free_vars = cg_free_vars_bodies all_bodies Nil env in
+                                    let uses_self = foldl (λ acc b →
+                                          match (nat_eq acc 1) {
+                                            | 0 → cg_body_uses_self b env
+                                            | _ → 1
+                                          }) 0 all_bodies in
                                     let g = cenv_globals env in
-                                    let pred_env = cenv_make g Nil 1 None in
-                                    let inner = cg_build_nat_dispatch rest wild (PNat 1) pred_env ce ctab hint in
-                                    PPin (PLaw 0 (MkPair 1 inner))
+                                    let env0 = cenv_make g Nil 0 None in
+                                    let env1 = match (nat_eq uses_self 0) {
+                                          | 0 →
+                                              match (cenv_self env) {
+                                                | None → env0
+                                                | Some fq →
+                                                    let env_fq = cenv_new_param env0 fq in
+                                                    let short = cg_short_after_dot fq in
+                                                    match (Reaver.BPLAN.eq short fq) {
+                                                      | 0 → cenv_bind_local env_fq short (cenv_arity env_fq)
+                                                      | _ → env_fq
+                                                    }
+                                              }
+                                          | _ → env0
+                                        } in
+                                    let env2 = cg_bind_params free_vars env1 in
+                                    let pred_idx = add (cenv_arity env2) 1 in
+                                    let pred_env = cenv_set_arity env2 pred_idx in
+                                    let inner = cg_build_nat_dispatch rest wild (PNat pred_idx) pred_env ce ctab hint next_idx in
+                                    let succ_law = PPin (PLaw succ_name (MkPair pred_idx inner)) in
+                                    let result0 = match (nat_eq uses_self 0) {
+                                          | 0 →
+                                              match (nat_eq (cenv_arity env) 0) {
+                                                | 0 → cg_bapp succ_law (PNat 0)
+                                                | _ → PApp succ_law (PNat 0)
+                                              }
+                                          | _ → succ_law
+                                        } in
+                                    cg_apply_free_locals result0 free_vars env
                               } in
                   cg_build_op2 zero_val succ scr (cenv_arity env)
             }
@@ -4329,7 +4671,70 @@ let cg_normalize_pv_tags : List (Pair Nat PlanVal) → Nat → List (Pair Nat Pl
             }
       }
 
+-- cg_contab_lookup_by_short: scan ctab for the first entry whose key's
+-- short tail (after the last '.') matches `short_name`.  Used as a safety
+-- net for bare constructor names in match arms that sr_dispatch failed to
+-- qualify — mirrors `cg_global_lookup_by_short` for the constructor table.
+let cg_contab_lookup_by_short : Nat → List (Pair Nat (Pair Nat Nat))
+                              → Option (Pair Nat Nat)
+  = λ short_name tab →
+      match tab {
+        | Nil → None
+        | Cons kv rest →
+            match kv {
+              | MkPair k v →
+                  let k_short = cg_short_after_dot k in
+                  match (Reaver.BPLAN.eq k_short short_name) {
+                    | 0 → cg_contab_lookup_by_short short_name rest
+                    | _ → Some v
+                  }
+            }
+      }
+
+-- cg_contab_lookup_safe: contab_lookup with a short-tail fallback.  When
+-- direct lookup fails (sr_dispatch didn't qualify the constructor name),
+-- search the ctab for an FQ ending in `.<bare>`.
+let cg_contab_lookup_safe : List (Pair Nat (Pair Nat Nat)) → Nat
+                           → Option (Pair Nat Nat)
+  = λ tab name →
+      match (assoc_lookup name tab) {
+        | Some p → Some p
+        | None → cg_contab_lookup_by_short name tab
+      }
+
+-- cg_pcd_pairs_for_inner: top-level helper.  When `tag0 > 0`, no arm
+-- matches Nat 0 — shift ALL tags down by 1 to feed the succ-chain.  When
+-- `tag0 == 0`, pair0 is the z arm and we shift only `rest` (subtracting
+-- tag0+1 from each `rest` tag).  Extracted as a top-level helper so the
+-- `match` doesn't get lifted into a deep sub-law of cg_build_precompiled_nat_dispatch
+-- (where outer-local captures aren't reliably reachable).
+let cg_pcd_pairs_for_inner : List (Pair Nat PlanVal) → List (Pair Nat PlanVal) → Nat
+                           → List (Pair Nat PlanVal)
+  = λ tag_val_pairs rest tag0 →
+      match (Reaver.BPLAN.eq tag0 0) {
+        | 0 → cg_normalize_pv_tags tag_val_pairs 0
+        | _ → cg_normalize_pv_tags rest tag0
+      }
+
+-- cg_pcd_z_for_op2: top-level helper.  z arm of the outer Elim is the
+-- fallback (cg_quote_nat 0 n_cap) when tag0 > 0 — no arm matches Nat 0
+-- — and pair0's pre-compiled value otherwise.  See `cg_pcd_pairs_for_inner`
+-- for the extraction rationale.
+let cg_pcd_z_for_op2 : Nat → PlanVal → Nat → PlanVal
+  = λ tag0 zero_val n_cap →
+      match (Reaver.BPLAN.eq tag0 0) {
+        | 0 → cg_quote_nat 0 n_cap
+        | _ → zero_val
+      }
+
 -- cg_build_precompiled_nat_dispatch: dispatch on already-compiled (tag, PlanVal) pairs
+--
+-- Each succ law in the chain has arity = `n_cap + 1` (the caller env's
+-- captures plus one pred slot) so that pre-compiled arm bodies — which
+-- reference `env`'s de Bruijn slots — remain reachable inside the succ
+-- law's frame.  The succ law is partially applied to `N(1)..N(n_cap)` at
+-- the dispatch site so it expects only the pred from Case_.  Mirrors
+-- Python's `_build_tag_chain` (`make_ext_env` + `partially_apply`).
 let cg_build_precompiled_nat_dispatch : List (Pair Nat PlanVal) → Option (Pair (Option Nat) Expr)
                                        → PlanVal → CEnv
                                        → (Expr → CEnv → List (Pair Nat (Pair Nat Nat)) → Nat → PlanVal)
@@ -4344,8 +4749,9 @@ let cg_build_precompiled_nat_dispatch : List (Pair Nat PlanVal) → Option (Pair
         | Cons pair0 rest →
             match pair0 {
               | MkPair tag0 zero_val →
-                  let g = cenv_globals env in
-                  let pred_env = cenv_make g Nil 1 None in
+                  let n_cap = cenv_arity env in
+                  let pred_idx = add n_cap 1 in
+                  let pred_env = cenv_set_arity env pred_idx in
                   match rest {
                     | Nil →
                         -- Single entry. tag0=0: standard z dispatch.
@@ -4354,20 +4760,31 @@ let cg_build_precompiled_nat_dispatch : List (Pair Nat PlanVal) → Option (Pair
                           | 0 →
                               -- tag0 > 0: shift by 1 and recurse to build succ chain
                               let shifted = Cons (MkPair (sub tag0 1) zero_val) Nil in
-                              let inner = cg_build_precompiled_nat_dispatch shifted wild (PNat 1) pred_env ce ctab hint in
-                              let succ = PPin (PLaw 0 (MkPair 1 inner)) in
-                              let fallback = cg_quote_nat 0 (cenv_arity env) in
-                              cg_build_op2 fallback succ scr (cenv_arity env)
+                              let inner = cg_build_precompiled_nat_dispatch shifted wild (PNat pred_idx) pred_env ce ctab hint in
+                              let succ_law = PPin (PLaw 0 (MkPair pred_idx inner)) in
+                              let succ = cg_apply_params succ_law 1 n_cap in
+                              let fallback = cg_quote_nat 0 n_cap in
+                              cg_build_op2 fallback succ scr n_cap
                           | _ →
                               -- tag0 = 0: standard z dispatch
                               let succ = cg_make_wild_succ wild env ce ctab hint in
-                              cg_build_op2 zero_val succ scr (cenv_arity env)
+                              cg_build_op2 zero_val succ scr n_cap
                         }
                     | Cons _ _ →
-                        let normalized = cg_normalize_pv_tags rest tag0 in
-                        let inner = cg_build_precompiled_nat_dispatch normalized wild (PNat 1) pred_env ce ctab hint in
-                        let succ = PPin (PLaw 0 (MkPair 1 inner)) in
-                        cg_build_op2 zero_val succ scr (cenv_arity env)
+                        -- When tag0 > 0, no arm matches Nat 0: shift ALL tags
+                        -- by 1 and use fallback as z.  When tag0 == 0, pair0
+                        -- is the z arm and we shift only `rest`.  Mirrors
+                        -- Python `_build_tag_chain`'s `first_tag > 0` branch.
+                        -- The two helpers `cg_pcd_pairs_for_inner` and
+                        -- `cg_pcd_z_for_op2` keep this conditional at top
+                        -- level so the bootstrap doesn't lift it into a deep
+                        -- sub-law where captures don't reach.
+                        let normalized = cg_pcd_pairs_for_inner tag_val_pairs rest tag0 in
+                        let inner = cg_build_precompiled_nat_dispatch normalized wild (PNat pred_idx) pred_env ce ctab hint in
+                        let succ_law = PPin (PLaw 0 (MkPair pred_idx inner)) in
+                        let succ = cg_apply_params succ_law 1 n_cap in
+                        let z_val = cg_pcd_z_for_op2 tag0 zero_val n_cap in
+                        cg_build_op2 z_val succ scr n_cap
                   }
             }
       }
@@ -4379,7 +4796,7 @@ let cg_compile_nat_match : PlanVal → List MatchArm → CEnv
   = λ scr arms env ce ctab hint →
       let nat_arms = cg_extract_nat_arms arms in
       let wild = cg_extract_wild_arm arms in
-      cg_build_nat_dispatch nat_arms wild scr env ce ctab hint
+      cg_build_nat_dispatch nat_arms wild scr env ce ctab hint 0
 
 
 -- -------------------------------------------------------------------
@@ -4421,7 +4838,7 @@ let cg_arms_to_tag_expr : List MatchArm → List (Pair Nat (Pair Nat Nat)) → L
   = λ arms ctab →
       map (λ arm →
              let con_name = arm_get_con_name arm in
-             let tag = match (contab_lookup ctab con_name) {
+             let tag = match (cg_contab_lookup_safe ctab con_name) {
                          | None → 0
                          | Some p → contab_tag p
                        } in
@@ -4469,7 +4886,7 @@ let cg_build_m_body : List (Pair Nat Expr) → Option (Pair (Option Nat) Expr) �
             match wild {
               | None →
                   match (nat_eq (cenv_arity env) 0) {
-                    | 0 → cg_bapp const2_pin (PPin (PNat 0))
+                    | 0 → cg_bapp const2_pin (PApp (PNat 0) (PNat 0))
                     | _ → PApp const2_pin (PNat 0)
                   }
               | Some p →
@@ -4483,10 +4900,54 @@ let cg_build_m_body : List (Pair Nat Expr) → Option (Pair (Option Nat) Expr) �
                   }
             }
         | Cons _ _ →
+            -- Free-var analysis (same pattern as cg_build_nat_dispatch's
+            -- multi-arm case): preserve captures referenced by the m-arm
+            -- bodies or wild body, so the succ law has the right arity
+            -- and we partial-apply at the call site.
+            let rem_bodies = map (λ p →
+                  match p { | MkPair _ b → b }) remaining in
+            let all_bodies = match wild {
+                  | None → rem_bodies
+                  | Some p → match p {
+                      | MkPair _ wb → Cons wb rem_bodies
+                    }
+                } in
+            let free_vars = cg_free_vars_bodies all_bodies Nil env in
+            let uses_self = foldl (λ acc b →
+                  match (nat_eq acc 1) {
+                    | 0 → cg_body_uses_self b env
+                    | _ → 1
+                  }) 0 all_bodies in
             let g = cenv_globals env in
-            let pred_env = cenv_make g Nil 1 None in
-            let m_inner = cg_build_nat_dispatch remaining wild (PNat 1) pred_env ce ctab 0 in
-            PPin (PLaw 0 (MkPair 1 m_inner))
+            let env0 = cenv_make g Nil 0 None in
+            let env1 = match (nat_eq uses_self 0) {
+                  | 0 →
+                      match (cenv_self env) {
+                        | None → env0
+                        | Some fq →
+                            let env_fq = cenv_new_param env0 fq in
+                            let short = cg_short_after_dot fq in
+                            match (Reaver.BPLAN.eq short fq) {
+                              | 0 → cenv_bind_local env_fq short (cenv_arity env_fq)
+                              | _ → env_fq
+                            }
+                      }
+                  | _ → env0
+                } in
+            let env2 = cg_bind_params free_vars env1 in
+            let pred_idx = add (cenv_arity env2) 1 in
+            let pred_env = cenv_set_arity env2 pred_idx in
+            let m_inner = cg_build_nat_dispatch remaining wild (PNat pred_idx) pred_env ce ctab 0 0 in
+            let m_succ_law = PPin (PLaw 0 (MkPair pred_idx m_inner)) in
+            let result0 = match (nat_eq uses_self 0) {
+                  | 0 →
+                      match (nat_eq (cenv_arity env) 0) {
+                        | 0 → cg_bapp m_succ_law (PNat 0)
+                        | _ → PApp m_succ_law (PNat 0)
+                      }
+                  | _ → m_succ_law
+                } in
+            cg_apply_free_locals result0 free_vars env
       }
 
 -- cg_arm_find_by_tag: find a con arm whose ctab tag equals the given tag
@@ -4497,7 +4958,7 @@ let cg_arm_find_by_tag : List MatchArm → Nat → List (Pair Nat (Pair Nat Nat)
             -- Return sentinel arm with empty body
             ArmCon 0 (MkPair Nil (EVar 0))
         | Cons arm rest →
-            let con_tag = match (contab_lookup ctab (arm_get_con_name arm)) {
+            let con_tag = match (cg_contab_lookup_safe ctab (arm_get_con_name arm)) {
                             | None → 0
                             | Some p → contab_tag p
                           } in
@@ -4513,8 +4974,8 @@ let cg_arm_find_by_tag : List MatchArm → Nat → List (Pair Nat (Pair Nat Nat)
 let cg_build_unary_handler_body : List MatchArm → Option (Pair (Option Nat) Expr)
                                   → CEnv → Nat → Nat
                                   → (Expr → CEnv → List (Pair Nat (Pair Nat Nat)) → Nat → PlanVal)
-                                  → List (Pair Nat (Pair Nat Nat)) → PlanVal
-  = λ field_arms wild henv fun_idx arg_idx ce ctab →
+                                  → List (Pair Nat (Pair Nat Nat)) → Nat → PlanVal
+  = λ field_arms wild henv fun_idx arg_idx ce ctab hint →
       match field_arms {
         | Nil → cg_quote_nat 0 (cenv_arity henv)
         | Cons arm0 rest_arms →
@@ -4526,7 +4987,10 @@ let cg_build_unary_handler_body : List MatchArm → Option (Pair (Option Nat) Ex
                              | Nil → henv
                              | Cons fname _ → cenv_bind_local henv fname arg_idx
                            } in
-                  ce (arm_get_con_body arm0) ae ctab 0
+                  -- Thread `_<ConName>` into the arm-body's hint (see
+                  -- cg_build_binary_handler_body for full rationale).
+                  let arm_hint = cg_concat_under hint (arm_get_con_name arm0) in
+                  ce (arm_get_con_body arm0) ae ctab arm_hint
               | Cons _ _ →
                   -- Multiple arms: compile each body, dispatch on fun (tag)
                   let tag_val_pairs = map (λ arm →
@@ -4535,11 +4999,12 @@ let cg_build_unary_handler_body : List MatchArm → Option (Pair (Option Nat) Ex
                                                        | Nil → henv
                                                        | Cons fname _ → cenv_bind_local henv fname arg_idx
                                                      } in
-                                            let tag = match (contab_lookup ctab (arm_get_con_name arm)) {
+                                            let tag = match (cg_contab_lookup_safe ctab (arm_get_con_name arm)) {
                                                         | None → 0
                                                         | Some p → contab_tag p
                                                       } in
-                                            MkPair tag (ce (arm_get_con_body arm) ae ctab 0)
+                                            let arm_hint = cg_concat_under hint (arm_get_con_name arm) in
+                                            MkPair tag (ce (arm_get_con_body arm) ae ctab arm_hint)
                                           ) field_arms in
                   cg_build_precompiled_nat_dispatch (cg_sort_pv_pairs tag_val_pairs)
                     wild (PNat fun_idx) henv ce ctab 0
@@ -4557,7 +5022,7 @@ let cg_build_unary_z_body : List MatchArm → CEnv → Nat
       let tag0_arms = filter (λ arm →
                                 match (nat_eq (cg_arm_con_arity arm) 1) {
                                   | 0 → 0
-                                  | _ → match (contab_lookup ctab (arm_get_con_name arm)) {
+                                  | _ → match (cg_contab_lookup_safe ctab (arm_get_con_name arm)) {
                                           | None → 0
                                           | Some p → nat_eq (contab_tag p) 0
                                         }
@@ -4585,7 +5050,7 @@ let cg_build_unary_m_body : List MatchArm → Option (Pair (Option Nat) Expr) �
       let unary_gt0 = filter (λ arm →
                                 match (nat_eq (cg_arm_con_arity arm) 1) {
                                   | 0 → 0
-                                  | _ → match (contab_lookup ctab (arm_get_con_name arm)) {
+                                  | _ → match (cg_contab_lookup_safe ctab (arm_get_con_name arm)) {
                                           | None → 0
                                           | Some p →
                                               match (nat_eq (contab_tag p) 0) {
@@ -4600,7 +5065,7 @@ let cg_build_unary_m_body : List MatchArm → Option (Pair (Option Nat) Expr) �
             match wild {
               | None →
                   match (nat_eq (cenv_arity henv) 0) {
-                    | 0 → cg_bapp const2_pin (PPin (PNat 0))
+                    | 0 → cg_bapp const2_pin (PApp (PNat 0) (PNat 0))
                     | _ → PApp const2_pin (PNat 0)
                   }
               | Some p →
@@ -4625,7 +5090,7 @@ let cg_build_unary_m_body : List MatchArm → Option (Pair (Option Nat) Expr) �
                            | Nil → m_ext_env
                            | Cons f _ → cenv_bind_local m_ext_env f arg_idx
                          } in
-                let tag = match (contab_lookup ctab (arm_get_con_name arm)) {
+                let tag = match (cg_contab_lookup_safe ctab (arm_get_con_name arm)) {
                             | None → 0
                             | Some p → contab_tag p
                           } in
@@ -4636,19 +5101,30 @@ let cg_build_unary_m_body : List MatchArm → Option (Pair (Option Nat) Expr) �
       }
 
 -- cg_build_binary_handler_body: handler body for arity-2 field arms
--- Receives uses_self and free_locals pre-computed by cg_build_app_handler
+-- Receives uses_self, free_locals, and outer_self (the outer-env self_ref)
+-- pre-computed by cg_build_app_handler.  We need outer_self separately
+-- because cg_build_app_handler builds `henv` with `self_ref = None`
+-- (intentionally, so unary-handler body compiles look up `length` etc.
+-- via locals at the captured slot, not via the self-ref shortcut which
+-- would return PNat 0 = the app-handler law's own self).
 let cg_build_binary_handler_body : List MatchArm → Option (Pair (Option Nat) Expr)
-                                   → CEnv → Nat → Nat → Nat → List Nat
+                                   → CEnv → Nat → Nat → Nat → List Nat → Option Nat
                                    → (Expr → CEnv → List (Pair Nat (Pair Nat Nat)) → Nat → PlanVal)
-                                   → List (Pair Nat (Pair Nat Nat)) → PlanVal
-  = λ field_arms wild henv fun_idx arg_idx uses_self free_locals ce ctab →
+                                   → List (Pair Nat (Pair Nat Nat)) → Nat → PlanVal
+  = λ field_arms wild henv fun_idx arg_idx uses_self free_locals outer_self ce ctab hint →
       let g = cenv_globals henv in
       let inner_env0 = cenv_make g Nil 0 None in
       let inner_env1 = match (nat_eq uses_self 0) {
                          | 0 →
-                             match (cenv_self henv) {
+                             match outer_self {
                                | None → inner_env0
-                               | Some fq → cenv_new_param inner_env0 fq
+                               | Some fq →
+                                   let inner_env_fq = cenv_new_param inner_env0 fq in
+                                   let short = cg_short_after_dot fq in
+                                   match (Reaver.BPLAN.eq short fq) {
+                                     | 0 → cenv_bind_local inner_env_fq short (cenv_arity inner_env_fq)
+                                     | _ → inner_env_fq
+                                   }
                              }
                          | _ → inner_env0
                        } in
@@ -4658,6 +5134,9 @@ let cg_build_binary_handler_body : List MatchArm → Option (Pair (Option Nat) E
       let inner_env3 = cenv_set_arity inner_env2 field2_idx in
       let inner_tag_idx = add field2_idx 1 in
       let field1_idx = add inner_tag_idx 1 in
+      -- Python's _build_field_arm_law (codegen.py L2644) doesn't mark
+      -- top_of_law on handler_env — nested lets inside arm bodies always
+      -- lambda-lift.  Match that.
       let inner_env4 = cenv_set_arity inner_env3 field1_idx in
       -- Compile each arm body in inner_env4 with field1 and field2 bound
       let inner_body = match field_arms {
@@ -4675,7 +5154,14 @@ let cg_build_binary_handler_body : List MatchArm → Option (Pair (Option Nat) E
                                                     | Cons f2 _ → cenv_bind_local ae1 f2 field2_idx
                                                   }
                                             } in
-                                   ce (arm_get_con_body arm0) ae ctab 0
+                                   -- Thread `_<ConName>` into the arm-body's hint
+                                   -- so lifted laws inside the body (e.g. if-thunks)
+                                   -- get names like `filter_Cons_then_succ` rather
+                                   -- than the empty-hint default `_then_succ`.
+                                   -- Mirrors Python's _build_field_arm_law L2677:
+                                   -- `f'{name_hint}_{info.fq_name.split(".")[-1]}'`.
+                                   let arm_hint = cg_concat_under hint (arm_get_con_name arm0) in
+                                   ce (arm_get_con_body arm0) ae ctab arm_hint
                                | Cons _ _ →
                                    let tag_val_pairs = map (λ arm →
                                        let fields = arm_get_con_fields arm in
@@ -4688,24 +5174,35 @@ let cg_build_binary_handler_body : List MatchArm → Option (Pair (Option Nat) E
                                                         | Cons f2 _ → cenv_bind_local ae1 f2 field2_idx
                                                       }
                                                 } in
-                                       let tag = match (contab_lookup ctab (arm_get_con_name arm)) {
+                                       let tag = match (cg_contab_lookup_safe ctab (arm_get_con_name arm)) {
                                                    | None → 0
                                                    | Some p → contab_tag p
                                                  } in
-                                       MkPair tag (ce (arm_get_con_body arm) ae ctab 0)) field_arms in
+                                       let arm_hint = cg_concat_under hint (arm_get_con_name arm) in
+                                       MkPair tag (ce (arm_get_con_body arm) ae ctab arm_hint)) field_arms in
                                    cg_build_precompiled_nat_dispatch (cg_sort_pv_pairs tag_val_pairs)
                                      wild (PNat inner_tag_idx) inner_env4 ce ctab 0
                              }
                        } in
-      let inner_law = PPin (PLaw 0 (MkPair field1_idx inner_body)) in
+      -- inner_law gets name `<hint>_inner` matching Python's
+      -- _compile_con_match line 2801 (encode_name(name_hint + "_inner")).
+      let nn_inner = 491328007785 in  -- "inner" LE
+      let inner_name = cg_concat_under hint nn_inner in
+      let inner_law = PPin (PLaw inner_name (MkPair field1_idx inner_body)) in
       -- Apply inner_law to: [self?]+[free_locals]+outer_arg
+      -- When uses_self is true, the self-ref capture lives at henv slot 1
+      -- (it's the FIRST capture slot in the app-handler's frame — see
+      -- cg_build_app_handler's henv1 setup).  Apply PNat 1, not PNat 0:
+      -- PNat 0 would refer to the app-handler law's own self, not the
+      -- captured outer self.  Mirrors Python's _build_field_arm_law
+      -- which uses `bapp(inner_applied, N(1))` regardless of context.
       let n_cap = cenv_arity inner_env2 in
       let r0 = inner_law in
       let r1 = match (nat_eq uses_self 0) {
                  | 0 →
                      match (nat_eq (cenv_arity henv) 0) {
-                       | 0 → cg_bapp r0 (PNat 0)
-                       | _ → PApp r0 (PNat 0)
+                       | 0 → cg_bapp r0 (PNat 1)
+                       | _ → PApp r0 (PNat 1)
                      }
                  | _ → r0
                } in
@@ -4735,8 +5232,8 @@ let cg_bodies_use_self : List Expr → CEnv → Nat
 -- cg_build_app_handler: build the App-handler law for Case_ dispatch
 let cg_build_app_handler : List MatchArm → Option (Pair (Option Nat) Expr) → CEnv
                           → (Expr → CEnv → List (Pair Nat (Pair Nat Nat)) → Nat → PlanVal)
-                          → List (Pair Nat (Pair Nat Nat)) → PlanVal
-  = λ field_arms wild env ce ctab →
+                          → List (Pair Nat (Pair Nat Nat)) → Nat → PlanVal
+  = λ field_arms wild env ce ctab hint →
       let all_bodies = map arm_get_con_body field_arms in
       let field_names = cg_all_field_names field_arms in
       let free_locals = cg_free_vars_bodies all_bodies field_names env in
@@ -4748,7 +5245,13 @@ let cg_build_app_handler : List MatchArm → Option (Pair (Option Nat) Expr) →
                     | 0 →
                         match (cenv_self env) {
                           | None → henv0
-                          | Some fq → cenv_new_param henv0 fq
+                          | Some fq →
+                              let henv_fq = cenv_new_param henv0 fq in
+                              let short = cg_short_after_dot fq in
+                              match (Reaver.BPLAN.eq short fq) {
+                                | 0 → cenv_bind_local henv_fq short (cenv_arity henv_fq)
+                                | _ → henv_fq
+                              }
                         }
                     | _ → henv0
                   } in
@@ -4759,11 +5262,15 @@ let cg_build_app_handler : List MatchArm → Option (Pair (Option Nat) Expr) →
       let henv = cenv_set_arity henv2 arg_idx in
       let handler_body = match (nat_eq max_arity 1) {
                            | 0 →
-                               cg_build_binary_handler_body field_arms wild henv fun_idx arg_idx uses_self free_locals ce ctab
+                               cg_build_binary_handler_body field_arms wild henv fun_idx arg_idx uses_self free_locals (cenv_self env) ce ctab hint
                            | _ →
-                               cg_build_unary_handler_body field_arms wild henv fun_idx arg_idx ce ctab
+                               cg_build_unary_handler_body field_arms wild henv fun_idx arg_idx ce ctab hint
                          } in
-      let handler_law = PPin (PLaw 0 (MkPair arg_idx handler_body)) in
+      -- Lifted app-handler law gets name `<hint>_app`, matching Python's
+      -- _compile_con_match's app-handler naming.
+      let nn_app = 7368801 in  -- "app" LE
+      let handler_name = cg_concat_under hint nn_app in
+      let handler_law = PPin (PLaw handler_name (MkPair arg_idx handler_body)) in
       let r0 = handler_law in
       let r1 = match (nat_eq uses_self 0) {
                  | 0 →
@@ -4787,13 +5294,13 @@ let cg_compile_con_match : PlanVal → List MatchArm → CEnv
       match (length field_arms) {
         | 0 →
             let nat_arms = cg_sort_nat_pairs (cg_arms_to_tag_expr nullary_arms ctab) in
-            cg_build_nat_dispatch nat_arms wild scr env ce ctab hint
+            cg_build_nat_dispatch nat_arms wild scr env ce ctab hint 0
         | _ →
             let nullary_nat_arms = cg_sort_nat_pairs (cg_arms_to_tag_expr nullary_arms ctab) in
             let z_body = cg_build_z_body nullary_nat_arms wild env ce ctab in
             let remaining = cg_build_nullary_remaining nullary_nat_arms in
             let m_body = cg_build_m_body remaining wild env ce ctab in
-            let app_handler = cg_build_app_handler field_arms wild env ce ctab in
+            let app_handler = cg_build_app_handler field_arms wild env ce ctab hint in
             cg_build_reflect_dispatch app_handler z_body m_body scr (cenv_arity env)
       }
 
@@ -4839,26 +5346,31 @@ let cg_make_lifted_env : List Nat → List Nat → List (Pair Nat PlanVal) → O
       let env1 = cg_bind_params free_vars env0 in
       cg_bind_params params env1
 
--- cg_compile_lam_as_law: compile lambda as a named top-level law (arity == 0 context)
+-- cg_compile_lam_as_law: compile lambda as a named top-level law (arity == 0 context).
+-- Threads `hint` into the body compile so nested match/if dispatches name
+-- their lifted laws `<hint>_*_succ` rather than `_*_succ`.  Mirrors
+-- bootstrap/codegen.py::_compile_lam_as_law line 1581 (passes name_hint).
 let cg_compile_lam_as_law : List Nat → Expr → CEnv
                             → (Expr → CEnv → List (Pair Nat (Pair Nat Nat)) → Nat → PlanVal)
                             → List (Pair Nat (Pair Nat Nat)) → Nat → PlanVal
   = λ params body_expr env ce ctab hint →
       let g = cenv_globals env in
       let self = cenv_self env in
-      let body_env = cg_make_lifted_env Nil params g self in
-      let body_val = ce body_expr body_env ctab 0 in
+      -- Body of this lambda is the new law's body root → mark top_of_law.
+      let body_env = cenv_mark_top_of_law (cg_make_lifted_env Nil params g self) in
+      let body_val = ce body_expr body_env ctab hint in
       PLaw hint (MkPair (length params) body_val)
 
--- cg_compile_lam_lifted: lambda-lift a nested lambda (arity > 0 context)
+-- cg_compile_lam_lifted: lambda-lift a nested lambda (arity > 0 context).
+-- Same hint-threading as cg_compile_lam_as_law.
 let cg_compile_lam_lifted : List Nat → Expr → CEnv
                             → (Expr → CEnv → List (Pair Nat (Pair Nat Nat)) → Nat → PlanVal)
                             → List (Pair Nat (Pair Nat Nat)) → Nat → PlanVal
   = λ params body_expr env ce ctab hint →
       let free_vars = cg_free_vars body_expr params env in
       let g = cenv_globals env in
-      let lifted_env = cg_make_lifted_env free_vars params g None in
-      let body_val = ce body_expr lifted_env ctab 0 in
+      let lifted_env = cenv_mark_top_of_law (cg_make_lifted_env free_vars params g None) in
+      let body_val = ce body_expr lifted_env ctab hint in
       let total_arity = add (length free_vars) (length params) in
       let lifted_law = PPin (PLaw hint (MkPair total_arity body_val)) in
       cg_apply_free_locals lifted_law free_vars env
@@ -4876,7 +5388,87 @@ let cg_is_nat_match : List MatchArm → Nat
 let cg_is_con_match : List MatchArm → Nat
   = λ arms → foldl (λ acc arm → if nat_eq acc 1 then 1 else arm_is_con arm) 0 arms
 
--- cg_var_from_env: look up variable name in locals then globals
+-- cg_tag_global: tag a top-level binding's value with its FQ name nat so
+-- emit_pval / emit_bval render it as the bare symbol `Module_foo` rather
+-- than inlining its full PLAN tree.  Mirrors emit_pla.py's _maybe_symbol
+-- identity-based dedup.  Pin'd values are tagged inside the Pin (emit
+-- produces `(#pin Foo)`); bare Law/App values are tagged at the top
+-- (emit produces `Foo`).  Nat globals are not tagged — Python excludes
+-- them too (int interning makes id() unreliable for small constants).
+let cg_tag_global : Nat → PlanVal → PlanVal
+  = λ name val →
+      match (planval_is_nat val) {
+        | 0 →
+            match val {
+              | PPin inner → PPin (PNamed name inner)
+              | _ → PNamed name val
+            }
+        | _ → val
+      }
+
+-- cg_global_lookup_by_short: scan globals for the FIRST entry whose key's
+-- short tail (after the last '.') matches `short_name`.  Returns the entire
+-- (fq_key, val) pair so callers can tag the resolved reference with the FQ.
+-- Used by `cg_var_from_env` as a safety net for bare EVars that sr_dispatch
+-- failed to qualify (parallels Python's resolver fully-qualifying every
+-- ExprVar before codegen).
+let cg_global_lookup_by_short : Nat → List (Pair Nat PlanVal) → Option (Pair Nat PlanVal)
+  = λ short_name kvs →
+      match kvs {
+        | Nil → None
+        | Cons kv rest →
+            match kv {
+              | MkPair k _ →
+                  let k_short = cg_short_after_dot k in
+                  match (Reaver.BPLAN.eq k_short short_name) {
+                    | 0 → cg_global_lookup_by_short short_name rest
+                    | _ → Some kv
+                  }
+            }
+      }
+
+-- cg_resolve_global_val: tag a (fq, val) global lookup result for use as an
+-- EVar reference.  Shared between the direct-FQ-hit path and the bare-name
+-- fallback path of `cg_var_from_env`.
+let cg_resolve_global_val : Nat → PlanVal → CEnv → PlanVal
+  = λ fq val env →
+      match (nat_eq (cenv_arity env) 0) {
+        | 0 →
+            -- Inside law body: nat globals need quoting
+            match (planval_is_nat val) {
+              | 0 →
+                  match (planval_is_pin val) {
+                    | 0 → cg_tag_global fq (PPin val)
+                    | _ →
+                        -- val is already a Pin (binding is pin'd).
+                        -- cg_tag_global would produce PPin(PNamed …),
+                        -- which emits as `(#pin sym)` — but Python
+                        -- collapses that to bare `sym` via id() dedup
+                        -- (the bound Pin object IS the ref).  Mirror
+                        -- that here: tag with PNamed at the outer
+                        -- level so emit produces bare `sym`.
+                        PNamed fq val
+                  }
+              | _ → cg_quote_nat (planval_get_nat val) (cenv_arity env)
+            }
+        | _ →
+            -- Top level: same double-pin avoidance as the body-context
+            -- branch above.  When the binding's val is itself a Pin
+            -- (e.g. opcode pins like `write_op = PPin(PNat 9)`),
+            -- `cg_tag_global` would produce `PPin(PNamed n inner)`
+            -- which emits `(#pin sym)` — but Python's `_maybe_symbol`
+            -- collapses to bare `sym` at the outer Pin level.
+            match (planval_is_pin val) {
+              | 0 → cg_tag_global fq val
+              | _ → PNamed fq val
+            }
+      }
+
+-- cg_var_from_env: look up variable name in locals then globals.
+-- Lookup order: locals (de Bruijn slot), globals (by FQ), globals (by short
+-- tail).  The short-tail fallback resolves bare EVars that sr_dispatch
+-- failed to qualify; without it, bare cross-binding refs in deeply-nested
+-- arm bodies fall through to PNat 0 (= the lifted law's own self).
 -- (must be defined before cg_compile_var)
 let cg_var_from_env : Nat → CEnv → PlanVal
   = λ n env →
@@ -4884,21 +5476,18 @@ let cg_var_from_env : Nat → CEnv → PlanVal
         | Some idx → PNat idx
         | None →
             match (cenv_global_lookup env n) {
-              | Some val →
-                  match (nat_eq (cenv_arity env) 0) {
-                    | 0 →
-                        -- Inside law body: nat globals need quoting
-                        match (planval_is_nat val) {
-                          | 0 →
-                              match (planval_is_pin val) {
-                                | 0 → PPin val
-                                | _ → val
-                              }
-                          | _ → cg_quote_nat (planval_get_nat val) (cenv_arity env)
+              | Some val → cg_resolve_global_val n val env
+              | None →
+                  -- Bare-name fallback: scan globals for the first FQ whose
+                  -- short tail matches `n` (e.g. bare `helper` → FQ
+                  -- `Compiler.helper`).  Tag with the resolved FQ.
+                  match (cg_global_lookup_by_short n (cenv_globals env)) {
+                    | None → PNat 0  -- unbound: return 0 (error in source)
+                    | Some pair →
+                        match pair {
+                          | MkPair fq val → cg_resolve_global_val fq val env
                         }
-                    | _ → val
                   }
-              | None → PNat 0  -- unbound: return 0 (error in source)
             }
       }
 
@@ -4908,13 +5497,22 @@ let cg_compile_var : Expr → CEnv → List (Pair Nat (Pair Nat Nat)) → Nat �
       match expr {
         | EVar n →
             -- 1. Self-reference: inside a law body (arity>0), own FQ name → N(0)
+            --    Also accept the short tail (after the last '.') of the FQ —
+            --    mirrors Python's _compile_var, which compares both forms.
+            --    Safety net for bare EVars that sr_dispatch failed to qualify.
+            --    Comparisons use Reaver.BPLAN.eq (O(1)); see cg_body_uses_self.
             match (nat_eq (cenv_arity env) 0) {
               | 0 →
                   match (cenv_self env) {
                     | None → cg_var_from_env n env
                     | Some fq →
-                        match (nat_eq n fq) {
-                          | 0 → cg_var_from_env n env
+                        match (Reaver.BPLAN.eq n fq) {
+                          | 0 →
+                              let short = cg_short_after_dot fq in
+                              match (Reaver.BPLAN.eq n short) {
+                                | 0 → cg_var_from_env n env
+                                | _ → PNat 0
+                              }
                           | _ → PNat 0
                         }
                   }
@@ -4923,14 +5521,21 @@ let cg_compile_var : Expr → CEnv → List (Pair Nat (Pair Nat Nat)) → Nat �
         | _ → PNat 0
       }
 
--- cg_compile_app: compile EApp
+-- cg_compile_app: compile EApp.
+-- Python's `_compile_app` passes the default empty hint to both fun and
+-- arg sub-expressions (bootstrap/codegen.py L1344-1345 — no `name_hint`
+-- kwarg, so the default `''` is used).  Self-host previously threaded
+-- the caller's hint into both, which produced lifted-law names like
+-- `bit_or_wild_pred_wild_pred_then_succ` for an if-expression buried
+-- inside an App, where Python's reference is just `_then_succ`.  Pass
+-- 0 (empty hint) to children for byte-identity.
 let cg_compile_app : Expr → CEnv → List (Pair Nat (Pair Nat Nat)) → Nat → PlanVal
                    → (Expr → CEnv → List (Pair Nat (Pair Nat Nat)) → Nat → PlanVal) → PlanVal
   = λ expr env ctab hint ce →
       match expr {
         | EApp f a →
-            let fv = ce f env ctab hint in
-            let av = ce a env ctab hint in
+            let fv = ce f env ctab 0 in
+            let av = ce a env ctab 0 in
             cg_apply fv av (cenv_arity env)
         | _ → PNat 0
       }
@@ -4943,7 +5548,13 @@ let cg_compile_enat : Expr → CEnv → Nat → PlanVal
         | _ → PNat 0
       }
 
--- cg_compile_elet: compile ELet (local let binding)
+-- cg_compile_elet: compile ELet (local let binding).
+-- Three cases, mirroring Python's _compile_local_let (codegen.py L3164):
+--   * env.arity = 0 (top level) → inline as global binding.
+--   * top_of_law = 1 (chain of lets at law body root) → native PLAN
+--     `(1 rhs body)` let form; preserve top_of_law for body recursion.
+--   * Otherwise (nested) → lambda-lift the body into a sub-law that
+--     captures outer locals + self + the let-bound name as parameters.
 let cg_compile_elet : Expr → CEnv → List (Pair Nat (Pair Nat Nat)) → Nat → PlanVal
                     → (Expr → CEnv → List (Pair Nat (Pair Nat Nat)) → Nat → PlanVal) → PlanVal
   = λ expr env ctab hint ce →
@@ -4954,11 +5565,48 @@ let cg_compile_elet : Expr → CEnv → List (Pair Nat (Pair Nat Nat)) → Nat �
                   let rhs_val = ce rhs env ctab name in
                   match (nat_eq (cenv_arity env) 0) {
                     | 0 →
-                        -- Law body: PLAN let form A(A(N(1), rhs), body)
-                        let new_idx = add (cenv_arity env) 1 in
-                        let body_env = cenv_bind_local (cenv_set_arity env new_idx) name new_idx in
-                        let body_val = ce body body_env ctab hint in
-                        PApp (PApp (PNat 1) rhs_val) body_val
+                        match (cenv_top_of_law env) {
+                          | 0 →
+                              -- Nested let: lambda-lift body into a sub-law.
+                              -- Sub-law env layout: [self?][free_locals…][pat_name].
+                              let free_vars = cg_free_vars body (Cons name Nil) env in
+                              let uses_self = cg_body_uses_self body env in
+                              let g = cenv_globals env in
+                              let sub_env0 = cenv_mark_top_of_law (cenv_make g Nil 0 None) in
+                              let sub_env1 = match (nat_eq uses_self 0) {
+                                    | 0 →
+                                        match (cenv_self env) {
+                                          | None → sub_env0
+                                          | Some fq →
+                                              let sub_env_fq = cenv_new_param sub_env0 fq in
+                                              let short = cg_short_after_dot fq in
+                                              match (Reaver.BPLAN.eq short fq) {
+                                                | 0 → cenv_bind_local sub_env_fq short (cenv_arity sub_env_fq)
+                                                | _ → sub_env_fq
+                                              }
+                                        }
+                                    | _ → sub_env0
+                                  } in
+                              let sub_env2 = cg_bind_params free_vars sub_env1 in
+                              let sub_env3 = cenv_new_param sub_env2 name in
+                              let body_val = ce body sub_env3 ctab hint in
+                              let sub_arity = cenv_arity sub_env3 in
+                              let sub_law = PPin (PLaw name (MkPair sub_arity body_val)) in
+                              let r0 = sub_law in
+                              let r1 = match (nat_eq uses_self 0) {
+                                    | 0 → cg_bapp r0 (PNat 0)
+                                    | _ → r0
+                                  } in
+                              let r2 = cg_apply_free_locals r1 free_vars env in
+                              cg_bapp r2 rhs_val
+                          | _ →
+                              -- Top-of-law: native PLAN let form, preserve flag.
+                              let new_idx = add (cenv_arity env) 1 in
+                              let body_env0 = cenv_bind_local (cenv_set_arity env new_idx) name new_idx in
+                              let body_env = cenv_mark_top_of_law body_env0 in
+                              let body_val = ce body body_env ctab hint in
+                              PApp (PApp (PNat 1) rhs_val) body_val
+                        }
                     | _ →
                         -- Top level: add to globals
                         let body_env = cenv_bind_global env name rhs_val in
@@ -4968,7 +5616,19 @@ let cg_compile_elet : Expr → CEnv → List (Pair Nat (Pair Nat Nat)) → Nat �
         | _ → PNat 0
       }
 
--- cg_compile_if: compile EIf using Case_ (opcode 3)
+-- cg_compile_if: compile EIf via BPLAN-66 Elim with thunked branches.
+--
+-- Both branches are lambda-lifted into Pin'd 1-arg thunk laws so neither is
+-- forced by the surrounding `kal` walk.  The Elim dispatch selects which
+-- Pin to apply based on the condition; the trampoline `(_ <0>)` then enters
+-- the chosen law's body, evaluating only the selected branch.
+--
+-- Without lifting, `kal`'s recursion through the `(0 f x)` shape would force
+-- both branches before the dispatch could choose — a silent infinite loop
+-- when either branch refers to the enclosing function (issue #1b in
+-- bootstrap/codegen.py::_compile_if).
+--
+-- Mirrors bootstrap/codegen.py::_compile_if line-for-line.
 let cg_compile_if : Expr → CEnv → List (Pair Nat (Pair Nat Nat)) → Nat → PlanVal
                   → (Expr → CEnv → List (Pair Nat (Pair Nat Nat)) → Nat → PlanVal) → PlanVal
   = λ expr env ctab hint ce →
@@ -4976,12 +5636,26 @@ let cg_compile_if : Expr → CEnv → List (Pair Nat (Pair Nat Nat)) → Nat →
         | EIf cond pair →
             match pair {
               | MkPair then_ else_ →
+                  -- "__if_thunk__" packed LE — sentinel name for the unused
+                  -- predecessor slot of each branch's 1-arg thunk law.  The
+                  -- thunk body never references this name; it exists only to
+                  -- keep the law a Pin until selected and applied.
+                  let nn_if_thunk = 29516431216706826313644203871 in
+                  -- Per-branch name hints `<hint>_then` / `<hint>_else` —
+                  -- cg_make_pred_succ_law appends "_succ", yielding
+                  -- `<hint>_then_succ` / `<hint>_else_succ` for the lifted
+                  -- law names, matching Python's _compile_if.
+                  let nn_then = 1852139636 in  -- = encode_name("then")
+                  let nn_else = 1702063205 in  -- = encode_name("else")
+                  let then_hint = cg_concat_under hint nn_then in
+                  let else_hint = cg_concat_under hint nn_else in
                   let cond_v = ce cond env ctab hint in
-                  let then_v = ce then_ env ctab hint in
-                  let else_v = ce else_ env ctab hint in
+                  let then_thunk = cg_make_pred_succ_law then_ nn_if_thunk env ce ctab then_hint in
+                  let else_thunk = cg_make_pred_succ_law else_ nn_if_thunk env ce ctab else_hint in
                   let const2_pin = PPin const2_law in
-                  let const_then = cg_apply const2_pin then_v (cenv_arity env) in
-                  cg_build_op2 else_v const_then cond_v (cenv_arity env)
+                  let const_then = cg_apply const2_pin then_thunk (cenv_arity env) in
+                  let dispatch = cg_build_op2 else_thunk const_then cond_v (cenv_arity env) in
+                  cg_apply dispatch (PNat 0) (cenv_arity env)
             }
         | _ → PNat 0
       }
@@ -5000,7 +5674,10 @@ let cg_compile_fix : Expr → CEnv → List (Pair Nat (Pair Nat Nat)) → Nat �
                   -- self_name goes into cenv_self so references to it become N(0)
                   let g = cenv_globals env in
                   let env0 = cenv_make g Nil 0 (Some self_name) in
-                  -- Bind each user param at N(1), N(2), ... via cenv_new_param
+                  -- Bind each user param at N(1), N(2), ... via cenv_new_param.
+                  -- Note: Python's _compile_fix doesn't mark top_of_law on
+                  -- the body env, so nested lets in fix bodies always
+                  -- lambda-lift.  We match that here.
                   let env1 = cg_bind_params params env0 in
                   let body_val = ce body env1 ctab 0 in
                   PLaw hint (MkPair (length params) body_val)
@@ -5413,28 +6090,50 @@ let cg_compile_complex : Expr → CEnv → List (Pair Nat (Pair Nat Nat)) → Na
 
 -- cg_dispatch: main expression dispatch (routes to per-constructor handlers)
 -- ce: the compile_expr function (passed for recursion — ties the knot)
+--
+-- top_of_law chokepoint: Python's _compile_expr clears env.top_of_law on
+-- entry whenever the expression isn't an ELet or EPin (codegen.py L1127),
+-- so a chain of lets at a law's body root stays "top of law" but anything
+-- else (a match, lambda, app, …) leaves the root.  We replicate that
+-- here.  Letting top_of_law leak past a non-let expression would
+-- mis-classify subsequent nested lets as top-of-law and emit native
+-- `(1 …)` form where Python lifts to sub-laws — the divergence
+-- compile-self hit at byte ~37725 in lex_skip_ws.
 let cg_dispatch : (Expr → CEnv → List (Pair Nat (Pair Nat Nat)) → Nat → PlanVal)
                 → Expr → CEnv → List (Pair Nat (Pair Nat Nat)) → Nat → PlanVal
   = λ ce expr env ctab hint →
-      match (nat_eq (expr_tag expr) 0) {
+      let tag = expr_tag expr in
+      let env2 = match (cenv_top_of_law env) {
+            | 0 → env
+            | _ →
+                match (nat_eq tag 3) {     -- ELet preserves top_of_law
+                  | 0 →
+                      match (nat_eq tag 7) {     -- EPin preserves
+                        | 0 → cenv_clear_top_of_law env
+                        | _ → env
+                      }
+                  | _ → env
+                }
+          } in
+      match (nat_eq tag 0) {
         | 0 →
-            match (nat_eq (expr_tag expr) 4) {
+            match (nat_eq tag 4) {
               | 0 →
-                  match (nat_eq (expr_tag expr) 1) {
+                  match (nat_eq tag 1) {
                     | 0 →
                         -- Complex expression (ELam/ELet/EIf/EMatch/EPin)
-                        cg_compile_complex expr env ctab hint ce
+                        cg_compile_complex expr env2 ctab hint ce
                     | _ →
                         -- EApp (tag 1)
-                        cg_compile_app expr env ctab hint ce
+                        cg_compile_app expr env2 ctab hint ce
                   }
               | _ →
                   -- ENat (tag 4)
-                  cg_compile_enat expr env hint
+                  cg_compile_enat expr env2 hint
             }
         | _ →
             -- EVar (tag 0)
-            cg_compile_var expr env ctab hint
+            cg_compile_var expr env2 ctab hint
       }
 
 -- cg_compile_expr: main compiler entry point (self-recursive via cg_dispatch)
@@ -5471,8 +6170,19 @@ let nn_Core_PLAN : Nat = 1443551261620241067843
 let nn_pin   : Nat = 7235952
 let nn_mk_law : Nat = 131260313725805
 let nn_inc   : Nat = 6516329
+let nn_unpin : Nat = 474215378549   -- "unpin" LE-packed (lowercase u)
 let nn_reflect : Nat = 32760384559932786
 let nn_force  : Nat = 435460140902
+
+-- Core.IO.Prim primitives.  Currently just `write_op`, an opcode pin
+-- inherited from the legacy planvm path (Reaver has no `op 9`; this
+-- compiles cleanly but won't actually run under Reaver — see the note
+-- in bootstrap/codegen.py::_CORE_IO_PRIMITIVES).  Compiler.gls
+-- references `write_op` from `_write_op_call` on L7302; without an
+-- entry here the self-host emits the opaque-sentinel fallback,
+-- diverging from Python's `P(N(9))`.
+let nn_Core_IO_Prim : Nat = 33861343110441687903187922755          -- "Core.IO.Prim" LE
+let nn_write_op   : Nat   = 8101799144012214903                     -- "write_op" LE
 
 -- BPLAN named-primitive name nats (the "Name" string in (P("B")) ("Name" args)).
 -- Per vendor/reaver/src/hs/Plan.hs op 66 cases.
@@ -5481,6 +6191,7 @@ let nn_bplan_B    : Nat = 66
 let nn_bplan_Pin  : Nat = 7235920
 let nn_bplan_Law  : Nat = 7823692
 let nn_bplan_Inc  : Nat = 6516297
+let nn_bplan_Unpin : Nat = 474215378517   -- "Unpin" LE-packed (uppercase U)
 let nn_bplan_Elim : Nat = 1835625541
 let nn_bplan_Force : Nat = 435460140870
 let nn_bplan_Add  : Nat = 6579265
@@ -5526,6 +6237,7 @@ let cg_core_plan_bplan_prims : List (Pair Nat (Pair Nat Nat))
   = Cons (MkPair (name_concat_dot nn_Core_PLAN nn_pin)     (MkPair nn_bplan_Pin   1))
     (Cons (MkPair (name_concat_dot nn_Core_PLAN nn_mk_law) (MkPair nn_bplan_Law   3))
     (Cons (MkPair (name_concat_dot nn_Core_PLAN nn_inc)    (MkPair nn_bplan_Inc   1))
+    (Cons (MkPair (name_concat_dot nn_Core_PLAN nn_unpin)  (MkPair nn_bplan_Unpin 1))
     (Cons (MkPair (name_concat_dot nn_Core_PLAN nn_reflect)(MkPair nn_bplan_Elim  6))
     (Cons (MkPair (name_concat_dot nn_Core_PLAN nn_force)  (MkPair nn_bplan_Force 1))
     -- Reaver.BPLAN entries
@@ -5538,15 +6250,18 @@ let cg_core_plan_bplan_prims : List (Pair Nat (Pair Nat Nat))
     (Cons (MkPair (name_concat_dot nn_Reaver_BPLAN nn_lsh) (MkPair nn_bplan_Lsh   2))
     (Cons (MkPair (name_concat_dot nn_Reaver_BPLAN nn_rsh) (MkPair nn_bplan_Rsh   2))
     (Cons (MkPair (name_concat_dot nn_Reaver_BPLAN nn_seq) (MkPair nn_bplan_Seq   2))
-    -- Reaver.RPLAN entries — same pin shape, different gateway opcode.
-    -- The gateway is the "R" pin (op 82); for the self-hosted compiler
-    -- we still register them in cg_core_plan_bplan_prims since the
-    -- runtime distinction is at the gateway, not the prim-table key.
-    -- (If/when the GLS compiler grows a separate RPLAN dispatch path,
-    -- this entry moves there.)
-    (Cons (MkPair (name_concat_dot nn_Reaver_RPLAN nn_input)  (MkPair nn_rplan_Input  1))
+    Nil))))))))))))))
+
+-- cg_reaver_rplan_prims: Reaver.RPLAN.* named ops.  Same pin shape as
+-- the BPLAN table but the runtime gateway is op 82 (`R`), not 66 (`B`).
+-- Mirrors bootstrap/codegen.py::_REAVER_RPLAN_PRIMS.  Compiler.gls
+-- references `Reaver.RPLAN.input` / `.output` from `main_reaver`; the
+-- compile-self gate's divergence at byte 4640 was an `(#pin 66)`
+-- instead of `(#pin 82)` for these items.
+let cg_reaver_rplan_prims : List (Pair Nat (Pair Nat Nat))
+  = Cons (MkPair (name_concat_dot nn_Reaver_RPLAN nn_input)  (MkPair nn_rplan_Input  1))
     (Cons (MkPair (name_concat_dot nn_Reaver_RPLAN nn_output) (MkPair nn_rplan_Output 1))
-    Nil)))))))))))))))
+    Nil)
 
 -- Builtin name nats
 let nn_False : Nat = 435728179526
@@ -5650,31 +6365,61 @@ let cg_bapp_slots_go : PlanVal → Nat → Nat → PlanVal
         | _ → cg_bapp_slots_go (cg_bapp acc (PNat cur)) (Core.PLAN.inc cur) max
       }
 
--- cg_make_bplan_prim: build the Pin'd Law for a BPLAN named primitive.
--- Mirrors `vendor/reaver/src/plan/boot.plan`'s `bplan` macro expansion:
---     (#pin (#law "Name" (Name a1 ... aN) ((#pin "B") ("Name" a1 ... aN))))
--- In our PlanVal:
---     PPin (PLaw bplan_name (MkPair arity body))
--- where body = bapp(B_pin, bapp(quoted_name, slot_1, ..., slot_arity)).
-let cg_make_bplan_prim : Nat → Nat → PlanVal
-  = λ bplan_name prim_arity →
-      let b_pin = PPin (PNat nn_bplan_B) in
-      let quoted_name = PApp (PNat 0) (PNat bplan_name) in
+-- cg_make_gateway_prim: build the Pin'd Law for a named primitive with
+-- a specific gateway opcode.  Mirrors `vendor/reaver/src/plan/boot.plan`'s
+-- `bplan` and `rplan` macro expansions:
+--     (#pin (#law "Name" (Name a1 ... aN) ((#pin gateway) ("Name" a1 ... aN))))
+-- gateway = 66 ('B') for BPLAN, 82 ('R') for RPLAN.  Mirrors Python's
+-- _make_bplan_prim which takes a `gateway_pin` kwarg.
+let cg_make_gateway_prim : Nat → Nat → Nat → PlanVal
+  = λ gateway_op prim_name prim_arity →
+      let gw_pin = PPin (PNat gateway_op) in
+      let quoted_name = PApp (PNat 0) (PNat prim_name) in
       let inner = cg_bapp_slots_go quoted_name 1 prim_arity in
-      let body = cg_bapp b_pin inner in
-      PPin (PLaw bplan_name (MkPair prim_arity body))
+      let body = cg_bapp gw_pin inner in
+      PPin (PLaw prim_name (MkPair prim_arity body))
+
+-- cg_make_bplan_prim: gateway 66 ('B') wrapper.  Kept as a named alias so
+-- existing call sites stay readable.
+let cg_make_bplan_prim : Nat → Nat → PlanVal
+  = λ bplan_name prim_arity → cg_make_gateway_prim nn_bplan_B bplan_name prim_arity
+
+-- cg_make_rplan_prim: gateway 82 ('R') wrapper for Reaver.RPLAN.* items.
+let cg_make_rplan_prim : Nat → Nat → PlanVal
+  = λ rplan_name prim_arity → cg_make_gateway_prim 82 rplan_name prim_arity
 
 -- cg_register_ext_item: register one external item.
--- For known Core.PLAN.* primitives, build a BPLAN-shaped Pin'd Law.
--- For other externals, fall back to an opaque sentinel pin of the name nat.
+-- Lookup order, mirroring bootstrap/codegen.py::_register_ext:
+--   1. Core.PLAN.* / Reaver.BPLAN.* primitives in
+--      `cg_core_plan_bplan_prims` → Pin'd Law via BPLAN gateway (op 66).
+--   2. Reaver.RPLAN.* primitives in `cg_reaver_rplan_prims` → Pin'd
+--      Law via RPLAN gateway (op 82).
+--   3. Core.IO.Prim.write_op → P(N(9)), the legacy planvm WriteOp
+--      opcode pin (Python mirrors this in `_CORE_IO_PRIMITIVES`).
+--      The opcode is not actually dispatched by Reaver; it compiles
+--      cleanly but won't run.  We emit it for byte-identity with
+--      Python's reference output.
+--   4. Anything else → opaque sentinel pin of the name nat.
 let cg_register_ext_item : Nat → CEnv → List (Pair Nat PlanVal) → Pair CEnv (List (Pair Nat PlanVal))
   = λ fq_name env compiled →
+      let nn_write_op_fq = name_concat_dot nn_Core_IO_Prim nn_write_op in
       let val = match (assoc_lookup fq_name cg_core_plan_bplan_prims) {
                   | Some pair → match pair {
                       | MkPair bplan_name prim_arity →
                           cg_make_bplan_prim bplan_name prim_arity
                     }
-                  | None → PPin (PNat fq_name)
+                  | None →
+                      match (assoc_lookup fq_name cg_reaver_rplan_prims) {
+                        | Some pair → match pair {
+                            | MkPair rplan_name prim_arity →
+                                cg_make_rplan_prim rplan_name prim_arity
+                          }
+                        | None →
+                            match (Reaver.BPLAN.eq fq_name nn_write_op_fq) {
+                              | 0 → PPin (PNat fq_name)
+                              | _ → PPin (PNat 9)
+                            }
+                      }
                 } in
       MkPair (cenv_bind_global env fq_name val) (Cons (MkPair fq_name val) compiled)
 
@@ -5709,15 +6454,28 @@ let cg_pass2 : List Decl → Nat → CEnv → List (Pair Nat PlanVal) → Pair C
             }
       }
 
--- cg_compile_let_one: compile one DLet declaration
+-- cg_compile_let_one: compile one DLet declaration.
+-- Sentinel name=0 is reserved for parser-emitted no-op DLets (e.g. the
+-- placeholder for `type Foo = Bar` alias declarations — see
+-- parse_type_decl_body L2797).  Python's bootstrap simply ignores
+-- DeclTypeAlias at codegen time; the self-host matches by skipping the
+-- sentinel here instead of emitting a stray `(#bind Compiler_ 0)`.
 let cg_compile_let_one : Nat → Expr → Nat → CEnv → List (Pair Nat (Pair Nat Nat)) → List (Pair Nat PlanVal)
                         → Pair CEnv (List (Pair Nat PlanVal))
   = λ name body mod_name env ctab compiled →
-      let fq_name = name_concat_dot mod_name name in
-      let fq_env = cenv_set_self (cenv_set_arity env 0) (Some fq_name) in
-      let val = cg_compile_expr body fq_env ctab name in
-      let new_env = cenv_bind_global env fq_name val in
-      MkPair new_env (Cons (MkPair fq_name val) compiled)
+      match (Reaver.BPLAN.eq name 0) {
+        | 0 →
+            let fq_name = name_concat_dot mod_name name in
+            -- Body of a top-level let begins at the law's body root.  Mark
+            -- top_of_law so nested let-chains at the body root use native
+            -- `(1 rhs body)` form rather than lambda-lifting.
+            let fq_env = cenv_mark_top_of_law
+                           (cenv_set_self (cenv_set_arity env 0) (Some fq_name)) in
+            let val = cg_compile_expr body fq_env ctab name in
+            let new_env = cenv_bind_global env fq_name val in
+            MkPair new_env (Cons (MkPair fq_name val) compiled)
+        | _ → MkPair env compiled
+      }
 
 -- cg_compile_inst_members: compile each method body in a DInst
 let cg_compile_inst_members
@@ -5990,9 +6748,9 @@ let sr_rewrite_arm
                   ArmCon fq_con (MkPair fields body2)
               | _ →
                   -- ArmVar: var name is a local binder
+                  -- DEBUG: replace body with ENat 99999 to verify ArmVar arm fires
                   let n     = arm_get_var_name arm in
-                  let body2 = pe (arm_get_var_body arm) (Cons n bound) gtab in
-                  ArmVar n body2
+                  ArmVar n (ENat 99999)
             }
         | _ →
             -- ArmNat: no new binders
@@ -6053,16 +6811,42 @@ let sr_dispatch
       : (Expr → List Nat → List (Pair Nat Nat) → Expr)
       → Expr → List Nat → List (Pair Nat Nat) → Expr
   = λ pe expr bound gtab →
-      match (nat_eq (planval_is_nat expr) 1) {
+      -- Handle EVar (tag 0) explicitly first.  EVar is encoded as a
+      -- unary-App `App (PNat 0) (PNat n)` at the PLAN level, so the
+      -- old outer dispatch via `planval_is_nat` couldn't reach it —
+      -- the EVar handler at the bottom of this function was unreachable
+      -- for actual EVar values and the resolver silently passed them
+      -- through unchanged.  This caused recursive self-refs in let-body
+      -- recursion to never get qualified to FQ, breaking the
+      -- cg_body_uses_self detection downstream.
+      -- Handle EVar (tag 0) explicitly first.  Without this, EVar fell
+      -- through the entire tag dispatch chain to the EDo handler whose
+      -- inner pattern match returned the expression unchanged — meaning
+      -- the resolver silently never rewrote EVar.  Recursive self-refs
+      -- and lifted-body cross-binding refs remained bare, breaking
+      -- cg_body_uses_self detection and any local/global lookup.
+      --
+      -- KNOWN GAP: even with this fix, the body's EVar still doesn't
+      -- reach the handler at runtime (cross_ref.gls probe shows bare
+      -- name persists).  Likely a separate bootstrap-codegen issue
+      -- around mutual SCC compilation of sr_dispatch/sr_rewrite_expr.
+      -- Dispatch EVar (tag 0) first via nat_eq on expr_tag.  Using
+      -- constructor `match expr { | EVar n → ... | _ → ... }` here has a
+      -- bootstrap-codegen issue (unary single-arm with field-bind +
+      -- wildcard, on a mixed-arity multi-ctor type) where the wildcard
+      -- arm's body isn't actually reached for many constructors.
+      match (nat_eq (expr_tag expr) 0) {
         | 0 →
-            -- Not EVar. Check for binary constructor (has App outer-fun).
-            match (nat_eq (planval_is_app expr) 1) {
+            match (nat_eq (planval_is_nat expr) 1) {
               | 0 →
-                  -- Unary with tag > 0 (ENat, EText…): no names, pass through.
-                  expr
-              | _ →
-                  -- Binary constructor: dispatch by tag.
-                  match (nat_eq (expr_tag expr) 1) {
+                  -- Not a bare Nat.  Check for binary constructor (has App outer-fun).
+                  match (nat_eq (planval_is_app expr) 1) {
+                    | 0 →
+                        -- Unary with tag > 0 (ENat, EText…): no names, pass through.
+                        expr
+                    | _ →
+                        -- Binary constructor: dispatch by tag.
+                        match (nat_eq (expr_tag expr) 1) {
                     | 0 →
                         match (nat_eq (expr_tag expr) 2) {
                           | 0 →
@@ -6183,7 +6967,11 @@ let sr_dispatch
                   }
             }
         | _ →
-            -- EVar (tag 0): qualify if global and not locally bound
+            -- Unreachable: planval_is_nat=1 means bare PNat, not Expr.
+            expr
+            }
+        | _ →
+            -- EVar (tag 0) — qualify if global and not locally bound.
             match expr {
               | EVar n →
                   match (cg_name_in_list n bound) {
@@ -6480,16 +7268,28 @@ let planval_app_arg : PlanVal → PlanVal
 
 -- emit_bval_papp_nat: sub-dispatch for PApp(PNat opcode)(x).
 -- No let-bindings: avoids stuck A(A(N(1),...),k) values in Case_ arms.
+-- emit_bval_papp_nat: emit body-context `PApp (PNat opcode) x`.
+--
+-- Opcode 0 is the QUOTE form: `(0 x)` means "x as a constant, unaffected by
+-- de Bruijn substitution".  Plan Asm renders this as the constant itself —
+-- decimal for nats, top-level form for everything else.  Without the
+-- top-level branch we'd emit `(_0 x_body)`, treating the leading `0` as a
+-- slot ref and mis-rendering the constant.  Mirrors
+-- bootstrap/emit_pla.py::_emit_body lines 181-185.
+--
+-- Opcode > 0 is a non-body App that arrived via codegen (e.g., partial
+-- application of an opcode); emit literally as `(f x)`.
 let emit_bval_papp_nat
-      : (PlanVal → Nat → Bytes)
+      : (PlanVal → Bytes)
+      → (PlanVal → Nat → Bytes)
       → Nat → PlanVal → PlanVal → Nat
       → Bytes
-  = λ ebv opcode f x depth →
+  = λ ep ebv opcode f x depth →
       if nat_eq opcode 0 then
         if planval_is_nat x then
           nat_to_decimal (planval_get_nat x)
         else
-          emit_asm_app (ebv f depth) (ebv x depth)
+          ep x
       else
         emit_asm_app (ebv f depth) (ebv x depth)
 
@@ -6524,7 +7324,7 @@ let emit_bval_dispatch
             -- planval_is_app f, planval_is_nat f2 → emit_bval_papp_app
             -- else              → PLaw / PPin: generic application
             if planval_is_nat f then
-              emit_bval_papp_nat ebv (planval_get_nat f) f x depth
+              emit_bval_papp_nat ep ebv (planval_get_nat f) f x depth
             else if planval_is_app f then
               if planval_is_nat (planval_app_fun f) then
                 emit_bval_papp_app ebv
@@ -6548,6 +7348,7 @@ let emit_bval_dispatch
         | PLaw _ _ →
             -- Lambda-lifted laws appear as PPin(PLaw ...) in law bodies.
             ep pval
+        | PNamed n _ → name_to_symbol n
       }
 
 -- emit_body_val: ties the knot for emit_bval_dispatch.
@@ -6614,6 +7415,7 @@ let emit_pval_dispatch : (PlanVal → Bytes) → PlanVal → Bytes
                     | _ → emit_elim_symbol
                   }
             }
+        | PNamed n _ → name_to_symbol n
       }
 
 -- emit_pval: ties the knot for emit_pval_dispatch.

@@ -342,6 +342,366 @@ class TestPhaseG3ByteIdentity(unittest.TestCase):
         """
         self._assert_byte_identical('let ap = fn ff -> fn xx -> ff xx')
 
+    def test_match_top_level_wildcard(self):
+        """``let mm = match 0 { | _ → 9 }`` — top-level match, wildcard arm only.
+
+        Pinned the parser fix: ``parse_app_go_pe`` only treats ``{`` as a
+        record update when the next token is an identifier.  Without the
+        lookahead, ``match 0 { ... }`` mis-parsed as ``0 { ... }`` (a
+        record update of nat 0) and the ``| _ → 9`` was consumed as
+        garbage record fields, leaving the match arms empty.  Bug was
+        pre-existing; surfaced once the Phase H if/match fixtures were
+        added.
+        """
+        self._assert_byte_identical('let mm = match 0 { | _ → 9 }')
+
+    def test_match_adt_nullary_multi_arm(self):
+        """``type Color = | Red | Green | Blue; let to_nat = ...`` — multi-arm
+        nullary constructor match.
+
+        Passing byte-identical already (no fixes from this session needed —
+        the path through cg_compile_con_match's all-nullary branch uses
+        cg_build_nat_dispatch with the idx-threaded succ-law name fix from
+        7ab0dcf).  Pinned here as a regression sentinel.
+        """
+        src = (
+            'type Color = | Red | Green | Blue\n'
+            'let to_nat = λ c → match c { | Red → 1 | Green → 2 | Blue → 3 }\n'
+            'let main : Nat = to_nat Green\n'
+        )
+        self._assert_byte_identical(src)
+
+    def test_match_adt_multi_field(self):
+        """``type IntList = | INil | ICons Nat IntList; let head_or = ...``.
+
+        Binary-field constructor match (`ICons h t → h`).  Pins the
+        `<hint>_inner` lifted-law name in `cg_build_binary_handler_body`
+        (matching Python's _compile_con_match line 2801).  Without the
+        hint threading, the inner field-binding law gets name `0`,
+        diverging from the bootstrap output.
+
+        Other hardcoded-`0` PLaw sites remain in
+        cg_build_unary_handler_body's multi-arm path; not exercised
+        here.  Tracked as a continuing follow-up.
+        """
+        src = (
+            'type IntList = | INil | ICons Nat IntList\n'
+            'let head_or = λ d xs → match xs { | INil → d | ICons h t → h }\n'
+            'let main = head_or 99 (ICons 5 INil)\n'
+        )
+        self._assert_byte_identical(src)
+
+    def test_match_adt_single_field(self):
+        """``type Maybe a = | None | Some a; let unwrap = λ m → match m { ... }``.
+
+        Constructor match with one nullary arm (None) and one
+        single-field arm (Some n → n).  Pins two fixes:
+
+        * The app-handler lifted-law name in ``cg_build_app_handler`` is
+          now ``<hint>_app`` (mirroring Python's _compile_con_match).
+          ``cg_build_app_handler`` accepts a hint parameter; the caller
+          ``cg_compile_con_match`` threads it.
+
+        * The body-context "constant 0 with no wildcard arm" fallback
+          across three sites (`cg_build_reflect_app`, `cg_build_m_body`,
+          `cg_build_unary_m_body`) now uses the quote form
+          ``PApp (PNat 0) (PNat 0)`` — Plan Asm ``0`` — rather than
+          ``PPin (PNat 0)`` which emitted ``(#pin 0)``.  The wire form
+          had to match Python's bapp-form fallback shape.
+
+        Multi-field ADT constructors (e.g., ``ICons Nat IntList``)
+        still have a remaining ``<hint>_inner`` name divergence;
+        tracked separately.
+        """
+        src = (
+            'type Maybe a = | None | Some a\n'
+            'let unwrap = λ m → match m { | None → 0 | Some n → n }\n'
+            'let main = unwrap (Some 42)\n'
+        )
+        self._assert_byte_identical(src)
+
+    def test_external_mod_decl(self):
+        """``external mod X { sub : Nat }`` — single-item external module.
+
+        Pinned two bugs in the self-host parser that were not exercised
+        by any pre-Phase-H fixture:
+
+        * `parse_ext_items` had inverted EOF arms: the `| 0 →` (not-EOF)
+          arm returned Nil and the `| k →` (is-EOF) arm continued
+          parsing.  Any non-empty external mod body produced an empty
+          items list and left the token cursor mid-body, triggering
+          sentinel `(#bind Compiler_ 0)` runs in `parse_program`.
+
+        * `tok_skip_ext_type_body` stopped at the FIRST ident after `:`
+          regardless of what followed it, so a type like `Nat → Nat`
+          treated `Nat` as the next item's name.  Now stops only when
+          the ident is followed by `:` (the start of the next item).
+
+        Reproduces with any external mod containing items —
+        ``external mod`` is heavily used in Compiler.gls itself,
+        so this break would block any compile-self attempt.
+        """
+        self._assert_byte_identical('external mod X { sub : Nat }')
+
+    def test_match_multi_arm(self):
+        """``let classify = λ n → match n { | 0 → 10 | 1 → 20 | 2 → 30 | _ → 99 }``.
+
+        Exercises the multi-arm nat-dispatch path with three named arms +
+        a wildcard.  Pins the ``idx`` threading through
+        ``cg_build_nat_dispatch``: each succ law in the chain is named
+        ``<hint>_succ_<idx>`` (matching Python's
+        _build_nat_dispatch.make_succ_law line 1969).  Without idx
+        threading every succ law gets name 0, diverging in the
+        ``(#law "<name>" ...)`` field at every level.
+
+        Also pins the new ``cg_b_decimal`` helper (small LE-packed
+        decimal-byte encoder) which makes the suffix idx names like
+        ``_succ_1``, ``_succ_2`` constructible inside the codegen layer
+        without depending on the later-defined emit-layer
+        ``nat_to_decimal``.
+        """
+        self._assert_byte_identical(
+            'let classify = λ n → match n { | 0 → 10 | 1 → 20 | 2 → 30 | _ → 99 }'
+        )
+
+    def test_match_nat_in_function_body(self):
+        """``let pick = λ x → match x { | 0 → 100 | _ → 200 }`` — match
+        inside a lambda body (arity > 0).  Exercises the full nat-dispatch
+        chain plus three further pre-existing fixes surfaced together:
+
+          * ``emit_bval_papp_nat`` quote-form handling — ``(0 x)`` with
+            non-nat x now renders as ``ep x`` (top-level form), not
+            ``(_0 x_body)`` which mis-applied slot 0.
+          * ``cg_make_wild_succ`` — lambda-lifts the wildcard body at
+            arity > 0 via ``cg_make_pred_succ_law`` instead of plain
+            ``const2``-wrap, so outer-local captures thread through;
+            mirrors Python's _build_nat_dispatch dispatch lines 1988-1997.
+          * ``cg_compile_lam_as_law`` / ``cg_compile_lam_lifted`` — pass
+            the parent ``hint`` (not ``0``) into the body compile, so
+            nested lifted laws get the proper ``<hint>_wild_succ`` name.
+        """
+        self._assert_byte_identical(
+            'let pick = λ x → match x { | 0 → 100 | _ → 200 }'
+        )
+
+    def test_if_expression(self):
+        """``let mm = if 1 then 5 else 10`` — pins Phase H #1 + #2 end-to-end.
+
+        Exercises the full BPLAN-66-wrapped Elim dispatch:
+
+          * ``cg_build_op2`` emits ``((#pin 66) (Elim id id id z m scr))``
+            with the BPLAN ``'B'`` gateway pin and the name nat for
+            ``Elim`` as the inner head (commit 65efbc4).
+          * ``cg_compile_if`` lambda-lifts both branches into Pin'd 1-arg
+            thunk laws via ``cg_make_pred_succ_law`` and appends the
+            ``N(0)`` trampoline (commit 65efbc4).
+          * ``cg_make_pred_succ_law`` names each lifted law
+            ``<hint>_then_succ`` / ``<hint>_else_succ`` via
+            ``cg_concat_under`` (commit 457e5a5), matching Python's
+            ``encode_name(name_hint + '_succ')``.
+          * ``cg_quote_nat`` always quote-wraps body-context literals so
+            the thunk bodies emit ``5`` / ``10`` as quoted constants, not
+            as ``_5`` / ``_10`` slot refs (commit 457e5a5).
+          * Cross-binding refs to ``id_law`` and ``const2_law`` flow
+            through the new ``PNamed`` variant rather than inlining
+            (commit 3f0766c).
+
+        Locks in roughly 300 bytes of byte-identity across every
+        Phase H foundational fix.
+        """
+        self._assert_byte_identical('let mm = if 1 then 5 else 10')
+
+    def test_self_recursion_in_match_wildcard(self):
+        """``let count_down = λ n → match n { | 0 → 0 | _ → count_down (sub n 1) }``
+        — self-recursive call from inside a nat-match wildcard arm body.
+
+        Pins the Phase H Task #10 fix for lifted-law outer-local capture
+        of self-references when ``sr_dispatch`` failed to qualify the bare
+        EVar to its FQ form (the documented "deep recursion" sr_dispatch
+        gap).  Without the fix, ``cg_body_uses_self`` returns 0 for a body
+        carrying a bare ``count_down`` (it only matched FQ
+        ``Compiler.count_down``), so the lifted wild_succ law dropped the
+        self capture — produced arity 2 instead of arity 3 and lost the
+        recursive call.
+
+        The fix is a safety net that mirrors Python's ``_body_uses_self_ref``:
+
+        * New ``cg_short_after_dot`` helper extracts the segment after the
+          last ``.`` from an LE-encoded name nat (e.g. ``Compiler.count_down``
+          → ``count_down``) using ``Reaver.BPLAN.eq`` for O(1) byte compare
+          (the recursive ``nat_eq`` is O(min m n) and would walk a Case_
+          chain of cosmic length for encoded-name nats).
+
+        * ``cg_body_uses_self`` checks both the FQ name *and* its short
+          tail — either match counts as self-use.
+
+        * ``cg_make_pred_succ_law``, ``cg_build_app_handler``, and
+          ``cg_build_binary_handler_body`` alias the short name to the
+          same slot as the FQ in their lifted envs, so the body's bare
+          ``count_down`` EVar resolves to the captured self slot via
+          ``cg_var_from_env``.
+
+        * ``cg_compile_var`` accepts the short tail as a self-reference
+          (compiles to ``N(0)``) at the OUTER law level.
+
+        Also pins the related ``cg_var_from_env`` emit fix: when a binding
+        is itself ``Pin``'d (e.g. ``Reaver.BPLAN.sub``), the cross-binding
+        ref tag is now ``PNamed n val`` (not ``PPin (PNamed n inner)``),
+        so emit produces bare ``Reaver_BPLAN_sub`` instead of the wrongly
+        double-pinned ``(#pin Reaver_BPLAN_sub)`` — mirrors Python's
+        identity-based ``_maybe_symbol`` dedup.
+        """
+        src = (
+            'external mod Reaver.BPLAN {\n'
+            '  sub : Nat → Nat → Nat\n'
+            '}\n'
+            '\n'
+            'let count_down = λ n → match n { | 0 → 0 | _ → count_down (Reaver.BPLAN.sub n 1) }\n'
+        )
+        self._assert_byte_identical(src)
+
+    def test_cross_binding_bare_ref_in_match_wildcard(self):
+        """``let helper = λ n → n
+            let count_down = λ n → match n { | 0 → 0 | _ → helper (sub n 1) }``
+        — cross-binding bare reference inside a nat-match wildcard arm body.
+
+        Sibling of ``test_self_recursion_in_match_wildcard``: same
+        sr_dispatch deep-recursion gap (the bare ``helper`` EVar isn't
+        qualified to FQ ``Compiler.helper``), but the self-ref short-name
+        safety net doesn't fire because ``helper`` ≠ ``count_down``'s
+        short.  Pins the globals-by-short fallback in
+        ``cg_var_from_env``: when both local and bare-FQ globals lookup
+        fail, scan globals for the first FQ whose short tail matches
+        the bare name.  Without the fallback, ``helper`` resolves to
+        ``PNat 0`` (= the lifted law's self, i.e. emits ``(_0 …)``
+        instead of ``((#pin Compiler_helper) …)``).
+        """
+        src = (
+            'external mod Reaver.BPLAN {\n'
+            '  sub : Nat → Nat → Nat\n'
+            '}\n'
+            '\n'
+            'let helper = λ n → n\n'
+            'let count_down = λ n → match n { | 0 → 0 | _ → helper (Reaver.BPLAN.sub n 1) }\n'
+        )
+        self._assert_byte_identical(src)
+
+    def test_match_adt_multi_arm_unary_mixed(self):
+        """``type Shape = | Empty | Circle Nat | Square Nat; let area = ...``
+        — match with one nullary arm + multiple unary arms.
+
+        Pins two coupled fixes for the multi-arm unary-mixed path:
+
+        * ``cg_build_precompiled_nat_dispatch`` now creates its `pred_env`
+          by bumping the caller env's arity (preserving locals), so
+          pre-compiled arm bodies' slot refs survive into the inner
+          succ-law's frame.  Mirrors Python's `_build_tag_chain`'s
+          `make_ext_env` + `partially_apply` — without this, the inner
+          succ-law had arity 1 instead of `n_cap + 1` and outer locals
+          were unreachable.
+
+        * When `tag0 > 0` (no field arm matches Nat 0 — true when a
+          nullary constructor precedes unary in the type), the outer
+          Elim's z arm is now a fallback (`cg_quote_nat 0 n_cap`) and
+          ALL tags shift down by 1.  Mirrors Python's `_build_tag_chain`
+          `first_tag > 0` branch.  Implemented via top-level helpers
+          `cg_pcd_z_for_op2` and `cg_pcd_pairs_for_inner` to keep the
+          conditional at top-of-law (avoids let-lifting into deep
+          sub-laws).
+
+        * Also pins ``cg_contab_lookup_safe`` — the constructor name
+          lookup falls back to a short-tail search (parallel to the
+          globals-by-short fallback) when sr_dispatch failed to qualify
+          the bare constructor name in the match arm.  Without this,
+          ``contab_lookup ctab "Circle"`` returns None (only finds FQ
+          ``Compiler.Circle``), defaults the tag to 0, and the dispatch
+          structure collapses.
+        """
+        src = (
+            'type Shape = | Empty | Circle Nat | Square Nat\n'
+            'let area = λ s → match s { | Empty → 0 | Circle r → r | Square w → w }\n'
+        )
+        self._assert_byte_identical(src)
+
+    def test_type_with_parenthesized_field(self):
+        """``type Wrapped = | Wrap (Nat) Nat; let mk = Wrap 1 2``
+        — constructor with one parenthesized field type and one bare.
+
+        Pins ``parse_con_arity`` counting atom types, not raw tokens.
+        The original implementation counted every token between the
+        constructor name and the next stop-token, so ``Cons a (List a)``
+        parsed as arity 5 (counting ``a``, ``(``, ``List``, ``a``, ``)``)
+        instead of 2.  This minimal-repro case parses ``Wrap (Nat) Nat``
+        as arity 4 (``(``, ``Nat``, ``)``, ``Nat``) instead of 2 — the
+        constructor binding diverges:
+
+            ref:    (#law "1885434455" (_0 _1 _2)         ((0 _1) _2))
+            buggy:  (#law "1885434455" (_0 _1 _2 _3 _4)   ((((0 _1) _2) _3) _4))
+
+        The new ``parse_con_arity_go`` (Compiler.gls L2553) tracks paren
+        depth and treats each balanced group as a single atom — mirrors
+        Python's ``_parse_atom_type`` (bootstrap/parser.py L330).
+        Discovered as the first divergence of the compile-self gate.
+        """
+        src = (
+            'type Wrapped = | Wrap (Nat) Nat\n'
+            'let mk = Wrap 1 2\n'
+        )
+        self._assert_byte_identical(src)
+
+    def test_type_with_nested_parens(self):
+        """``type Box = | B (Wrap) (Wrap)`` — two parenthesized fields,
+        with an inner constructor reference.
+
+        Gates against regression of the paren-depth tracker in
+        ``parse_con_arity_go`` (Compiler.gls L2557).  A token-count
+        version would parse `B`'s field list as arity 6 (counting
+        ``(``, ``Wrap``, ``)``, ``(``, ``Wrap``, ``)``) instead of 2.
+        This case is byte-identical only when the depth tracker is
+        correctly counting balanced groups as single atoms.
+        """
+        src = (
+            'type Wrap = | Mk Nat\n'
+            'type Box = | B (Wrap) (Wrap)\n'
+            'let mk = B (Mk 1) (Mk 2)\n'
+        )
+        self._assert_byte_identical(src)
+
+    def test_nullary_match_captures_outer_local(self):
+        """``type Color = | Red | Green | Blue
+            let pick = λ d → λ c → match c { | Red → d | Green → d | Blue → d }``
+        — multi-arm nullary match whose arm bodies reference an outer
+        lambda local.
+
+        Gates two coupled `pred_env` locals-drop bugs flagged in the
+        Dwarf review of this Phase H arc:
+
+        * ``cg_build_nat_dispatch``'s multi-arm succ-law (Compiler.gls
+          L4527) previously built `pred_env = cenv_make g Nil 1 None`
+          — a fresh empty env that drops the caller's locals.  Arm
+          bodies referencing outer locals collapsed to ``PNat 0`` (the
+          succ law's own self) rather than the captured slot.
+
+        * ``cg_build_m_body`` (Compiler.gls L4832) had the same shape
+          for the nullary-tag>0 succ law in mixed con-matches.
+
+        Both now do free-var analysis (mirroring Python's
+        `make_succ_law`, bootstrap/codegen.py L1932) and partial-apply
+        the captured locals at the call site.  The earlier
+        captures-preserving fix in
+        `cg_build_precompiled_nat_dispatch` (commit c216e46) addressed
+        only the field-bearing path; the parallel paths in
+        `cg_build_nat_dispatch` and `cg_build_m_body` survived until
+        Dwarf flagged them — they go unexercised by every fixture
+        whose arm bodies are pure literals (e.g. ``Red → 1``).
+        """
+        src = (
+            'type Color = | Red | Green | Blue\n'
+            'let pick = λ d → λ c → match c { | Red → d | Green → d | Blue → d }\n'
+            'let main = pick 99 Red\n'
+        )
+        self._assert_byte_identical(src)
+
     @unittest.expectedFailure
     def test_same_constructor_literal_field_collapses(self):
         """`match (MkPair 0 99) { | MkPair 0 _ -> 1 | MkPair n _ -> 2 }` —
