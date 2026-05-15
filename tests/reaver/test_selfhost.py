@@ -702,6 +702,199 @@ class TestPhaseG3ByteIdentity(unittest.TestCase):
         )
         self._assert_byte_identical(src)
 
+    def test_single_unary_arm_with_wildcard(self):
+        """``match m { | Some x → x | _ → d }`` — single unary field arm
+        plus wildcard, where the wildcard body (``d``) references an outer
+        lambda parameter.
+
+        Pins two coupled fixes in the App-handler path:
+
+        * ``cg_build_app_handler`` now includes ``wild_body`` in the
+          free-variable union before intersecting with ``env.locals``.
+          Mirrors Python's ``_build_field_arm_law`` which gathers names
+          from field bodies AND wild_body so outer captures referenced
+          only by the wild (``d`` here) get lifted as a handler-law
+          parameter.  Without this, the wild's reference to ``d`` became
+          an unbound slot inside the lifted handler law's frame.
+
+        * ``cg_build_unary_handler_body`` (single-arm path) now wraps the
+          arm body in a reflect-dispatch tag-check when a wildcard is
+          present, so non-matching constructors (including the Nat-shaped
+          nullary case for tag 0) return the wild value instead of
+          running the arm body on a mistyped scrutinee.  Mirrors
+          Python's ``_build_field_arm_law`` L2664-2710 (``info.tag == 0``
+          and ``info.tag > 0`` branches both implemented).
+
+        * ``cg_build_precompiled_nat_dispatch``'s base case (single
+          pair, tag0=0, wild=Some) now inlines ``bapp(const2,
+          wild_compiled_in_env)`` instead of lifting via
+          ``cg_make_wild_succ``.  Mirrors Python's ``_build_tag_chain``
+          L2999-3005 — DO NOT regress this back to a ``_wild_succ`` law,
+          since Python doesn't lift here and lifting flips byte-identity.
+          The ``wild=None`` branch still uses ``cg_make_wild_succ`` to
+          produce ``bapp(const2, Nat 0)``, also matching Python.
+        """
+        src = (
+            'type Maybe a = | None | Some a\n'
+            'let unwrap_or : Maybe Nat → Nat → Nat\n'
+            '  = λ m d → match m { | Some x → x | _ → d }\n'
+            'let main = unwrap_or (Some 42) 99\n'
+        )
+        self._assert_byte_identical(src)
+
+    def test_mutual_recursion_two_member_scc(self):
+        """``is_even``/``is_odd`` — two mutually recursive lets that form
+        a single SCC.  Pins the Phase H Task A shared-pin encoding:
+        Tarjan SCC detection (cg_build_dep_graph + cg_tarjan_scc), a
+        selector law `{0 (n+1) 0}` partially applied to the n lambda-
+        lifted member laws (cg_build_selector_law + cg_build_shared_row),
+        external wrappers of the original arity per member
+        (cg_build_mutual_wrapper), and the PMutual sentinel routed
+        through cg_var_from_env to emit the `((_1 j) _1)` cross-call.
+
+        Also pins the implicit-``__shared__`` capture rule in
+        ``cg_cf_dispatch``: when a body EVar resolves to PMutual in
+        globals, ``__shared__`` joins the free-var set so lifted wild-
+        arm laws capture slot 1 (the shared row).  Without this, the
+        lifted ``_wild_succ`` law would have arity 2 instead of 3 and
+        cross-calls would target the wrong slot — see
+        ``bootstrap/codegen.py::_collect_free`` L1640-1646.
+        """
+        src = (
+            'external mod Reaver.BPLAN {\n'
+            '  sub : Nat → Nat → Nat\n'
+            '}\n'
+            '\n'
+            'let is_even : Nat → Nat\n'
+            '  = λ n → match n {\n'
+            '      | 0 → 1\n'
+            '      | _ → is_odd (Reaver.BPLAN.sub n 1)\n'
+            '    }\n'
+            '\n'
+            'let is_odd : Nat → Nat\n'
+            '  = λ n → match n {\n'
+            '      | 0 → 0\n'
+            '      | _ → is_even (Reaver.BPLAN.sub n 1)\n'
+            '    }\n'
+        )
+        self._assert_byte_identical(src)
+
+    def test_mutual_recursion_app_handler_no_extra_shared(self):
+        """Two mutually-recursive lets whose bodies have a constructor
+        match referencing the other SCC member; the lifted App-handler law
+        therefore sees a PMutual in its arm bodies.
+
+        Pins ``cg_drop_shared`` (the filter that strips the synthetic
+        ``__shared__`` name from the App-handler's free-locals).  Python's
+        ``_build_field_arm_law`` collects captures via ``_collect_all_names``
+        — a purely syntactic walker with no ``__shared__`` implicit-capture
+        rule.  Self-host's generic ``cg_free_vars_bodies`` uses
+        ``cg_cf_dispatch``, which DOES add ``__shared__`` whenever a body
+        resolves to a PMutual.  In an App handler nested inside a wild-pred
+        sub-law (whose outer ``_make_pred_succ_law`` frame already captures
+        ``__shared__``), the extra capture grew the App handler's arity by 1
+        and broke byte-identity with the bootstrap — observable as a
+        cascade of +1-arity laws ``_0_wild_pred_app`` and
+        ``_0_wild_pred_inner`` inside ``Compiler_parse_expr``.  See
+        ``bootstrap/codegen.py::_build_field_arm_law`` L2629 for the
+        Python reference.
+        """
+        src = (
+            'external mod Reaver.BPLAN {\n'
+            '  sub : Nat → Nat → Nat\n'
+            '}\n'
+            'type Shape = | Empty | Circle Nat | Square Nat\n'
+            '\n'
+            'let foo : Nat → Nat\n'
+            '  = λ n → match n {\n'
+            '      | 0 → 1\n'
+            '      | _ → match (Circle n) {\n'
+            '          | Empty → 0\n'
+            '          | Circle x → bar x\n'
+            '          | Square x → bar (Reaver.BPLAN.sub x 1)\n'
+            '        }\n'
+            '    }\n'
+            '\n'
+            'let bar : Nat → Nat\n'
+            '  = λ n → match n {\n'
+            '      | 0 → 2\n'
+            '      | _ → foo (Reaver.BPLAN.sub n 1)\n'
+            '    }\n'
+        )
+        self._assert_byte_identical(src)
+
+    def test_match_nullary_arm_plus_wild_on_field_type(self):
+        """Constructor match with only nullary explicit arms but a
+        wildcard, on a type that has field-bearing siblings.  Python
+        routes this through ``_compile_adt_dispatch`` (codegen.py
+        L2380) and builds an explicit ``wild_app_handler`` for Elim's
+        App branch so an App-shaped scrutinee (e.g. ``Some 42``) fires
+        the wild body instead of being returned as-is by the default
+        ``id_pin`` handler.  Pins ``cg_build_wild_app_handler`` and the
+        ``cg_compile_con_match`` routing change (Phase H Task H).
+
+        Without the fix, the self-host's ``cg_build_nat_dispatch`` path
+        wraps the dispatch with ``cg_build_op2`` (App branch = id_pin),
+        emitting a ``_wild_succ`` law where the bootstrap emits a
+        ``_wild_app`` law.  Observable as the byte-542118 divergence in
+        ``Compiler_collect_record_types_go``.
+        """
+        src = (
+            'type Maybe a = | None | Some a\n'
+            '\n'
+            'let foo : Maybe Nat → Nat\n'
+            '  = λ m → match m {\n'
+            '      | None → 0\n'
+            '      | _ → 1\n'
+            '    }\n'
+            '\n'
+            'let main = foo (Some 42)\n'
+        )
+        self._assert_byte_identical(src)
+
+    def test_nat_dispatch_first_tag_positive(self):
+        """``cg_build_nat_dispatch``'s ``first_tag > 0`` shift path.
+
+        When the outermost nullary tag in a constructor match is > 0
+        (e.g. matching only ``TkEof`` from a Token type, where TkEof's
+        tag is 4), the dispatch's z slot must be the wild body and the
+        m slot must shift down through tag values until reaching tag 0.
+        Mirrors bootstrap/codegen.py::_build_nat_dispatch L2025-2078.
+
+        Without the shift path, self-host emits ``body0`` as z
+        (incorrect tag semantics) and byte-diverges from REF, which
+        chains ``_shifted_…`` sub-laws.  Observable as the byte-550551
+        divergence in ``Compiler_collect_record_types_go``.  The guard
+        ``idx == 0`` ensures the shift only fires at the outer entry
+        (Python checks ``tag0 > 0`` at the top of ``_build_nat_dispatch``,
+        not inside its recursive ``dispatch()`` helper).
+        """
+        src = (
+            'external mod Reaver.BPLAN {\n'
+            '  sub : Nat → Nat → Nat\n'
+            '  eq : Nat → Nat → Nat\n'
+            '}\n'
+            'type Token = | TkA | TkB | TkC | TkD Nat | TkEof\n'
+            'let tok_peek : Nat → Token\n'
+            '  = λ n → TkA\n'
+            'let tok_tail : Nat → Nat\n'
+            '  = λ n → Reaver.BPLAN.sub n 1\n'
+            'let tok_is : Nat → Nat → Nat\n'
+            '  = λ n k → Reaver.BPLAN.eq n k\n'
+            'let go : Nat → Nat → Nat\n'
+            '  = λ toks acc →\n'
+            '      match (tok_peek toks) {\n'
+            '        | TkEof → acc\n'
+            '        | _ →\n'
+            '            match (tok_is toks 5) {\n'
+            '              | 0 → go (tok_tail toks) acc\n'
+            '              | k → go (tok_tail (tok_tail toks)) acc\n'
+            '            }\n'
+            '      }\n'
+            'let main = go 100 0\n'
+        )
+        self._assert_byte_identical(src)
+
     @unittest.expectedFailure
     def test_same_constructor_literal_field_collapses(self):
         """`match (MkPair 0 99) { | MkPair 0 _ -> 1 | MkPair n _ -> 2 }` —
@@ -720,6 +913,71 @@ class TestPhaseG3ByteIdentity(unittest.TestCase):
             '}'
         )
         self._assert_byte_identical(src)
+
+
+@requires_reaver
+@unittest.skipUnless(
+    os.environ.get('GALLOWGLASS_RUN_COMPILE_SELF') == '1',
+    'compile-self fixed-point gate is slow (~20-25 min under Reaver, '
+    'no jets); set GALLOWGLASS_RUN_COMPILE_SELF=1 to run it.',
+)
+class TestPhaseHFixedPoint(unittest.TestCase):
+    """Phase H — compile-self fixed point.
+
+    The Reaver-hosted self-host compiler (``main_reaver`` driving the
+    bootstrap-compiled ``Compiler.gls``) must produce output
+    byte-identical to the Python bootstrap when both compile
+    ``compiler/src/Compiler.gls`` itself.  This is the canonical
+    self-hosting property — once true, the self-host can replace the
+    Python bootstrap.
+
+    Gated behind ``GALLOWGLASS_RUN_COMPILE_SELF=1`` because the run
+    takes ~20-25 minutes under Reaver (no jet substrate for arithmetic
+    yet — post-1.0).  CI and slow-suites should set the var; default
+    pytest runs skip it.
+    """
+
+    _TIMEOUT = 1800  # 30 min — Reaver no-jets is slow.
+
+    def test_compile_self(self):
+        """Feed ``compiler/src/Compiler.gls`` to the Reaver-hosted
+        self-host; assert byte-identity to the Python bootstrap output
+        of the same source.
+        """
+        with open(COMPILER_GLS) as f:
+            src = f.read()
+
+        # Python reference
+        prog = parse(lex(src, COMPILER_GLS), COMPILER_GLS)
+        resolved, _ = resolve(prog, 'Compiler', {}, COMPILER_GLS)
+        compiled = compile_program(resolved, 'Compiler')
+        reference = emit_program(compiled).encode()
+
+        try:
+            stdout, stderr, exit_code = _run_compiler(
+                src.encode(), timeout=self._TIMEOUT
+            )
+        except subprocess.TimeoutExpired:
+            self.fail(
+                f'compile-self timed out after {self._TIMEOUT}s.  '
+                f'Reaver no-jet arithmetic is slow; raise _TIMEOUT or '
+                f'wait for jets.'
+            )
+        self.assertEqual(
+            exit_code, 0,
+            f'main_reaver failed (exit {exit_code}):\n'
+            f'stderr-tail={stderr[-1500:]!r}',
+        )
+        self.assertEqual(
+            len(stdout), len(reference),
+            f'compile-self output length mismatch: '
+            f'actual={len(stdout)} bytes, reference={len(reference)} bytes',
+        )
+        self.assertEqual(
+            stdout, reference,
+            f'compile-self byte-identity FAILED.  '
+            f'First mismatch position: {next((i for i in range(min(len(stdout), len(reference))) if stdout[i:i+1] != reference[i:i+1]), -1)}',
+        )
 
 
 if __name__ == '__main__':

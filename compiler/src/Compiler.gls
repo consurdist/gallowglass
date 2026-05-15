@@ -545,6 +545,18 @@ type PlanVal =
                                     -- emit_pval/emit_body_val.  All other
                                     -- helpers see PNamed as opaque (fall
                                     -- through their wildcard arms).
+  | PMutual Nat                     -- mutual-SCC sentinel; the Nat is the
+                                    -- 0-based SCC index.  Lives ONLY in
+                                    -- env.globals during compilation of a
+                                    -- mutual-recursion member law body;
+                                    -- cg_var_from_env intercepts it and
+                                    -- emits the shared-pin bapp pattern.
+                                    -- Mirrors bootstrap/codegen.py::
+                                    -- _MutualRef (L41) and its _compile_var
+                                    -- handler (L1268).  Should NEVER reach
+                                    -- the emit path; if it does, the
+                                    -- emit-side fallback arms produce a
+                                    -- '!' sentinel to fail loud.
 
 -- Compilation environment (4 fields → nested Pairs)
 -- globals : List (Pair Nat PlanVal)
@@ -2035,24 +2047,43 @@ let parse_match_arms_pe : List (Pair Nat (List Nat)) → (List Token → Pair Ex
             }
       }
 
--- parse_lambda_params: collect TkIdent params until TkArrow
+-- parse_lambda_params: collect TkIdent or TkUnderscore params until TkArrow.
+-- Underscore params are bound to the synthetic sentinel `nn_pat_wild` —
+-- they occupy a slot but are never referenced in the body.  Mirrors
+-- Python's `_parse_lambda_expr` which uses `_parse_atom_pat` (accepts
+-- PatVar and PatWild).
+--
 -- Two arms with the same constructor (MkPair) but a literal in the first
 -- field aren't disambiguated by the bootstrap codegen — extract `n` first,
 -- then dispatch on it.  Same workaround used in parse_decl.
 let parse_lambda_params : List Token → Pair (List Nat) (List Token)
   = λ toks →
-      match (tok_eat_ident toks) {
-        | MkPair n rest →
-            match n {
-              | 0 → MkPair Nil toks
-              | _ →
-                  match (tok_is rest TkArrow) {
-                    | 0 →
-                        match (parse_lambda_params rest) {
-                          | MkPair ps rest2 → MkPair (Cons n ps) rest2
+      let nn_pat_wild = 29516398122387466075270831967 in  -- "__pat_wild__" LE
+      match (tok_is toks TkUnderscore) {
+        | 0 →
+            match (tok_eat_ident toks) {
+              | MkPair n rest →
+                  match n {
+                    | 0 → MkPair Nil toks
+                    | _ →
+                        match (tok_is rest TkArrow) {
+                          | 0 →
+                              match (parse_lambda_params rest) {
+                                | MkPair ps rest2 → MkPair (Cons n ps) rest2
+                              }
+                          | k → MkPair (Cons n Nil) rest
                         }
-                    | k → MkPair (Cons n Nil) rest
                   }
+            }
+        | _ →
+            -- TkUnderscore param: bind to nn_pat_wild sentinel and continue.
+            let rest = tok_tail toks in
+            match (tok_is rest TkArrow) {
+              | 0 →
+                  match (parse_lambda_params rest) {
+                    | MkPair ps rest2 → MkPair (Cons nn_pat_wild ps) rest2
+                  }
+              | k → MkPair (Cons nn_pat_wild Nil) rest
             }
       }
 
@@ -3376,6 +3407,13 @@ let cenv_bind_global : CEnv → Nat → PlanVal → CEnv
 -- so nested lets must be lambda-lifted to sub-laws instead.
 let nn_top_of_law : Nat = 1934392534279512447088758627786591
 
+-- nn___shared__: synthetic param name for the shared-pin slot in a
+-- mutual-recursion member law's lifted body.  See the SCC emit
+-- pipeline (cg_compile_mutual_law) for why this exists; declared
+-- here so cg_cf_dispatch can name it when adding the implicit
+-- capture triggered by a PMutual reference.  LE-packed "__shared__".
+let nn___shared__ : Nat = 450384490873757833060191
+
 -- cenv_top_of_law: 1 if env is at the body root of some law, 0 otherwise.
 let cenv_top_of_law : CEnv → Nat
   = λ env →
@@ -4056,14 +4094,37 @@ let cg_cf_dispatch : (Expr → List Nat → CEnv → List Nat → List Nat)
               | _ → acc  -- ENat: no free vars
             }
         | _ →
-            -- EVar: check if name is free (in env.locals, not in bound)
+            -- EVar: check if name is free (in env.locals, not in bound).
+            -- Also: if the name resolves to a PMutual in env.globals,
+            -- the body's compiled form implicitly references slot 1
+            -- (the shared row), so add __shared__ as a captured local.
+            -- Mirrors bootstrap/codegen.py::_collect_free L1640-1646.
             match expr {
               | EVar n →
                   match (cg_name_in_list n bound) {
                     | 0 →
-                        match (assoc_has n (cenv_locals env)) {
-                          | 0 → acc
-                          | _ → cg_add_name_once n acc
+                        let acc1 = match (assoc_has n (cenv_locals env)) {
+                                     | 0 → acc
+                                     | _ → cg_add_name_once n acc
+                                   } in
+                        match (cenv_global_lookup env n) {
+                          | None → acc1
+                          | Some val →
+                              match val {
+                                | PMutual _ →
+                                    match (assoc_has nn___shared__
+                                             (cenv_locals env)) {
+                                      | 0 → acc1
+                                      | _ →
+                                          match (cg_name_in_list
+                                                   nn___shared__ bound) {
+                                            | 0 → cg_add_name_once
+                                                    nn___shared__ acc1
+                                            | _ → acc1
+                                          }
+                                    }
+                                | _ → acc1
+                              }
                         }
                     | _ → acc
                   }
@@ -4114,6 +4175,35 @@ let cg_free_vars_bodies : List Expr → List Nat → CEnv → List Nat
   = λ bodies bound env →
       let all_found = foldl (λ acc body → cg_collect_free body bound env acc) Nil bodies in
       cg_keep_free_locals (reverse (cenv_locals env)) all_found bound
+
+-- cg_drop_shared: drop the synthetic `__shared__` name from a free-locals
+-- list.  Used at the `cg_build_app_handler` call site, where Python's
+-- counterpart (`_build_field_arm_law`, codegen.py L2629) computes its
+-- captures via `_collect_all_names` — a purely syntactic walker with no
+-- `__shared__` implicit-capture rule.  Our `cg_free_vars_bodies` uses
+-- `cg_cf_dispatch`, which DOES add `__shared__` whenever a body resolves
+-- to a PMutual in globals.  In an App handler nested inside a wild-pred
+-- sub-law, the outer pred-succ law already captures `__shared__` from
+-- its own free_vars analysis (via `cg_make_pred_succ_law`'s
+-- `cg_free_vars`), so adding it again here grows the App handler's
+-- arity by 1 and breaks byte-identity with the bootstrap.  The
+-- synthetic name never appears in source, so filtering it out is safe.
+--
+-- IMPORTANT: comparisons against encoded FQ nats MUST use
+-- `Reaver.BPLAN.eq` (O(1) BPLAN primitive), NOT the recursive `nat_eq`
+-- — `nn___shared__` is ~78 bits, and the Peano walker would take ~2^78
+-- Case_ reductions per comparison under Reaver (no jets), hanging
+-- compile-self.  Cf. the analogous warning in [[cg_short_after_dot]].
+let cg_drop_shared : List Nat → List Nat
+  = λ names →
+      match names {
+        | Nil → Nil
+        | Cons n rest →
+            match (Reaver.BPLAN.eq n nn___shared__) {
+              | 0 → Cons n (cg_drop_shared rest)
+              | _ → cg_drop_shared rest
+            }
+      }
 
 -- -------------------------------------------------------------------
 -- Layer 4b: Self-reference detection (same pass-self pattern)
@@ -4583,78 +4673,186 @@ let cg_build_nat_dispatch : List (Pair Nat Expr) → Option (Pair (Option Nat) E
         | Cons arm0 rest →
             match arm0 {
               | MkPair tag body0 →
-                  -- Thread `_{tag}` into the arm-body's hint so nested
-                  -- lifted laws inside the arm body get distinct names
-                  -- like `nat_eq_0_wild_succ` instead of colliding on
-                  -- `nat_eq_wild_succ`.  Mirrors Python's
-                  -- `_compile_expr(body_expr, cur_env, f'{name_hint}_{tag}')`
-                  -- in `_build_nat_dispatch.dispatch` (codegen.py L1983).
-                  let body_hint = cg_concat_under hint (cg_b_decimal tag) in
-                  let zero_val = ce body0 env ctab body_hint in
-                  let succ = match rest {
-                                | Nil →
-                                    cg_make_wild_succ wild env ce ctab hint
-                                | Cons _ _ →
-                                    let nn_succ = 1667462515 in  -- "succ" LE
-                                    let next_idx = add idx 1 in
-                                    let idx_name = cg_b_decimal next_idx in
-                                    let succ_base = cg_concat_under hint nn_succ in
-                                    let succ_name = cg_concat_under succ_base idx_name in
-                                    -- Free-var analysis: capture only the outer
-                                    -- locals that remaining arm bodies (or the
-                                    -- wild body) actually reference.  Mirrors
-                                    -- Python's `make_succ_law`.  Without this,
-                                    -- a body like `match s { | Red → d | Green
-                                    -- → d | Blue → d }` (with `d` an outer
-                                    -- lambda param) compiles `d` to PNat 0
-                                    -- (the succ-law's own self) instead of the
-                                    -- captured slot.
-                                    let rest_bodies = map (λ p →
-                                          match p { | MkPair _ b → b }) rest in
-                                    let all_bodies = match wild {
-                                          | None → rest_bodies
-                                          | Some p → match p {
-                                              | MkPair _ wb → Cons wb rest_bodies
-                                            }
-                                        } in
-                                    let free_vars = cg_free_vars_bodies all_bodies Nil env in
-                                    let uses_self = foldl (λ acc b →
-                                          match (nat_eq acc 1) {
-                                            | 0 → cg_body_uses_self b env
-                                            | _ → 1
-                                          }) 0 all_bodies in
-                                    let g = cenv_globals env in
-                                    let env0 = cenv_make g Nil 0 None in
-                                    let env1 = match (nat_eq uses_self 0) {
-                                          | 0 →
-                                              match (cenv_self env) {
-                                                | None → env0
-                                                | Some fq →
-                                                    let env_fq = cenv_new_param env0 fq in
-                                                    let short = cg_short_after_dot fq in
-                                                    match (Reaver.BPLAN.eq short fq) {
-                                                      | 0 → cenv_bind_local env_fq short (cenv_arity env_fq)
-                                                      | _ → env_fq
+                  -- The `tag0 > 0` shift handling fires only at the OUTER
+                  -- entry to cg_build_nat_dispatch (idx == 0), mirroring
+                  -- Python's check at codegen.py L2025 — which is at the
+                  -- top of _build_nat_dispatch, not inside its recursive
+                  -- `dispatch()` helper.  Recursive succ-law calls
+                  -- (idx > 0) take arm0.body as zero_val regardless of
+                  -- arm0.tag: the scrutinee at that level is the
+                  -- predecessor, so "scr==0 in this dispatch level"
+                  -- already means "scr==orig_tag in the original".
+                  -- Returns 0 (firing `| 0 →` arm = shift) only when
+                  -- idx == 0 AND tag > 0; else returns 1 (firing
+                  -- `| _ →` arm = existing path).
+                  let shift_guard =
+                        match (nat_eq idx 0) {
+                          | 0 → 1
+                          | _ →
+                              match (nat_eq tag 0) {
+                                | 0 → 0
+                                | _ → 1
+                              }
+                        } in
+                  match shift_guard {
+                    | 0 →
+                        -- idx == 0 AND tag > 0: shift path (Python
+                        -- L2025-2078).  No arm matches scrutinee==0, so
+                        -- the outer op2's z slot is the wild body and
+                        -- the m slot recurses on a shifted-down arm
+                        -- list with the predecessor as the new
+                        -- scrutinee.
+                        let nn_wild = 1684826487 in     -- "wild" LE
+                        let nn_shifted = 28259048279861363 in  -- "shifted" LE
+                        let wild_hint = cg_concat_under hint nn_wild in
+                        let shifted_hint = cg_concat_under hint nn_shifted in
+                        let wild_val = match wild {
+                                         | None → cg_quote_nat 0 (cenv_arity env)
+                                         | Some p →
+                                             match p { | MkPair _ wb → ce wb env ctab wild_hint }
+                                       } in
+                        let wild_body_opt = match wild {
+                                              | None → None
+                                              | Some p → match p { | MkPair _ wb → Some wb }
+                                            } in
+                        let wild_var_opt = match wild {
+                                             | None → None
+                                             | Some p → match p { | MkPair v _ → v }
+                                           } in
+                        let shifted_arms = map (λ p →
+                              match p {
+                                | MkPair t body → MkPair (sub t 1) body
+                              }) arms in
+                        let shifted_bodies = map (λ p →
+                              match p { | MkPair _ b → b }) shifted_arms in
+                        let bound_for_free = match wild_var_opt {
+                                               | None → Nil
+                                               | Some v → Cons v Nil
+                                             } in
+                        let all_bodies = match wild_body_opt {
+                                           | None → shifted_bodies
+                                           | Some wb → Cons wb shifted_bodies
+                                         } in
+                        let free_vars = cg_free_vars_bodies all_bodies bound_for_free env in
+                        let uses_self = foldl (λ acc b →
+                              match (nat_eq acc 1) {
+                                | 0 → cg_body_uses_self b env
+                                | _ → 1
+                              }) 0 all_bodies in
+                        match (nat_eq (cenv_arity env) 0) {
+                          | 0 →
+                              -- in-law: lambda-lift outer captures + self-ref
+                              -- into the shifted-dispatch sub-law.
+                              let g = cenv_globals env in
+                              let env0 = cenv_make g Nil 0 None in
+                              let env1 = match (nat_eq uses_self 0) {
+                                           | 0 →
+                                               match (cenv_self env) {
+                                                 | None → env0
+                                                 | Some fq →
+                                                     let env_fq = cenv_new_param env0 fq in
+                                                     let short = cg_short_after_dot fq in
+                                                     match (Reaver.BPLAN.eq short fq) {
+                                                       | 0 → cenv_bind_local env_fq short (cenv_arity env_fq)
+                                                       | _ → env_fq
+                                                     }
+                                               }
+                                           | _ → env0
+                                         } in
+                              let env2 = cg_bind_params free_vars env1 in
+                              let pred_idx = add (cenv_arity env2) 1 in
+                              let pred_env = cenv_set_arity env2 pred_idx in
+                              let inner = cg_build_nat_dispatch shifted_arms wild (PNat pred_idx) pred_env ce ctab shifted_hint 0 in
+                              let lifted_law = PPin (PLaw 0 (MkPair pred_idx inner)) in
+                              let succ_partial = match (nat_eq uses_self 0) {
+                                                   | 0 → cg_bapp lifted_law (PNat 0)
+                                                   | _ → lifted_law
+                                                 } in
+                              let succ = cg_apply_free_locals succ_partial free_vars env in
+                              cg_build_op2 wild_val succ scr (cenv_arity env)
+                          | _ →
+                              -- top-level: fresh pred env with arity 1, no captures.
+                              let g = cenv_globals env in
+                              let pred_env = cenv_make g Nil 1 (cenv_self env) in
+                              let inner = cg_build_nat_dispatch shifted_arms wild (PNat 1) pred_env ce ctab shifted_hint 0 in
+                              let succ = PPin (PLaw 0 (MkPair 1 inner)) in
+                              cg_build_op2 wild_val succ scr (cenv_arity env)
+                        }
+                    | _ →
+                        -- tag == 0: existing path.
+                        -- Thread `_{tag}` into the arm-body's hint so nested
+                        -- lifted laws inside the arm body get distinct names
+                        -- like `nat_eq_0_wild_succ` instead of colliding on
+                        -- `nat_eq_wild_succ`.  Mirrors Python's
+                        -- `_compile_expr(body_expr, cur_env, f'{name_hint}_{tag}')`
+                        -- in `_build_nat_dispatch.dispatch` (codegen.py L1983).
+                        let body_hint = cg_concat_under hint (cg_b_decimal tag) in
+                        let zero_val = ce body0 env ctab body_hint in
+                        let succ = match rest {
+                                      | Nil →
+                                          cg_make_wild_succ wild env ce ctab hint
+                                      | Cons _ _ →
+                                          let nn_succ = 1667462515 in  -- "succ" LE
+                                          let next_idx = add idx 1 in
+                                          let idx_name = cg_b_decimal next_idx in
+                                          let succ_base = cg_concat_under hint nn_succ in
+                                          let succ_name = cg_concat_under succ_base idx_name in
+                                          -- Free-var analysis: capture only the outer
+                                          -- locals that remaining arm bodies (or the
+                                          -- wild body) actually reference.  Mirrors
+                                          -- Python's `make_succ_law`.  Without this,
+                                          -- a body like `match s { | Red → d | Green
+                                          -- → d | Blue → d }` (with `d` an outer
+                                          -- lambda param) compiles `d` to PNat 0
+                                          -- (the succ-law's own self) instead of the
+                                          -- captured slot.
+                                          let rest_bodies = map (λ p →
+                                                match p { | MkPair _ b → b }) rest in
+                                          let all_bodies = match wild {
+                                                | None → rest_bodies
+                                                | Some p → match p {
+                                                    | MkPair _ wb → Cons wb rest_bodies
+                                                  }
+                                              } in
+                                          let free_vars = cg_free_vars_bodies all_bodies Nil env in
+                                          let uses_self = foldl (λ acc b →
+                                                match (nat_eq acc 1) {
+                                                  | 0 → cg_body_uses_self b env
+                                                  | _ → 1
+                                                }) 0 all_bodies in
+                                          let g = cenv_globals env in
+                                          let env0 = cenv_make g Nil 0 None in
+                                          let env1 = match (nat_eq uses_self 0) {
+                                                | 0 →
+                                                    match (cenv_self env) {
+                                                      | None → env0
+                                                      | Some fq →
+                                                          let env_fq = cenv_new_param env0 fq in
+                                                          let short = cg_short_after_dot fq in
+                                                          match (Reaver.BPLAN.eq short fq) {
+                                                            | 0 → cenv_bind_local env_fq short (cenv_arity env_fq)
+                                                            | _ → env_fq
+                                                          }
                                                     }
-                                              }
-                                          | _ → env0
-                                        } in
-                                    let env2 = cg_bind_params free_vars env1 in
-                                    let pred_idx = add (cenv_arity env2) 1 in
-                                    let pred_env = cenv_set_arity env2 pred_idx in
-                                    let inner = cg_build_nat_dispatch rest wild (PNat pred_idx) pred_env ce ctab hint next_idx in
-                                    let succ_law = PPin (PLaw succ_name (MkPair pred_idx inner)) in
-                                    let result0 = match (nat_eq uses_self 0) {
-                                          | 0 →
-                                              match (nat_eq (cenv_arity env) 0) {
-                                                | 0 → cg_bapp succ_law (PNat 0)
-                                                | _ → PApp succ_law (PNat 0)
-                                              }
-                                          | _ → succ_law
-                                        } in
-                                    cg_apply_free_locals result0 free_vars env
-                              } in
-                  cg_build_op2 zero_val succ scr (cenv_arity env)
+                                                | _ → env0
+                                              } in
+                                          let env2 = cg_bind_params free_vars env1 in
+                                          let pred_idx = add (cenv_arity env2) 1 in
+                                          let pred_env = cenv_set_arity env2 pred_idx in
+                                          let inner = cg_build_nat_dispatch rest wild (PNat pred_idx) pred_env ce ctab hint next_idx in
+                                          let succ_law = PPin (PLaw succ_name (MkPair pred_idx inner)) in
+                                          let result0 = match (nat_eq uses_self 0) {
+                                                | 0 →
+                                                    match (nat_eq (cenv_arity env) 0) {
+                                                      | 0 → cg_bapp succ_law (PNat 0)
+                                                      | _ → PApp succ_law (PNat 0)
+                                                    }
+                                                | _ → succ_law
+                                              } in
+                                          cg_apply_free_locals result0 free_vars env
+                                    } in
+                        cg_build_op2 zero_val succ scr (cenv_arity env)
+                  }
             }
       }
 
@@ -4758,16 +4956,58 @@ let cg_build_precompiled_nat_dispatch : List (Pair Nat PlanVal) → Option (Pair
                         -- tag0>0: build succ chain so zero_val fires at pred=tag0.
                         match (nat_eq tag0 0) {
                           | 0 →
-                              -- tag0 > 0: shift by 1 and recurse to build succ chain
+                              -- tag0 > 0: shift by 1 and recurse to build succ
+                              -- chain.  When wild = Some, the outer z must be
+                              -- the compiled wild_body (in env), NOT Nat 0 —
+                              -- mirrors Python `_build_tag_chain` L2986
+                              -- (`z_val = wild_val if wild_val is not None
+                              -- else body_nat(0, env.arity)`).  Without this,
+                              -- a match like `match t { | TkIdent n → ... | _
+                              -- → MkPair 0 toks }` (TkIdent.tag=2) compiles
+                              -- the outer z to literal Nat 0 instead of
+                              -- `MkPair 0 toks`, which surfaces in
+                              -- `tok_eat_ident` of the compile-self gate.
                               let shifted = Cons (MkPair (sub tag0 1) zero_val) Nil in
                               let inner = cg_build_precompiled_nat_dispatch shifted wild (PNat pred_idx) pred_env ce ctab hint in
                               let succ_law = PPin (PLaw 0 (MkPair pred_idx inner)) in
                               let succ = cg_apply_params succ_law 1 n_cap in
-                              let fallback = cg_quote_nat 0 n_cap in
-                              cg_build_op2 fallback succ scr n_cap
+                              let z_val = match wild {
+                                            | None → cg_quote_nat 0 n_cap
+                                            | Some wpair →
+                                                match wpair {
+                                                  | MkPair _ wb →
+                                                      let nn_wild = 1684826487 in
+                                                      let wh = cg_concat_under hint nn_wild in
+                                                      ce wb env ctab wh
+                                                }
+                                          } in
+                              cg_build_op2 z_val succ scr n_cap
                           | _ →
-                              -- tag0 = 0: standard z dispatch
-                              let succ = cg_make_wild_succ wild env ce ctab hint in
+                              -- tag0 = 0: standard z dispatch.  When wild is
+                              -- Some, inline `bapp(const2, wild_compiled_in_env)`
+                              -- to mirror Python's `_build_tag_chain` base
+                              -- case (L2999–3005) — DO NOT lambda-lift wild
+                              -- into a separate `_wild_succ` law here, since
+                              -- Python doesn't, and lifting changes the
+                              -- emitted PLAN bytes for byte-identity.
+                              -- When wild is None, fall back to
+                              -- `cg_make_wild_succ` which produces
+                              -- `bapp(const2, Nat 0)`, matching Python.
+                              let succ = match wild {
+                                           | None → cg_make_wild_succ wild env ce ctab hint
+                                           | Some wpair →
+                                               match wpair {
+                                                 | MkPair _ wb →
+                                                     let nn_wild = 1684826487 in
+                                                     let wh = cg_concat_under hint nn_wild in
+                                                     let wv = ce wb env ctab wh in
+                                                     let const2_pin = PPin const2_law in
+                                                     match (nat_eq n_cap 0) {
+                                                       | 0 → cg_bapp const2_pin wv
+                                                       | _ → PApp const2_pin wv
+                                                     }
+                                               }
+                                         } in
                               cg_build_op2 zero_val succ scr n_cap
                         }
                     | Cons _ _ →
@@ -4783,7 +5023,26 @@ let cg_build_precompiled_nat_dispatch : List (Pair Nat PlanVal) → Option (Pair
                         let inner = cg_build_precompiled_nat_dispatch normalized wild (PNat pred_idx) pred_env ce ctab hint in
                         let succ_law = PPin (PLaw 0 (MkPair pred_idx inner)) in
                         let succ = cg_apply_params succ_law 1 n_cap in
-                        let z_val = cg_pcd_z_for_op2 tag0 zero_val n_cap in
+                        -- When tag0 > 0 AND wild is Some, the outer z is the
+                        -- compiled wild_body in env (Python: `wild_val` from
+                        -- `_get_wild_val(env)` in `_build_tag_chain`'s
+                        -- `first_tag > 0` branch).  When wild is None, fall
+                        -- back to the original `cg_pcd_z_for_op2` behaviour
+                        -- (Nat 0 fallback or pair0's value when tag0==0).
+                        let z_val = match (nat_eq tag0 0) {
+                                      | 0 →
+                                          match wild {
+                                            | None → cg_quote_nat 0 n_cap
+                                            | Some wpair →
+                                                match wpair {
+                                                  | MkPair _ wb →
+                                                      let nn_wild = 1684826487 in
+                                                      let wh = cg_concat_under hint nn_wild in
+                                                      ce wb env ctab wh
+                                                }
+                                          }
+                                      | _ → zero_val
+                                    } in
                         cg_build_op2 z_val succ scr n_cap
                   }
             }
@@ -4852,14 +5111,27 @@ let cg_all_field_names : List MatchArm → List Nat
 -- cg_build_z_body: value for z (scrutinee = Nat 0) in reflect dispatch
 let cg_build_z_body : List (Pair Nat Expr) → Option (Pair (Option Nat) Expr) → CEnv
                      → (Expr → CEnv → List (Pair Nat (Pair Nat Nat)) → Nat → PlanVal)
-                     → List (Pair Nat (Pair Nat Nat)) → PlanVal
-  = λ nullary_nat_arms wild env ce ctab →
+                     → List (Pair Nat (Pair Nat Nat)) → Nat → PlanVal
+  = λ nullary_nat_arms wild env ce ctab hint →
+      let nn_tag0 = 812081524 in   -- "tag0" LE
+      let nn_wild = 1684826487 in  -- "wild" LE
       match (assoc_lookup 0 nullary_nat_arms) {
-        | Some z_expr → ce z_expr env ctab 0
+        | Some z_expr →
+            -- Python: `_compile_expr(z_arm, env, f'{name_hint}_tag0')` —
+            -- z arm's body hint mirrors codegen.py L2444.
+            let body_hint = cg_concat_under hint nn_tag0 in
+            ce z_expr env ctab body_hint
         | None →
             match wild {
               | None → cg_quote_nat 0 (cenv_arity env)
-              | Some p → match p { | MkPair _ wb → ce wb env ctab 0 }
+              | Some p →
+                  match p {
+                    | MkPair _ wb →
+                        -- Python: wild fallback in z slot uses
+                        -- `<name_hint>_wild` (codegen.py L2446).
+                        let body_hint = cg_concat_under hint nn_wild in
+                        ce wb env ctab body_hint
+                  }
             }
       }
 
@@ -4878,9 +5150,12 @@ let cg_build_nullary_remaining : List (Pair Nat Expr) → List (Pair Nat Expr)
 -- cg_build_m_body: m (succ fn) for remaining nullary constructors with tag > 0
 let cg_build_m_body : List (Pair Nat Expr) → Option (Pair (Option Nat) Expr) → CEnv
                      → (Expr → CEnv → List (Pair Nat (Pair Nat Nat)) → Nat → PlanVal)
-                     → List (Pair Nat (Pair Nat Nat)) → PlanVal
-  = λ remaining wild env ce ctab →
+                     → List (Pair Nat (Pair Nat Nat)) → Nat → PlanVal
+  = λ remaining wild env ce ctab hint →
       let const2_pin = PPin const2_law in
+      let nn_wild = 1684826487 in           -- "wild" LE
+      let nn_tag_succ = 7161696970831520116 in  -- "tag_succ" LE
+      let nn_m = 109 in                     -- "m" LE
       match remaining {
         | Nil →
             match wild {
@@ -4892,7 +5167,10 @@ let cg_build_m_body : List (Pair Nat Expr) → Option (Pair (Option Nat) Expr) �
               | Some p →
                   match p {
                     | MkPair _ wb →
-                        let wv = ce wb env ctab 0 in
+                        -- Python L2522: `<name_hint>_wild` for the wild
+                        -- value before const2-wrapping.
+                        let wild_hint = cg_concat_under hint nn_wild in
+                        let wv = ce wb env ctab wild_hint in
                         match (nat_eq (cenv_arity env) 0) {
                           | 0 → cg_bapp const2_pin wv
                           | _ → PApp const2_pin wv
@@ -4937,8 +5215,14 @@ let cg_build_m_body : List (Pair Nat Expr) → Option (Pair (Option Nat) Expr) �
             let env2 = cg_bind_params free_vars env1 in
             let pred_idx = add (cenv_arity env2) 1 in
             let pred_env = cenv_set_arity env2 pred_idx in
-            let m_inner = cg_build_nat_dispatch remaining wild (PNat pred_idx) pred_env ce ctab 0 0 in
-            let m_succ_law = PPin (PLaw 0 (MkPair pred_idx m_inner)) in
+            -- Python L2510/2512: inner dispatch hint = `<name_hint>_tag_succ`,
+            -- lifted law name = `<name_hint>_m`.  Without these, the lifted
+            -- m-handler emits as an anonymous `(#law "0" …)` and any nested
+            -- match inside an arm body or the wild loses its FQ-name chain.
+            let inner_hint = cg_concat_under hint nn_tag_succ in
+            let m_law_name = cg_concat_under hint nn_m in
+            let m_inner = cg_build_nat_dispatch remaining wild (PNat pred_idx) pred_env ce ctab inner_hint 0 in
+            let m_succ_law = PPin (PLaw m_law_name (MkPair pred_idx m_inner)) in
             let result0 = match (nat_eq uses_self 0) {
                   | 0 →
                       match (nat_eq (cenv_arity env) 0) {
@@ -4981,16 +5265,72 @@ let cg_build_unary_handler_body : List MatchArm → Option (Pair (Option Nat) Ex
         | Cons arm0 rest_arms →
             match rest_arms {
               | Nil →
-                  -- Single arm: bind field to arg_idx
+                  -- Single arm: bind field to arg_idx, compile body, and
+                  -- if a wild arm is present, wrap the body in a tag-check
+                  -- reflect dispatch so non-matching constructors return
+                  -- the wild value instead of running the arm body.
+                  -- Mirrors Python's _build_field_arm_law L2664–2710.
+                  -- Without the tag-check, `match m { | Some x → x | _ → d }`
+                  -- would return the field for ANY 2-arg App scrutinee,
+                  -- not just Some (the classic "wildcard arm drop" bug).
                   let fields = arm_get_con_fields arm0 in
                   let ae = match fields {
                              | Nil → henv
                              | Cons fname _ → cenv_bind_local henv fname arg_idx
                            } in
-                  -- Thread `_<ConName>` into the arm-body's hint (see
-                  -- cg_build_binary_handler_body for full rationale).
                   let arm_hint = cg_concat_under hint (arm_get_con_name arm0) in
-                  ce (arm_get_con_body arm0) ae ctab arm_hint
+                  let arm_body_val = ce (arm_get_con_body arm0) ae ctab arm_hint in
+                  match wild {
+                    | None → arm_body_val
+                    | Some wpair →
+                        match wpair {
+                          | MkPair _ wild_body →
+                              let wild_hint = cg_concat_under hint 1684826487 in
+                              let wild_compiled = ce wild_body henv ctab wild_hint in
+                              let const2_pin = PPin const2_law in
+                              let n_cap = cenv_arity henv in
+                              let const_wild = match (nat_eq n_cap 0) {
+                                    | 0 → cg_bapp const2_pin wild_compiled
+                                    | _ → PApp const2_pin wild_compiled
+                                  } in
+                              let const2_wild = match (nat_eq n_cap 0) {
+                                    | 0 → cg_bapp const2_pin const_wild
+                                    | _ → PApp const2_pin const_wild
+                                  } in
+                              let con_tag = match (cg_contab_lookup_safe ctab (arm_get_con_name arm0)) {
+                                              | None → 0
+                                              | Some p → contab_tag p
+                                            } in
+                              match (nat_eq con_tag 0) {
+                                | 0 →
+                                    -- con_tag > 0: build succ chain so the
+                                    -- arm fires when pred = con_tag - 1.
+                                    -- Hint for the inner dispatch is
+                                    -- `<hint>_tag_m`, mirroring Python's
+                                    -- `_build_field_arm_law` L2700 (`f'{name_hint}_tag_m'`).
+                                    -- NOT `arm_hint` (`<hint>_<ConName>`) —
+                                    -- that's the arm body's hint, not the
+                                    -- dispatch's.  Without this rename, the
+                                    -- inner wild's lifted laws get names like
+                                    -- `parse_qual_name_go_Cons_wild_pred_Cons_TkIdent_wild_app`
+                                    -- instead of `..._tag_m_wild_app`.
+                                    let nn_tag_m = 469752045940 in  -- "tag_m" LE
+                                    let m_hint = cg_concat_under hint nn_tag_m in
+                                    let pred_idx = add n_cap 1 in
+                                    let m_ext_env = cenv_set_arity henv pred_idx in
+                                    let shifted_pair = MkPair (sub con_tag 1) arm_body_val in
+                                    let m_inner = cg_build_precompiled_nat_dispatch
+                                                    (Cons shifted_pair Nil)
+                                                    wild (PNat pred_idx) m_ext_env ce ctab m_hint in
+                                    let m_succ_law = PPin (PLaw 0 (MkPair pred_idx m_inner)) in
+                                    let m_body_val = cg_apply_params m_succ_law 1 n_cap in
+                                    cg_build_reflect_dispatch const2_wild wild_compiled m_body_val (PNat fun_idx) n_cap
+                                | _ →
+                                    -- con_tag == 0: arm fires for Nat 0; m is const_wild.
+                                    cg_build_reflect_dispatch const2_wild arm_body_val const_wild (PNat fun_idx) n_cap
+                              }
+                        }
+                  }
               | Cons _ _ →
                   -- Multiple arms: compile each body, dispatch on fun (tag)
                   let tag_val_pairs = map (λ arm →
@@ -5006,8 +5346,14 @@ let cg_build_unary_handler_body : List MatchArm → Option (Pair (Option Nat) Ex
                                             let arm_hint = cg_concat_under hint (arm_get_con_name arm) in
                                             MkPair tag (ce (arm_get_con_body arm) ae ctab arm_hint)
                                           ) field_arms in
+                  -- Python L2723: dispatch hint = `<name_hint>_tag` so any
+                  -- nested wild compilation in the chain emits names like
+                  -- `<outer>_tag_wild_0_wild_succ` instead of the bare
+                  -- `_wild_0_wild_succ` you get with hint=0.
+                  let nn_tag = 6775156 in
+                  let tag_hint = cg_concat_under hint nn_tag in
                   cg_build_precompiled_nat_dispatch (cg_sort_pv_pairs tag_val_pairs)
-                    wild (PNat fun_idx) henv ce ctab 0
+                    wild (PNat fun_idx) henv ce ctab tag_hint
             }
       }
 
@@ -5017,8 +5363,8 @@ let cg_build_unary_handler_body : List MatchArm → Option (Pair (Option Nat) Ex
 -- Falls back to constant 0 if no such arm exists.
 let cg_build_unary_z_body : List MatchArm → CEnv → Nat
                              → (Expr → CEnv → List (Pair Nat (Pair Nat Nat)) → Nat → PlanVal)
-                             → List (Pair Nat (Pair Nat Nat)) → PlanVal
-  = λ field_arms henv arg_idx ce ctab →
+                             → List (Pair Nat (Pair Nat Nat)) → Nat → PlanVal
+  = λ field_arms henv arg_idx ce ctab hint →
       let tag0_arms = filter (λ arm →
                                 match (nat_eq (cg_arm_con_arity arm) 1) {
                                   | 0 → 0
@@ -5035,7 +5381,11 @@ let cg_build_unary_z_body : List MatchArm → CEnv → Nat
                        | Nil → henv
                        | Cons f _ → cenv_bind_local henv f arg_idx
                      } in
-            ce (arm_get_con_body arm) ae ctab 0
+            -- Thread `<hint>_<ConName>` so nested lifted laws inside
+            -- the arm body get distinct names — mirrors Python
+            -- `_build_field_arm_law` L2826-2828.
+            let arm_hint = cg_concat_under hint (arm_get_con_name arm) in
+            ce (arm_get_con_body arm) ae ctab arm_hint
       }
 
 -- cg_build_unary_m_body: compile the m (succ) handler for unary (arity=1) arms with tag>0.
@@ -5044,8 +5394,8 @@ let cg_build_unary_z_body : List MatchArm → CEnv → Nat
 -- Each arm's field is bound to arg_idx (= outer_arg) in the extended env.
 let cg_build_unary_m_body : List MatchArm → Option (Pair (Option Nat) Expr) → CEnv → Nat
                              → (Expr → CEnv → List (Pair Nat (Pair Nat Nat)) → Nat → PlanVal)
-                             → List (Pair Nat (Pair Nat Nat)) → PlanVal
-  = λ field_arms wild henv arg_idx ce ctab →
+                             → List (Pair Nat (Pair Nat Nat)) → Nat → PlanVal
+  = λ field_arms wild henv arg_idx ce ctab hint →
       let const2_pin = PPin const2_law in
       let unary_gt0 = filter (λ arm →
                                 match (nat_eq (cg_arm_con_arity arm) 1) {
@@ -5061,22 +5411,24 @@ let cg_build_unary_m_body : List MatchArm → Option (Pair (Option Nat) Expr) �
                                 }) field_arms in
       match unary_gt0 {
         | Nil →
-            -- No unary arms with tag>0: fall to constant-0 or wild
-            match wild {
-              | None →
-                  match (nat_eq (cenv_arity henv) 0) {
-                    | 0 → cg_bapp const2_pin (PApp (PNat 0) (PNat 0))
-                    | _ → PApp const2_pin (PNat 0)
-                  }
-              | Some p →
-                  match p {
-                    | MkPair _ wb →
-                        let n_cap = cenv_arity henv in
-                        let m_ext_env = cenv_set_arity henv (add n_cap 1) in
-                        let m_compiled = ce wb m_ext_env ctab 0 in
-                        let m_law = PPin (PLaw 0 (MkPair (add n_cap 1) m_compiled)) in
-                        cg_apply_params m_law 1 n_cap
-                  }
+            -- No unary arms with tag>0: the binary handler's outer Case_ m
+            -- slot is a `const2(body_nat(0))` placeholder regardless of
+            -- whether the surrounding match has a wildcard.  The
+            -- corresponding Python branch is `_build_field_arm_law`'s
+            -- binary-path L2862-2865, which unconditionally uses
+            -- `bapp(const2_pin, A(N(0), N(0)))` (in-law) — the m slot fires
+            -- only when the scrutinee is `Nat>0`, which only happens for
+            -- nullary constructors with tag>0; those are dispatched at the
+            -- OUTER reflect_dispatch level (not inside the binary handler),
+            -- so this slot is "shouldn't happen" in well-formed matches and
+            -- the wild_body never legitimately needs to fire here.  An
+            -- earlier version of this branch lifted wild_body into a succ
+            -- law and partial-applied it; that produced extra structure
+            -- diverging from Python's byte output (compile-self gate's
+            -- `has_guard_sentinel` was the canary).
+            match (nat_eq (cenv_arity henv) 0) {
+              | 0 → cg_bapp const2_pin (PApp (PNat 0) (PNat 0))
+              | _ → PApp const2_pin (PNat 0)
             }
         | Cons _ _ →
             -- Build a succ law: arity = n_cap+1 (captures + pred)
@@ -5084,6 +5436,8 @@ let cg_build_unary_m_body : List MatchArm → Option (Pair (Option Nat) Expr) �
             let n_cap = cenv_arity henv in
             let pred_idx = add n_cap 1 in
             let m_ext_env = cenv_set_arity henv pred_idx in
+            let nn_m_tag = 444016648045 in   -- "m_tag" LE
+            let m_tag_hint = cg_concat_under hint nn_m_tag in
             let m_pairs = cg_sort_pv_pairs (map (λ arm →
                 let fields = arm_get_con_fields arm in
                 let ae = match fields {
@@ -5094,8 +5448,9 @@ let cg_build_unary_m_body : List MatchArm → Option (Pair (Option Nat) Expr) �
                             | None → 0
                             | Some p → contab_tag p
                           } in
-                MkPair (sub tag 1) (ce (arm_get_con_body arm) ae ctab 0)) unary_gt0) in
-            let m_dispatch = cg_build_precompiled_nat_dispatch m_pairs wild (PNat pred_idx) m_ext_env ce ctab 0 in
+                let arm_hint = cg_concat_under hint (arm_get_con_name arm) in
+                MkPair (sub tag 1) (ce (arm_get_con_body arm) ae ctab arm_hint)) unary_gt0) in
+            let m_dispatch = cg_build_precompiled_nat_dispatch m_pairs wild (PNat pred_idx) m_ext_env ce ctab m_tag_hint in
             let m_succ_law = PPin (PLaw 0 (MkPair pred_idx m_dispatch)) in
             cg_apply_params m_succ_law 1 n_cap
       }
@@ -5161,7 +5516,32 @@ let cg_build_binary_handler_body : List MatchArm → Option (Pair (Option Nat) E
                                    -- Mirrors Python's _build_field_arm_law L2677:
                                    -- `f'{name_hint}_{info.fq_name.split(".")[-1]}'`.
                                    let arm_hint = cg_concat_under hint (arm_get_con_name arm0) in
-                                   ce (arm_get_con_body arm0) ae ctab arm_hint
+                                   let arm_compiled = ce (arm_get_con_body arm0) ae ctab arm_hint in
+                                   -- Binary single-arm + wildcard: dispatch on
+                                   -- `inner_tag_idx` so non-matching 2-field
+                                   -- Apps (different tag) correctly fall
+                                   -- through to wild.  Mirrors Python
+                                   -- `_build_field_arm_law` L2779-2784:
+                                   -- `_build_tag_chain([(info.tag,
+                                   -- arm_compiled)], wild_body, …,
+                                   -- f'{name_hint}_inner_single_tag')`.
+                                   -- Without this, every binary App matched
+                                   -- the single arm regardless of tag — the
+                                   -- "wildcard arm drop" bug rediscovered in
+                                   -- the binary path (CLAUDE.md pitfalls).
+                                   match wild {
+                                     | None → arm_compiled
+                                     | Some _ →
+                                         let nn_ist = 137416496678702714058903172135449947753 in  -- "inner_single_tag" LE
+                                         let ist_hint = cg_concat_under hint nn_ist in
+                                         let arm0_tag = match (cg_contab_lookup_safe ctab (arm_get_con_name arm0)) {
+                                                          | None → 0
+                                                          | Some p → contab_tag p
+                                                        } in
+                                         cg_build_precompiled_nat_dispatch
+                                           (Cons (MkPair arm0_tag arm_compiled) Nil)
+                                           wild (PNat inner_tag_idx) inner_env4 ce ctab ist_hint
+                                   }
                                | Cons _ _ →
                                    let tag_val_pairs = map (λ arm →
                                        let fields = arm_get_con_fields arm in
@@ -5180,8 +5560,13 @@ let cg_build_binary_handler_body : List MatchArm → Option (Pair (Option Nat) E
                                                  } in
                                        let arm_hint = cg_concat_under hint (arm_get_con_name arm) in
                                        MkPair tag (ce (arm_get_con_body arm) ae ctab arm_hint)) field_arms in
+                                   -- Same `<name_hint>_tag` rename as the
+                                   -- unary multi-arm path above (Python
+                                   -- L2723).
+                                   let nn_tag_b = 6775156 in
+                                   let tag_hint_b = cg_concat_under hint nn_tag_b in
                                    cg_build_precompiled_nat_dispatch (cg_sort_pv_pairs tag_val_pairs)
-                                     wild (PNat inner_tag_idx) inner_env4 ce ctab 0
+                                     wild (PNat inner_tag_idx) inner_env4 ce ctab tag_hint_b
                              }
                        } in
       -- inner_law gets name `<hint>_inner` matching Python's
@@ -5216,8 +5601,8 @@ let cg_build_binary_handler_body : List MatchArm → Option (Pair (Option Nat) E
       -- Unary arms (arity=1) never reach the inner law: outer_fun is a bare Nat.
       --   tag=0 → outer z fires (handled by cg_build_unary_z_body)
       --   tag>0 → outer m fires with pred=tag-1 (handled by cg_build_unary_m_body)
-      let z_body = cg_build_unary_z_body field_arms henv arg_idx ce ctab in
-      let m_body = cg_build_unary_m_body field_arms wild henv arg_idx ce ctab in
+      let z_body = cg_build_unary_z_body field_arms henv arg_idx ce ctab hint in
+      let m_body = cg_build_unary_m_body field_arms wild henv arg_idx ce ctab hint in
       cg_build_reflect_dispatch r3 z_body m_body (PNat fun_idx) (cenv_arity henv)
 
 -- cg_bodies_use_self: check if any body in list uses self-ref
@@ -5229,14 +5614,115 @@ let cg_bodies_use_self : List Expr → CEnv → Nat
                  | _ → 1
                }) 0 bodies
 
+-- cg_build_wild_app_handler: build a 2-arg law over `wild_body` for use
+-- as the App branch of an Elim dispatch when a constructor match has no
+-- field-bearing arms but does have a wildcard, AND the matched type has
+-- at least one field-bearing constructor.  Mirrors
+-- bootstrap/codegen.py::_build_wild_app_handler (L2546-2600).
+--
+-- Without this handler the App branch of Elim defaults to `id_pin`
+-- (returns the App as-is), which is wrong: an App-shaped scrutinee
+-- (e.g. ``TkIdent name`` against ``match t { | TkEof → ... | _ → ... }``)
+-- needs to fire the wild body, not propagate the constructor App.
+--
+-- Caller invariant: only call when the matched type has a field-bearing
+-- sibling.  Currently the self-host can't cheaply tell (the ctab stores
+-- only (tag, arity) per constructor with no type_name), so we route
+-- here for every nullary-only-arms + wild match.  This is safe in
+-- practice because every type in Compiler.gls itself that's matched
+-- with a wildcard has at least one field-bearing sibling (verified by
+-- inspection — Bool isn't matched directly anywhere; List, Option,
+-- Result, Token, Expr, Decl, etc. all have field constructors).  If a
+-- truly nullary-only type is later matched with a wildcard the byte-
+-- identity gate will surface a regression and we'll plumb type_name
+-- through the ctab.
+--
+-- Capture analysis uses `cg_free_vars` + `cg_drop_shared` for the same
+-- reason as `cg_build_app_handler`: Python uses `_collect_all_names`
+-- here (codegen.py L2567) which has no `__shared__` implicit-capture
+-- rule.
+let cg_build_wild_app_handler
+  : Expr → CEnv → (Expr → CEnv → List (Pair Nat (Pair Nat Nat)) → Nat → PlanVal)
+  → List (Pair Nat (Pair Nat Nat)) → Nat → PlanVal
+  = λ wild_body env ce ctab hint →
+      let const2_pin = PPin const2_law in
+      let nn_wild = 1684826487 in           -- "wild" LE
+      let nn_app = 7368801 in               -- "app" LE
+      let nn_wild_app = cg_concat_under nn_wild nn_app in
+      let wild_hint = cg_concat_under hint nn_wild in
+      match (nat_eq (cenv_arity env) 0) {
+        | 0 →
+            -- In-law: lift outer captures + self-ref into a (n_cap+2)-arity
+            -- law whose last two slots are the unused (outer_fun, outer_arg).
+            let free_locals0 = cg_free_vars wild_body Nil env in
+            let free_locals = cg_drop_shared free_locals0 in
+            let uses_self = cg_body_uses_self wild_body env in
+            let g = cenv_globals env in
+            let henv0 = cenv_make g Nil 0 None in
+            let henv1 = match (nat_eq uses_self 0) {
+                          | 0 →
+                              match (cenv_self env) {
+                                | None → henv0
+                                | Some fq →
+                                    let henv_fq = cenv_new_param henv0 fq in
+                                    let short = cg_short_after_dot fq in
+                                    match (Reaver.BPLAN.eq short fq) {
+                                      | 0 → cenv_bind_local henv_fq short (cenv_arity henv_fq)
+                                      | _ → henv_fq
+                                    }
+                              }
+                          | _ → henv0
+                        } in
+            let henv2 = cg_bind_params free_locals henv1 in
+            let n_cap = cenv_arity henv2 in
+            let handler_arity = add n_cap 2 in
+            let henv = cenv_set_arity henv2 handler_arity in
+            let wv = ce wild_body henv ctab wild_hint in
+            let handler_name = cg_concat_under hint nn_wild_app in
+            let handler_law = PPin (PLaw handler_name (MkPair handler_arity wv)) in
+            let r0 = handler_law in
+            let r1 = match (nat_eq uses_self 0) {
+                       | 0 → cg_bapp r0 (PNat 0)
+                       | _ → r0
+                     } in
+            cg_apply_free_locals r1 free_locals env
+        | _ →
+            -- Top-level (env.arity == 0): no captures or self-ref to lift.
+            -- const2_pin twice over wild_body absorbs the (outer_fun, outer_arg)
+            -- pair the Elim handler receives.
+            let wv = ce wild_body env ctab wild_hint in
+            PApp const2_pin (PApp const2_pin wv)
+      }
+
 -- cg_build_app_handler: build the App-handler law for Case_ dispatch
 let cg_build_app_handler : List MatchArm → Option (Pair (Option Nat) Expr) → CEnv
                           → (Expr → CEnv → List (Pair Nat (Pair Nat Nat)) → Nat → PlanVal)
                           → List (Pair Nat (Pair Nat Nat)) → Nat → PlanVal
   = λ field_arms wild env ce ctab hint →
-      let all_bodies = map arm_get_con_body field_arms in
+      let field_bodies = map arm_get_con_body field_arms in
+      -- Include wild_body in free-var analysis so its outer-captures
+      -- (e.g. `d` in `match m { | Some x → x | _ → d }`) get lifted
+      -- through the app-handler.  Mirrors Python's `_build_field_arm_law`
+      -- which collects names from field bodies AND wild_body before
+      -- intersecting with env.locals.  Without this, the wild's
+      -- references to outer-lambda params become unbound slots when the
+      -- single-unary-arm tag-check (cg_build_unary_handler_body) compiles
+      -- wild_body inside the app-handler's frame.
+      let all_bodies = match wild {
+                         | None → field_bodies
+                         | Some wpair →
+                             match wpair {
+                               | MkPair _ wb → append field_bodies (Cons wb Nil)
+                             }
+                       } in
       let field_names = cg_all_field_names field_arms in
-      let free_locals = cg_free_vars_bodies all_bodies field_names env in
+      -- Strip `__shared__` from the App-handler's captures: Python's
+      -- `_build_field_arm_law` uses `_collect_all_names` (no __shared__
+      -- rule); our generic `cg_free_vars_bodies` adds it via the
+      -- `cg_cf_dispatch` PMutual rule.  See `cg_drop_shared` for the
+      -- full rationale.
+      let free_locals = cg_drop_shared
+                          (cg_free_vars_bodies all_bodies field_names env) in
       let uses_self = cg_bodies_use_self all_bodies env in
       let max_arity = cg_max_con_arity field_arms in
       let g = cenv_globals env in
@@ -5293,13 +5779,36 @@ let cg_compile_con_match : PlanVal → List MatchArm → CEnv
       let wild = cg_extract_wild_arm arms in
       match (length field_arms) {
         | 0 →
-            let nat_arms = cg_sort_nat_pairs (cg_arms_to_tag_expr nullary_arms ctab) in
-            cg_build_nat_dispatch nat_arms wild scr env ce ctab hint 0
+            -- No field arms.  If there's a wildcard, the matched type
+            -- may still have field-bearing siblings (e.g. ``match t {
+            -- TkEof → A | _ → B }`` on Token), and App-shaped scrutinees
+            -- must fire the wild body — that requires Elim's App branch
+            -- to be a wild_app_handler, not id_pin.  Mirrors Python's
+            -- _compile_con_match path that routes through
+            -- _compile_adt_dispatch when type_has_field_sibling
+            -- (codegen.py L2380).
+            match wild {
+              | None →
+                  -- No wild: pure nat dispatch (Python's _build_nat_dispatch
+                  -- path).  App branch defaults to id_pin via cg_build_op2.
+                  let nat_arms = cg_sort_nat_pairs (cg_arms_to_tag_expr nullary_arms ctab) in
+                  cg_build_nat_dispatch nat_arms wild scr env ce ctab hint 0
+              | Some wpair →
+                  match wpair {
+                    | MkPair _ wb →
+                        let nullary_nat_arms = cg_sort_nat_pairs (cg_arms_to_tag_expr nullary_arms ctab) in
+                        let z_body = cg_build_z_body nullary_nat_arms wild env ce ctab hint in
+                        let remaining = cg_build_nullary_remaining nullary_nat_arms in
+                        let m_body = cg_build_m_body remaining wild env ce ctab hint in
+                        let app_handler = cg_build_wild_app_handler wb env ce ctab hint in
+                        cg_build_reflect_dispatch app_handler z_body m_body scr (cenv_arity env)
+                  }
+            }
         | _ →
             let nullary_nat_arms = cg_sort_nat_pairs (cg_arms_to_tag_expr nullary_arms ctab) in
-            let z_body = cg_build_z_body nullary_nat_arms wild env ce ctab in
+            let z_body = cg_build_z_body nullary_nat_arms wild env ce ctab hint in
             let remaining = cg_build_nullary_remaining nullary_nat_arms in
-            let m_body = cg_build_m_body remaining wild env ce ctab in
+            let m_body = cg_build_m_body remaining wild env ce ctab hint in
             let app_handler = cg_build_app_handler field_arms wild env ce ctab hint in
             cg_build_reflect_dispatch app_handler z_body m_body scr (cenv_arity env)
       }
@@ -5434,37 +5943,80 @@ let cg_resolve_global_val : Nat → PlanVal → CEnv → PlanVal
   = λ fq val env →
       match (nat_eq (cenv_arity env) 0) {
         | 0 →
-            -- Inside law body: nat globals need quoting
+            -- Inside law body.  Three cases, matching Python's
+            -- ``_compile_var`` body-context branch (codegen.py L1287-1298):
+            --   * Nat            → quote.
+            --   * Pin or App     → return as-is (no PPin wrap).
+            --                       Python's emit-side `_maybe_symbol`
+            --                       collapses the value's identity to
+            --                       the bare binding symbol; we mirror
+            --                       that by tagging with `PNamed` at
+            --                       the outer level so emit produces
+            --                       bare `sym`.
+            --   * else (Law)     → wrap in PPin and tag, emitting
+            --                       `(#pin sym)`.  Python uses
+            --                       ``P(val)`` here.
             match (planval_is_nat val) {
               | 0 →
                   match (planval_is_pin val) {
-                    | 0 → cg_tag_global fq (PPin val)
+                    | 0 →
+                        match (planval_is_app val) {
+                          | 0 →
+                              -- Law: wrap in PPin and tag.
+                              cg_tag_global fq (PPin val)
+                          | _ →
+                              -- App: tag without PPin wrap so emit
+                              -- produces the bare binding symbol.
+                              PNamed fq val
+                        }
                     | _ →
-                        -- val is already a Pin (binding is pin'd).
-                        -- cg_tag_global would produce PPin(PNamed …),
-                        -- which emits as `(#pin sym)` — but Python
-                        -- collapses that to bare `sym` via id() dedup
-                        -- (the bound Pin object IS the ref).  Mirror
-                        -- that here: tag with PNamed at the outer
-                        -- level so emit produces bare `sym`.
+                        -- Pin: tag at the outer level (avoids
+                        -- double-pin).
                         PNamed fq val
                   }
               | _ → cg_quote_nat (planval_get_nat val) (cenv_arity env)
             }
         | _ →
-            -- Top level: same double-pin avoidance as the body-context
-            -- branch above.  When the binding's val is itself a Pin
-            -- (e.g. opcode pins like `write_op = PPin(PNat 9)`),
-            -- `cg_tag_global` would produce `PPin(PNamed n inner)`
-            -- which emits `(#pin sym)` — but Python's `_maybe_symbol`
-            -- collapses to bare `sym` at the outer Pin level.
+            -- Top level: same double-pin avoidance.  Apps and Pins
+            -- preserve identity via the binding symbol; Laws wrap.
             match (planval_is_pin val) {
-              | 0 → cg_tag_global fq val
+              | 0 →
+                  match (planval_is_app val) {
+                    | 0 → cg_tag_global fq val
+                    | _ → PNamed fq val
+                  }
               | _ → PNamed fq val
             }
       }
 
 -- cg_var_from_env: look up variable name in locals then globals.
+-- ---------------------------------------------------------------------
+-- Mutual-recursion sentinel helpers (Phase H Task A3-6)
+-- ---------------------------------------------------------------------
+-- These must be declared before cg_var_from_env, which calls them to
+-- intercept PMutual lookups.  The heavier SCC emit pipeline that
+-- depends on cg_compile_expr lives much later, just before cg_pass3.
+
+-- planval_is_mutual: predicate for the PMutual sentinel.
+let planval_is_mutual : PlanVal → Nat
+  = λ v → match v { | PMutual _ → 1 | _ → 0 }
+
+-- planval_get_mutual_idx: extract the SCC index from a PMutual.  Returns
+-- 0 on a non-PMutual value (caller responsibility to gate via
+-- planval_is_mutual first).
+let planval_get_mutual_idx : PlanVal → Nat
+  = λ v → match v { | PMutual i → i | _ → 0 }
+
+-- cg_mutual_ref_bapp: emit `(_1 j) _1` — extract law_j from the shared
+-- row at slot 1, then apply law_j to the shared row (its __shared__
+-- arg).  The caller's body context must have arity ≥ 1; PMutual lives
+-- only inside member law bodies so this invariant always holds at
+-- emit time.
+let cg_mutual_ref_bapp : Nat → CEnv → PlanVal
+  = λ idx env →
+      let j_val = cg_quote_nat idx (cenv_arity env) in
+      cg_bapp (cg_bapp (PNat 1) j_val) (PNat 1)
+
 -- Lookup order: locals (de Bruijn slot), globals (by FQ), globals (by short
 -- tail).  The short-tail fallback resolves bare EVars that sr_dispatch
 -- failed to qualify; without it, bare cross-binding refs in deeply-nested
@@ -5476,7 +6028,14 @@ let cg_var_from_env : Nat → CEnv → PlanVal
         | Some idx → PNat idx
         | None →
             match (cenv_global_lookup env n) {
-              | Some val → cg_resolve_global_val n val env
+              | Some val →
+                  -- PMutual sentinel (mutual-SCC member): emit the
+                  -- shared-pin bapp pattern instead of tagging the
+                  -- value.  See cg_compile_mutual_law for setup.
+                  match (planval_is_mutual val) {
+                    | 0 → cg_resolve_global_val n val env
+                    | _ → cg_mutual_ref_bapp (planval_get_mutual_idx val) env
+                  }
               | None →
                   -- Bare-name fallback: scan globals for the first FQ whose
                   -- short tail matches `n` (e.g. bare `helper` → FQ
@@ -5485,7 +6044,12 @@ let cg_var_from_env : Nat → CEnv → PlanVal
                     | None → PNat 0  -- unbound: return 0 (error in source)
                     | Some pair →
                         match pair {
-                          | MkPair fq val → cg_resolve_global_val fq val env
+                          | MkPair fq val →
+                              match (planval_is_mutual val) {
+                                | 0 → cg_resolve_global_val fq val env
+                                | _ → cg_mutual_ref_bapp
+                                        (planval_get_mutual_idx val) env
+                              }
                         }
                   }
             }
@@ -6542,40 +7106,796 @@ let cg_register_effs
             }
       }
 
--- cg_pass3: process DLet and DInst declarations
-let cg_pass3 : List Decl → Nat → CEnv → List (Pair Nat (Pair Nat Nat)) → List (Pair Nat PlanVal)
-             → List (Pair Nat PlanVal)
-  = λ decls mod_name env ctab compiled →
+-- ---------------------------------------------------------------------
+-- SCC Analysis for Mutual Recursion (Phase H Task A)
+-- ---------------------------------------------------------------------
+--
+-- Builds a forward-reference dependency graph over top-level let-decls
+-- in source order, in preparation for Tarjan SCC analysis and
+-- shared-pin encoding (spec/02-mutual-recursion.md).
+--
+-- Each binding's dependency list contains FQ names of other top-level
+-- lets that the body references — by FQ form OR by short-tail form,
+-- since the scope resolver may leave some bare names unqualified (the
+-- documented sr_dispatch deep-recursion gap; mirrors the Python
+-- bootstrap's two-way candidate match in _build_dep_graph).
+--
+-- Self-references appear as self-loops; Tarjan groups them into
+-- single-member SCCs with a self-edge, which fall back to the
+-- existing single-let compilation path.
+--
+-- Mirrors bootstrap/codegen.py::_build_dep_graph (~L3750).
+
+-- cg_collect_let_decls_go: accumulator loop for cg_collect_let_decls.
+-- Result is in REVERSE source order; the wrapper reverses to restore.
+-- Skips sentinel name=0 lets (type-alias placeholders — see
+-- cg_compile_let_one for context).
+let cg_collect_let_decls_go : List Decl → Nat → List (Pair Nat Expr)
+                             → List (Pair Nat Expr)
+  = λ decls mod_name acc →
+      match decls {
+        | Nil → acc
+        | Cons decl rest →
+            match (nat_eq (decl_is_let decl) 0) {
+              | 0 →
+                  let nm = decl_get_let_name decl in
+                  match (Reaver.BPLAN.eq nm 0) {
+                    | 0 →
+                        let fq   = name_concat_dot mod_name nm in
+                        let body = decl_get_let_body decl in
+                        cg_collect_let_decls_go rest mod_name
+                          (Cons (MkPair fq body) acc)
+                    | _ → cg_collect_let_decls_go rest mod_name acc
+                  }
+              | _ → cg_collect_let_decls_go rest mod_name acc
+            }
+      }
+
+-- cg_collect_let_decls: extract (fq_name, body) for every DLet in the
+-- module, in source order.  Sentinel placeholders are dropped.
+let cg_collect_let_decls : List Decl → Nat → List (Pair Nat Expr)
+  = λ decls mod_name →
+      reverse (cg_collect_let_decls_go decls mod_name Nil)
+
+-- cg_deps_for_body_go: walk the candidate FQ list, appending each FQ
+-- whose name (or short tail) appears in `body`.  Result is reversed
+-- once at the end so dependencies come out in candidate-list order.
+let cg_deps_for_body_go : Expr → List Nat → List Nat → List Nat
+  = λ body candidates acc →
+      match candidates {
+        | Nil → reverse acc
+        | Cons fq rest →
+            match (cg_has_var body fq) {
+              | 0 →
+                  let short = cg_short_after_dot fq in
+                  match (Reaver.BPLAN.eq short fq) {
+                    | 0 →
+                        match (cg_has_var body short) {
+                          | 0 → cg_deps_for_body_go body rest acc
+                          | _ → cg_deps_for_body_go body rest (Cons fq acc)
+                        }
+                    | _ → cg_deps_for_body_go body rest acc
+                  }
+              | _ → cg_deps_for_body_go body rest (Cons fq acc)
+            }
+      }
+
+-- cg_deps_for_body: subset of `candidates` that `body` references.
+-- Caller responsibility: `candidates` is duplicate-free (the let-decl
+-- FQ list).  Order of result matches order of `candidates`.
+let cg_deps_for_body : Expr → List Nat → List Nat
+  = λ body candidates → cg_deps_for_body_go body candidates Nil
+
+-- cg_dep_graph_go: for each (fq, body) pair, compute deps and prepend
+-- (fq, deps) to acc.  Reversed once at the end.
+let cg_dep_graph_go : List (Pair Nat Expr) → List Nat
+                    → List (Pair Nat (List Nat))
+                    → List (Pair Nat (List Nat))
+  = λ lets candidates acc →
+      match lets {
+        | Nil → reverse acc
+        | Cons pair rest →
+            match pair {
+              | MkPair fq body →
+                  let deps = cg_deps_for_body body candidates in
+                  cg_dep_graph_go rest candidates
+                    (Cons (MkPair fq deps) acc)
+            }
+      }
+
+-- cg_build_dep_graph: build the forward-reference dependency graph
+-- over the DLet declarations of a module.  Output is an assoc list
+-- (List (Pair fq_name (List fq_name))) in source order.
+let cg_build_dep_graph : List Decl → Nat → List (Pair Nat (List Nat))
+  = λ decls mod_name →
+      let lets  = cg_collect_let_decls decls mod_name in
+      let names = map (λ pair → match pair { | MkPair n _ → n }) lets in
+      cg_dep_graph_go lets names Nil
+
+-- ---------------------------------------------------------------------
+-- Tarjan SCC (Phase H Task A2)
+-- ---------------------------------------------------------------------
+--
+-- Standard Tarjan strongly-connected-components on the dep graph.
+-- Mirrors bootstrap/codegen.py::_tarjan_scc (L3773).
+--
+-- Output: List of SCCs in topological order (dependencies before
+-- dependents).  Each SCC is lex-sorted internally by FQ name —
+-- canonical ordering per spec/02-mutual-recursion.md §3.  Singleton
+-- SCCs are single-element lists; self-recursive bindings appear as
+-- singleton SCCs with a self-edge in the graph.
+
+-- TState: Tarjan working state.
+--   next_idx : Nat                       counter for index assignment
+--   idx      : List (Pair Nat Nat)       vertex → assigned DFS index
+--   lowlink  : List (Pair Nat Nat)       vertex → current lowlink
+--   stack    : List Nat                  vertices on DFS stack (top first)
+--   sccs     : List (List Nat)           accumulated SCCs (newest first;
+--                                        each pre-sorted lex)
+type TState =
+  | MkTState (Pair Nat (List (Pair Nat Nat)))
+             (Pair (List (Pair Nat Nat))
+                   (Pair (List Nat) (List (List Nat))))
+
+let tstate_empty : TState
+  = MkTState (MkPair 0 Nil) (MkPair Nil (MkPair Nil Nil))
+
+let ts_next : TState → Nat
+  = λ ts → match ts { | MkTState p _ → match p { | MkPair n _ → n } }
+
+let ts_idx : TState → List (Pair Nat Nat)
+  = λ ts → match ts { | MkTState p _ → match p { | MkPair _ m → m } }
+
+let ts_low : TState → List (Pair Nat Nat)
+  = λ ts → match ts { | MkTState _ q → match q { | MkPair l _ → l } }
+
+let ts_stack : TState → List Nat
+  = λ ts → match ts { | MkTState _ q →
+      match q { | MkPair _ r → match r { | MkPair s _ → s } } }
+
+let ts_sccs : TState → List (List Nat)
+  = λ ts → match ts { | MkTState _ q →
+      match q { | MkPair _ r → match r { | MkPair _ ss → ss } } }
+
+-- ts_enter: visit v for the first time — assign next_idx as both its
+-- index and lowlink, push onto DFS stack, increment counter.
+let ts_enter : Nat → TState → TState
+  = λ v ts →
+      let n = ts_next ts in
+      MkTState
+        (MkPair (Core.PLAN.inc n) (assoc_insert v n (ts_idx ts)))
+        (MkPair (assoc_insert v n (ts_low ts))
+                (MkPair (Cons v (ts_stack ts)) (ts_sccs ts)))
+
+-- ts_set_low: update v's lowlink to a new (smaller) value.
+let ts_set_low : Nat → Nat → TState → TState
+  = λ v new_low ts →
+      MkTState
+        (MkPair (ts_next ts) (ts_idx ts))
+        (MkPair (assoc_insert v new_low (ts_low ts))
+                (MkPair (ts_stack ts) (ts_sccs ts)))
+
+-- ts_update_low: lowlink[v] := min(lowlink[v], candidate).
+let ts_update_low : Nat → Nat → TState → TState
+  = λ v candidate ts →
+      let cur = match (assoc_lookup v (ts_low ts)) {
+                  | None    → 0
+                  | Some x  → x
+                } in
+      ts_set_low v (min_nat cur candidate) ts
+
+-- cg_name_lt_lex_go: byte-wise lexicographic compare loop.
+-- Returns 1 if x < y under lex byte order, 0 otherwise.
+let cg_name_lt_lex_go : Nat → Nat → Nat → Nat → Nat → Nat
+  = λ x y pos lenx leny →
+      match (lte lenx pos) {
+        | 0 →
+            match (lte leny pos) {
+              | 0 →
+                  let bx = byte_at x pos in
+                  let by = byte_at y pos in
+                  match (Reaver.BPLAN.eq bx by) {
+                    | 0 →
+                        match (lte bx by) {
+                          | 0 → 0
+                          | _ → 1
+                        }
+                    | _ →
+                        cg_name_lt_lex_go x y (Core.PLAN.inc pos) lenx leny
+                  }
+              | _ → 0
+            }
+        | _ →
+            match (lte leny pos) {
+              | 0 → 1
+              | _ → 0
+            }
+      }
+
+-- cg_name_lt_lex: x < y under lexicographic byte order on the LE-
+-- encoded name nats.  NOT the same as numeric `nat_lt` — numeric
+-- ordering on LE encodings does not match string lex order.
+let cg_name_lt_lex : Nat → Nat → Nat
+  = λ x y → cg_name_lt_lex_go x y 0 (nat_byte_len x) (nat_byte_len y)
+
+-- cg_insert_lex: insert x into a lex-sorted list, keeping it sorted.
+let cg_insert_lex : Nat → List Nat → List Nat
+  = λ x xs →
+      match xs {
+        | Nil → Cons x Nil
+        | Cons y rest →
+            match (cg_name_lt_lex x y) {
+              | 0 → Cons y (cg_insert_lex x rest)
+              | _ → Cons x xs
+            }
+      }
+
+-- cg_sort_lex_go: insertion-sort accumulator over an unsorted list.
+let cg_sort_lex_go : List Nat → List Nat → List Nat
+  = λ xs acc →
+      match xs {
+        | Nil → acc
+        | Cons x rest → cg_sort_lex_go rest (cg_insert_lex x acc)
+      }
+
+-- cg_sort_lex: lex-sort an unordered list of FQ name nats.
+let cg_sort_lex : List Nat → List Nat
+  = λ xs → cg_sort_lex_go xs Nil
+
+-- ts_pop_until: pop elements from `stack` until (and including) v,
+-- collecting the popped vertices.  Returns (popped, remaining_stack).
+-- Popped order is top-down (newest first), so the caller can sort.
+let ts_pop_until : Nat → List Nat → List Nat → Pair (List Nat) (List Nat)
+  = λ v stack acc →
+      match stack {
+        | Nil → MkPair acc Nil
+        | Cons top rest →
+            match (Reaver.BPLAN.eq top v) {
+              | 0 → ts_pop_until v rest (Cons top acc)
+              | _ → MkPair (Cons top acc) rest
+            }
+      }
+
+-- ts_emit_scc: pop the SCC rooted at v off the stack, lex-sort the
+-- result, prepend it to the accumulated SCC list.
+let ts_emit_scc : Nat → TState → TState
+  = λ v ts →
+      match (ts_pop_until v (ts_stack ts) Nil) {
+        | MkPair scc new_stack →
+            let sorted = cg_sort_lex scc in
+            MkTState
+              (MkPair (ts_next ts) (ts_idx ts))
+              (MkPair (ts_low ts)
+                      (MkPair new_stack (Cons sorted (ts_sccs ts))))
+      }
+
+-- cg_sc_visit_neighbors: process v's outgoing edges.
+--   sc: pass-self handle on strongconnect (pass-self pattern)
+--   graph: full dep graph (assoc list)
+--   v: source vertex
+--   ws: remaining neighbors to visit
+--   ts: running state
+let cg_sc_visit_neighbors
+      : (List (Pair Nat (List Nat)) → Nat → TState → TState)
+      → List (Pair Nat (List Nat)) → Nat → List Nat → TState → TState
+  = λ sc graph v ws ts →
+      match ws {
+        | Nil → ts
+        | Cons w rest →
+            let ts1 = match (assoc_has w (ts_idx ts)) {
+                        | 0 →
+                            -- w unvisited: recurse, then absorb its lowlink
+                            let ts_after = sc graph w ts in
+                            let lw = match (assoc_lookup w (ts_low ts_after)) {
+                                       | None   → 0
+                                       | Some x → x
+                                     } in
+                            ts_update_low v lw ts_after
+                        | _ →
+                            -- w visited: only matters if still on stack
+                            match (cg_name_in_list w (ts_stack ts)) {
+                              | 0 → ts
+                              | _ →
+                                  let iw = match (assoc_lookup w (ts_idx ts)) {
+                                             | None   → 0
+                                             | Some x → x
+                                           } in
+                                  ts_update_low v iw ts
+                            }
+                      } in
+            cg_sc_visit_neighbors sc graph v rest ts1
+      }
+
+-- cg_sc_dispatch: one iteration of Tarjan's strongconnect on vertex v.
+-- Enters v, recurses over neighbors, then (if v is the SCC root)
+-- pops the SCC off the stack.
+let cg_sc_dispatch
+      : (List (Pair Nat (List Nat)) → Nat → TState → TState)
+      → List (Pair Nat (List Nat)) → Nat → TState → TState
+  = λ sc graph v ts →
+      let ts1 = ts_enter v ts in
+      let ws  = match (assoc_lookup v graph) {
+                  | None   → Nil
+                  | Some n → n
+                } in
+      let ts2 = cg_sc_visit_neighbors sc graph v ws ts1 in
+      let iv = match (assoc_lookup v (ts_idx ts2)) {
+                 | None   → 0
+                 | Some x → x
+               } in
+      let lv = match (assoc_lookup v (ts_low ts2)) {
+                 | None   → 0
+                 | Some x → x
+               } in
+      match (Reaver.BPLAN.eq iv lv) {
+        | 0 → ts2
+        | _ → ts_emit_scc v ts2
+      }
+
+-- cg_strongconnect: pass-self entry point.
+let cg_strongconnect : List (Pair Nat (List Nat)) → Nat → TState → TState
+  = λ graph v ts → cg_sc_dispatch cg_strongconnect graph v ts
+
+-- cg_tarjan_outer: outer loop over graph keys.  Visits each unvisited
+-- vertex, accumulating SCCs in the state.
+let cg_tarjan_outer
+      : List (Pair Nat (List Nat)) → List Nat → TState → TState
+  = λ graph keys ts →
+      match keys {
+        | Nil → ts
+        | Cons k rest →
+            let ts1 = match (assoc_has k (ts_idx ts)) {
+                        | 0 → cg_strongconnect graph k ts
+                        | _ → ts
+                      } in
+            cg_tarjan_outer graph rest ts1
+      }
+
+-- cg_tarjan_scc: full SCC decomposition of the dep graph.
+-- Returns SCCs in topological order (dependencies before dependents),
+-- each internally lex-sorted by FQ name.
+let cg_tarjan_scc : List (Pair Nat (List Nat)) → List (List Nat)
+  = λ graph →
+      let keys  = assoc_keys graph in
+      let final = cg_tarjan_outer graph keys tstate_empty in
+      reverse (ts_sccs final)
+
+-- ---------------------------------------------------------------------
+-- Shared-pin SCC emit pipeline (Phase H Task A3-6)
+-- ---------------------------------------------------------------------
+--
+-- For an SCC of n ≥ 2 mutually recursive lets, the bootstrap emits:
+--
+--   shared_row = (((selector_law law_0) law_1) ... law_{n-1})
+--
+-- where selector_law is L(n+1, 0, dispatch-on-last-slot) and each law_i
+-- is a lambda-lifted version of member i with __shared__ inserted as
+-- its first explicit argument (slot 1).  Cross-SCC references in a
+-- member body compile to `(_1 j) _1` — extract law_j from the shared
+-- row, then pass the shared row as that law's __shared__ arg.
+--
+-- External wrappers of the original arity are emitted per member so
+-- the rest of the compiler sees normal pinned bindings.  Inside the
+-- wrapper body, the shared row tree is inlined twice (once for index
+-- extraction, once as the __shared__ arg) — same as the Python
+-- bootstrap (bootstrap/codegen.py::_build_mutual_wrapper L3916).
+--
+-- See spec/02-mutual-recursion.md and bootstrap/codegen.py::
+-- _compile_mutual_scc (L3822).
+
+-- ---------------------------------------------------------------------
+-- A3: Selector law
+-- ---------------------------------------------------------------------
+
+-- cg_build_selector_pairs_go: build the (tag, slot) pairs (0..n-1) →
+-- (PNat 1..PNat n) feeding cg_build_precompiled_nat_dispatch.
+let cg_build_selector_pairs_go : Nat → Nat → List (Pair Nat PlanVal)
+                                → List (Pair Nat PlanVal)
+  = λ i n acc →
+      match (lte n i) {
+        | 0 →
+            cg_build_selector_pairs_go (Core.PLAN.inc i) n
+              (Cons (MkPair i (PNat (add i 1))) acc)
+        | _ → reverse acc
+      }
+
+let cg_build_selector_pairs : Nat → List (Pair Nat PlanVal)
+  = λ n → cg_build_selector_pairs_go 0 n Nil
+
+-- cg_build_selector_law: build the bare selector law for an n-member SCC.
+--   L(n+1, 0, dispatch(scr=slot_{n+1}, pairs={0→_1, 1→_2, ..., n-1→_n}))
+-- No PPin wrap — the law is App'd into the shared_row chain directly.
+let cg_build_selector_law : Nat → CEnv → PlanVal
+  = λ n env →
+      let pairs = cg_build_selector_pairs n in
+      let body_arity = add n 1 in
+      let body_env = cenv_set_arity (cenv_set_self env None) body_arity in
+      let scr = PNat body_arity in
+      let body = cg_build_precompiled_nat_dispatch pairs None scr body_env
+                   cg_compile_expr Nil 0 in
+      PLaw 0 (MkPair body_arity body)
+
+-- ---------------------------------------------------------------------
+-- A5: Shared row builder
+-- ---------------------------------------------------------------------
+
+-- cg_build_shared_row_go: left-fold App selector to each member law.
+-- Variable named `lv` (not `law`) because `law` is a reserved keyword.
+let cg_build_shared_row_go : PlanVal → List PlanVal → PlanVal
+  = λ acc laws →
+      match laws {
+        | Nil → acc
+        | Cons lv rest → cg_build_shared_row_go (PApp acc lv) rest
+      }
+
+-- cg_build_shared_row: returns A(...A(A(selector, law_0), law_1)..., law_{n-1}).
+-- Not pinned — the row is partially-applied (awaits the index argument)
+-- and gets inlined twice into each wrapper body.
+let cg_build_shared_row : PlanVal → List PlanVal → PlanVal
+  = λ selector laws → cg_build_shared_row_go selector laws
+
+-- ---------------------------------------------------------------------
+-- A6: External wrapper
+-- ---------------------------------------------------------------------
+
+-- cg_apply_user_params_go: bapp `acc` to N(i), N(i+1), ..., N(u).
+-- Loop runs while i <= u (inclusive); stops once i exceeds u.
+let cg_apply_user_params_go : PlanVal → Nat → Nat → PlanVal
+  = λ acc i u →
+      match (lte i u) {
+        | 0 → acc
+        | _ → cg_apply_user_params_go (cg_bapp acc (PNat i))
+                                       (Core.PLAN.inc i) u
+      }
+
+let cg_apply_user_params : PlanVal → Nat → PlanVal
+  = λ acc u → cg_apply_user_params_go acc 1 u
+
+-- cg_build_mutual_wrapper: build the top-level wrapper binding for a
+-- single SCC member.  External callers see this as a normal pinned-ish
+-- law of the original arity u.  Body:
+--
+--   For u >= 1:
+--     L(u, name_nat,
+--       bapp(bapp(bapp(shared_row, quote(index)), shared_row), _1, ..., _u))
+--
+--   For u = 0:
+--     App(App(shared_row, N(index)), shared_row)
+let cg_build_mutual_wrapper : PlanVal → Nat → Nat → Nat → PlanVal
+  = λ shared_row index name_nat u →
+      match (nat_eq u 0) {
+        | 0 →
+            let i_val   = cg_quote_nat index u in
+            let extract = cg_bapp shared_row i_val in
+            let call    = cg_bapp extract shared_row in
+            let full    = cg_apply_user_params call u in
+            PLaw name_nat (MkPair u full)
+        | _ →
+            PApp (PApp shared_row (PNat index)) shared_row
+      }
+
+-- ---------------------------------------------------------------------
+-- A4: Lambda-lifted member law compilation
+-- ---------------------------------------------------------------------
+
+-- cg_register_mutual_refs_go: register PMutual(idx) in env.globals for
+-- each SCC member's FQ name AND its short tail.  Both forms must be
+-- registered so the body's bare or fully-qualified references both
+-- resolve.  Mirrors bootstrap/codegen.py::_compile_mutual_law L3905.
+let cg_register_mutual_refs_go : List (Pair Nat Nat) → CEnv → CEnv
+  = λ pairs env →
+      match pairs {
+        | Nil → env
+        | Cons p rest →
+            match p {
+              | MkPair fq idx →
+                  let env1 = cenv_bind_global env fq (PMutual idx) in
+                  let short = cg_short_after_dot fq in
+                  let env2 = match (Reaver.BPLAN.eq short fq) {
+                               | 0 → cenv_bind_global env1 short (PMutual idx)
+                               | _ → env1
+                             } in
+                  cg_register_mutual_refs_go rest env2
+            }
+      }
+
+let cg_register_mutual_refs : List (Pair Nat Nat) → CEnv → CEnv
+  = λ pairs env → cg_register_mutual_refs_go pairs env
+
+-- cg_compile_mutual_law: compile one SCC member's body as a lambda-
+-- lifted law of arity 1+u (shared row at slot 1, user params at
+-- slots 2..u+1).  Self-references and cross-references both route
+-- through the shared row via PMutual sentinels in env.globals.
+--
+-- Bypasses cg_compile_lam_as_law because that helper uses the same
+-- `hint` for both the law's name AND the body's lifted-sub-law name
+-- prefix.  For byte identity with bootstrap/codegen.py::
+-- _compile_mutual_law (L3912), the body must compile with an EMPTY
+-- hint (Python doesn't thread name_hint through) while the outer law
+-- still carries the original short name.
+let cg_compile_mutual_law
+  : Nat → Expr → List (Pair Nat Nat) → CEnv → List (Pair Nat (Pair Nat Nat)) → PlanVal
+  = λ name_nat body scc_idx_pairs env ctab →
+      match (cg_flatten_lam body) {
+        | MkPair user_params inner_body →
+            -- Synthetic outer parameter is __shared__ at slot 1; the
+            -- original user params slide one slot down to 2..1+u.
+            let all_params = Cons nn___shared__ user_params in
+            -- Clear self_ref so a body-internal reference to the
+            -- member's own name falls through to the PMutual entry
+            -- in env.globals (Python L3899: self_ref_name='').
+            let env0 = cenv_set_self env None in
+            let env1 = cg_register_mutual_refs scc_idx_pairs env0 in
+            let g = cenv_globals env1 in
+            let body_env = cenv_mark_top_of_law
+                             (cg_make_lifted_env Nil all_params g None) in
+            let body_val = cg_compile_expr inner_body body_env ctab 0 in
+            PLaw name_nat (MkPair (length all_params) body_val)
+      }
+
+-- ---------------------------------------------------------------------
+-- Orchestrator
+-- ---------------------------------------------------------------------
+
+-- cg_zip_indices_go: zip a (fq, body) list with 0-based indices.
+-- Result: List (Pair fq idx) — the canonical mapping for an SCC.
+let cg_zip_indices_go : List (Pair Nat Expr) → Nat → List (Pair Nat Nat)
+                       → List (Pair Nat Nat)
+  = λ members idx acc →
+      match members {
+        | Nil → reverse acc
+        | Cons p rest →
+            match p {
+              | MkPair fq _ →
+                  cg_zip_indices_go rest (Core.PLAN.inc idx)
+                    (Cons (MkPair fq idx) acc)
+            }
+      }
+
+-- cg_compile_member_laws_go: compile each member's body via
+-- cg_compile_mutual_law, accumulating laws in canonical order.
+let cg_compile_member_laws_go
+  : List (Pair Nat Expr) → List (Pair Nat Nat) → CEnv
+  → List (Pair Nat (Pair Nat Nat)) → List PlanVal → List PlanVal
+  = λ members scc_idx_pairs env ctab acc →
+      match members {
+        | Nil → reverse acc
+        | Cons p rest →
+            match p {
+              | MkPair fq body →
+                  let name_nat = cg_short_after_dot fq in
+                  let lv = cg_compile_mutual_law name_nat body
+                             scc_idx_pairs env ctab in
+                  cg_compile_member_laws_go rest scc_idx_pairs env ctab
+                    (Cons lv acc)
+            }
+      }
+
+-- cg_arity_of_lambda: count outer lambdas to get the wrapper's user arity.
+let cg_arity_of_lambda : Expr → Nat
+  = λ e → match (cg_flatten_lam e) {
+            | MkPair params _ → length params
+          }
+
+-- cg_emit_wrappers_go: for each member, build its wrapper, bind it in
+-- env.globals (tagged with FQ for cross-ref dedup), prepend (fq, val)
+-- to compiled.  Index counts up from 0 in member order (canonical).
+let cg_emit_wrappers_go
+  : List (Pair Nat Expr) → PlanVal → Nat → CEnv → List (Pair Nat PlanVal)
+  → Pair CEnv (List (Pair Nat PlanVal))
+  = λ members shared_row idx env compiled →
+      match members {
+        | Nil → MkPair env compiled
+        | Cons p rest →
+            match p {
+              | MkPair fq body →
+                  let name_nat = cg_short_after_dot fq in
+                  let u = cg_arity_of_lambda body in
+                  let wrapper = cg_build_mutual_wrapper shared_row idx
+                                  name_nat u in
+                  let new_env = cenv_bind_global env fq wrapper in
+                  let new_compiled = Cons (MkPair fq wrapper) compiled in
+                  cg_emit_wrappers_go rest shared_row (Core.PLAN.inc idx)
+                    new_env new_compiled
+            }
+      }
+
+-- cg_compile_mutual_scc: end-to-end compilation of one multi-member SCC.
+-- `members` is the (FQ, body) list in canonical (lex-sorted) order.
+let cg_compile_mutual_scc
+  : List (Pair Nat Expr) → CEnv → List (Pair Nat (Pair Nat Nat))
+  → List (Pair Nat PlanVal)
+  → Pair CEnv (List (Pair Nat PlanVal))
+  = λ members env ctab compiled →
+      let n = length members in
+      let scc_idx_pairs = cg_zip_indices_go members 0 Nil in
+      let selector = cg_build_selector_law n env in
+      let member_laws = cg_compile_member_laws_go members scc_idx_pairs
+                          env ctab Nil in
+      let shared_row = cg_build_shared_row selector member_laws in
+      cg_emit_wrappers_go members shared_row 0 env compiled
+
+-- cg_fan_scc_go / cg_fan_scc: turn one canonical-order SCC member list
+-- into entries (fq → member list) for every member.  Each member maps
+-- to the SAME shared list so cg_pass3 can recover the SCC from any of
+-- its members.
+let cg_fan_scc_go : List Nat → List Nat → List (Pair Nat (List Nat))
+                  → List (Pair Nat (List Nat))
+  = λ remaining all_members acc →
+      match remaining {
+        | Nil → acc
+        | Cons fq rest →
+            cg_fan_scc_go rest all_members (Cons (MkPair fq all_members) acc)
+      }
+
+let cg_fan_scc : List Nat → List (Pair Nat (List Nat))
+                → List (Pair Nat (List Nat))
+  = λ scc acc → cg_fan_scc_go scc scc acc
+
+-- cg_fq_to_scc_members_go: build the fq → member-list assoc by scanning
+-- every SCC.  Result keys cover every binding in every multi/single SCC.
+let cg_fq_to_scc_members_go : List (List Nat) → List (Pair Nat (List Nat))
+                             → List (Pair Nat (List Nat))
+  = λ sccs acc →
+      match sccs {
+        | Nil → acc
+        | Cons scc rest →
+            cg_fq_to_scc_members_go rest (cg_fan_scc scc acc)
+      }
+
+let cg_fq_to_scc_members : List (List Nat) → List (Pair Nat (List Nat))
+  = λ sccs → cg_fq_to_scc_members_go sccs Nil
+
+-- cg_lookup_member_bodies_go: for each member FQ, look up its body in
+-- lets_by_fq; result is (fq, body) pairs in member-list (canonical)
+-- order.  Returns the list in REVERSE order; wrapper reverses once.
+let cg_lookup_member_bodies_go : List Nat → List (Pair Nat Expr)
+                                → List (Pair Nat Expr)
+                                → List (Pair Nat Expr)
+  = λ members lets_by_fq acc →
+      match members {
+        | Nil → reverse acc
+        | Cons fq rest →
+            match (assoc_lookup fq lets_by_fq) {
+              | None → cg_lookup_member_bodies_go rest lets_by_fq acc
+              | Some body →
+                  cg_lookup_member_bodies_go rest lets_by_fq
+                    (Cons (MkPair fq body) acc)
+            }
+      }
+
+let cg_lookup_member_bodies : List Nat → List (Pair Nat Expr)
+                             → List (Pair Nat Expr)
+  = λ members lets_by_fq →
+      cg_lookup_member_bodies_go members lets_by_fq Nil
+
+-- cg_scc_rep: canonical representative of an SCC (the lex-smallest FQ,
+-- which is the first element of the canonically-sorted member list).
+-- Sentinel 0 for an empty list shouldn't arise in practice — Tarjan
+-- never emits empty SCCs.
+let cg_scc_rep : List Nat → Nat
+  = λ scc → match scc { | Nil → 0 | Cons rep _ → rep }
+
+-- cg_pass3_go: source-order walk over decls, dispatching DLets through
+-- their SCC's emit shape (single-member → cg_compile_let_one,
+-- multi-member → cg_compile_mutual_scc).  DInsts are compiled in-line
+-- as before.  `emitted` tracks SCC representative FQs already produced.
+let cg_pass3_go
+  : List Decl → Nat → CEnv → List (Pair Nat (Pair Nat Nat))
+  → List (Pair Nat PlanVal)
+  → List (Pair Nat Expr) → List (Pair Nat (List Nat)) → List Nat
+  → List (Pair Nat PlanVal)
+  = λ decls mod_name env ctab compiled lets_by_fq fq_to_members emitted →
       match decls {
         | Nil → compiled
         | Cons decl rest →
-            let result = match (nat_eq (decl_is_let decl) 0) {
-                           | 0 →
-                               cg_compile_let_one
-                                 (decl_get_let_name decl)
-                                 (decl_get_let_body decl)
-                                 mod_name env ctab compiled
-                           | _ →
-                               match (nat_eq (decl_is_inst decl) 0) {
-                                 | 0 →
-                                     match (decl_get_inst_body decl) {
-                                       | MkPair type_name members →
-                                           let inst_prefix =
-                                             name_concat_under
-                                               (name_concat_under nn_inst
-                                                  (decl_get_inst_class decl))
-                                               type_name in
-                                           cg_compile_inst_members members inst_prefix
-                                             mod_name env ctab compiled
-                                     }
-                                 | _ → MkPair env compiled
-                               }
-                         } in
-            match result {
-              | MkPair new_env new_compiled →
-                  cg_pass3 rest mod_name new_env ctab new_compiled
+            match (nat_eq (decl_is_let decl) 0) {
+              | 0 →
+                  -- DLet: route through SCC.
+                  let nm = decl_get_let_name decl in
+                  match (Reaver.BPLAN.eq nm 0) {
+                    | 0 →
+                        let fq = name_concat_dot mod_name nm in
+                        match (assoc_lookup fq fq_to_members) {
+                          | None →
+                              -- No SCC entry (shouldn't happen): fall
+                              -- back to single-let compile.
+                              match (cg_compile_let_one nm
+                                       (decl_get_let_body decl)
+                                       mod_name env ctab compiled) {
+                                | MkPair new_env new_compiled →
+                                    cg_pass3_go rest mod_name new_env ctab
+                                      new_compiled lets_by_fq fq_to_members
+                                      emitted
+                              }
+                          | Some members →
+                              let rep = cg_scc_rep members in
+                              match (cg_name_in_list rep emitted) {
+                                | 0 →
+                                    -- First time this SCC is seen.
+                                    let new_emitted = Cons rep emitted in
+                                    match (nat_eq (length members) 1) {
+                                      | 0 →
+                                          -- Multi-member SCC: compile via
+                                          -- shared-pin encoding.
+                                          let pairs =
+                                            cg_lookup_member_bodies members
+                                              lets_by_fq in
+                                          match (cg_compile_mutual_scc
+                                                   pairs env ctab compiled) {
+                                            | MkPair new_env new_compiled →
+                                                cg_pass3_go rest mod_name
+                                                  new_env ctab new_compiled
+                                                  lets_by_fq fq_to_members
+                                                  new_emitted
+                                          }
+                                      | _ →
+                                          -- Singleton SCC: today's path.
+                                          match (cg_compile_let_one nm
+                                                   (decl_get_let_body decl)
+                                                   mod_name env ctab
+                                                   compiled) {
+                                            | MkPair new_env new_compiled →
+                                                cg_pass3_go rest mod_name
+                                                  new_env ctab new_compiled
+                                                  lets_by_fq fq_to_members
+                                                  new_emitted
+                                          }
+                                    }
+                                | _ →
+                                    -- SCC already emitted; skip this decl.
+                                    cg_pass3_go rest mod_name env ctab
+                                      compiled lets_by_fq fq_to_members
+                                      emitted
+                              }
+                        }
+                    | _ →
+                        -- Sentinel name=0: type-alias placeholder, skip.
+                        cg_pass3_go rest mod_name env ctab compiled
+                          lets_by_fq fq_to_members emitted
+                  }
+              | _ →
+                  -- DInst or other non-let: compile in-line.
+                  match (nat_eq (decl_is_inst decl) 0) {
+                    | 0 →
+                        match (decl_get_inst_body decl) {
+                          | MkPair type_name members →
+                              let inst_prefix =
+                                name_concat_under
+                                  (name_concat_under nn_inst
+                                     (decl_get_inst_class decl))
+                                  type_name in
+                              match (cg_compile_inst_members members
+                                       inst_prefix mod_name env ctab
+                                       compiled) {
+                                | MkPair new_env new_compiled →
+                                    cg_pass3_go rest mod_name new_env ctab
+                                      new_compiled lets_by_fq fq_to_members
+                                      emitted
+                              }
+                        }
+                    | _ →
+                        cg_pass3_go rest mod_name env ctab compiled
+                          lets_by_fq fq_to_members emitted
+                  }
             }
       }
+
+-- cg_pass3: process DLet and DInst declarations.  Builds dep graph +
+-- SCC decomposition first, then walks decls in source order and emits
+-- each SCC the first time one of its members is encountered.  This
+-- mirrors bootstrap/codegen.py::compile_program L350-405 — multi-
+-- member SCCs use the shared-pin encoding (spec/02-mutual-recursion.md).
+let cg_pass3 : List Decl → Nat → CEnv → List (Pair Nat (Pair Nat Nat))
+             → List (Pair Nat PlanVal)
+             → List (Pair Nat PlanVal)
+  = λ decls mod_name env ctab compiled →
+      let lets_by_fq    = cg_collect_let_decls decls mod_name in
+      let graph         = cg_build_dep_graph decls mod_name in
+      let sccs          = cg_tarjan_scc graph in
+      let fq_to_members = cg_fq_to_scc_members sccs in
+      cg_pass3_go decls mod_name env ctab compiled lets_by_fq
+        fq_to_members Nil
 
 -- compile_program: compile a full program to a list of (fq_name, PlanVal) pairs
 -- compile_program: thread the four codegen passes and reverse the
@@ -7349,6 +8669,11 @@ let emit_bval_dispatch
             -- Lambda-lifted laws appear as PPin(PLaw ...) in law bodies.
             ep pval
         | PNamed n _ → name_to_symbol n
+        | PMutual _ →
+            -- Sentinel: PMutual should be resolved during codegen, never
+            -- reach emit.  Produce a '!' byte so any leak fails Reaver's
+            -- Plan Asm parse and points at the responsible law.
+            bytes_singleton 0x21
       }
 
 -- emit_body_val: ties the knot for emit_bval_dispatch.
@@ -7416,6 +8741,9 @@ let emit_pval_dispatch : (PlanVal → Bytes) → PlanVal → Bytes
                   }
             }
         | PNamed n _ → name_to_symbol n
+        | PMutual _ →
+            -- See emit_bval_dispatch: PMutual should never reach emit.
+            bytes_singleton 0x21
       }
 
 -- emit_pval: ties the knot for emit_pval_dispatch.

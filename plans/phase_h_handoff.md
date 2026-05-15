@@ -1,15 +1,81 @@
-# Phase H — Session handoff (2026-05-14)
+# Phase H — Session handoff (2026-05-14 / 2026-05-15 / 2026-05-16)
 
-**Status:** in progress, multi-session.
+**Status:** ✅ **COMPLETE.** Compile-self is byte-identical.
 **Roadmap reference:** `ROADMAP.md § "Phase H — Compile-self fixed point"`.
+
+## 🎉 Phase H complete — byte-identical compile-self (2026-05-16)
+
+The Reaver-hosted self-host compiler (`main_reaver` driving the
+bootstrap-compiled `Compiler.gls`) produces output **byte-identical**
+to the Python bootstrap when both compile `compiler/src/Compiler.gls`
+itself.  Output: **1,234,064 bytes** in **1253 seconds** under Reaver
+(no jets).
+
+The fixed point is pinned by
+`tests/reaver/test_selfhost.py::TestPhaseHFixedPoint::test_compile_self`,
+gated behind `GALLOWGLASS_RUN_COMPILE_SELF=1`.  Default pytest runs
+skip it (30-min timeout would derail fast iteration); CI and slow
+suites should set the env var.
+
+### Compile-self gate progression (this session — 2026-05-16)
+
+| After commit  | First divergence byte    | Cumulative % byte-identical | Cause                                                              |
+| ------------- | ------------------------ | --------------------------- | ------------------------------------------------------------------ |
+| (start)       | 306230 of 1218740        | ~25%                        | (anchor from prior session)                                        |
+| f10457b (F)   | 542118 of 1219621        | ~44%                        | `__shared__` over-capture in App handler                           |
+| 39d741a (H)   | 550551 of 1223796        | ~45%                        | No wild_app_handler for nullary-only + wild matches                |
+| dfb07c0 (I)   | 774580 of 1231445        | ~63%                        | `cg_build_nat_dispatch` missing `first_tag > 0` shift              |
+| a550e4b (J)   | 1232382 of 1232496       | ~99.99%                     | Double-pin for App globals; hint lost in unary z/m body            |
+| 2eaeaa0 (K)   | **OK 1234064 bytes**     | **100%**                    | `parse_lambda_params` rejected `λ _ → body`                        |
+
+Total: five fixes, each ~1-10 lines of substantive code change, plus
+test fixtures pinning each fix.  Selfhost suite: **27 passed + 1
+skipped (compile-self gate, env-gated) + 1 xfailed** at session end.
+
+### Commits this session
+
+```
+2eaeaa0 fix(self-host): parse_lambda_params accepts TkUnderscore (Phase H Task K)
+a550e4b fix(self-host): double-pin and unary z/m hint propagation (Phase H Task J)
+dfb07c0 fix(self-host): first_tag > 0 shift in nat_dispatch (Phase H Task I)
+39d741a feat(self-host): wild_app_handler for nullary-only + wild matches (Phase H)
+f10457b fix(self-host): drop __shared__ from App-handler captures (Phase H)
+```
+
+### What's still open (low priority)
+
+* **Dwarf #4** — ambiguity check in short-tail fallbacks
+  (`cg_global_lookup_by_short`, `cg_contab_lookup_by_short`).  No
+  current trigger.
+* **Hobbit cuts** — helper-inlining suggestions.  Re-evaluated
+  multiple times; left in place.
+* **xfail** `test_same_constructor_literal_field_collapses` — the
+  same-constructor collapse pass isn't ported to Compiler.gls.
+  AUDIT.md D9.
+* **Compile-self runtime under Reaver** — 1253s (~21 min) per run
+  is fine for slow-CI but too slow for default pytest.  Will
+  improve with jets (post-1.0).
+
+The earlier session-by-session sections below (compile-self at byte
+306230, 542118, 550551, 774580) are now historical — preserved for
+context on the bugs found, but no longer reflect the current state of
+the gate.
+
+---
+
+> **Next session: see [§ Work plan for next session (2026-05-15)](#work-plan-for-next-session-2026-05-15) at the bottom.**
+> That section is the actionable starting point. The earlier sections are
+> background context that explains how we got past the byte 293921 structural wall
+> and now sit at byte 306230 (~25% of 1.22M, the new reference length).
 
 ## Where we are
 
 Phase H deliverables (1) and (2) from the ROADMAP are landed; the
 self-host pipeline is now byte-identical to the bootstrap for a
 growing set of fixtures, and the compile-self gate (Compiler.gls
-compiling itself) has been pushed from byte 334 to byte ~78148 of
-~1.16M bytes byte-identical (~7%).
+compiling itself) has been pushed from byte 334 → byte ~78148 (last
+session) → byte 293921 (this session) of ~1.17M bytes byte-identical
+(~25%).
 
 ### Commits this session (head → ROADMAP base)
 
@@ -395,3 +461,688 @@ print(m.group(1) if m else 'not found')
 - `bootstrap/emit_pla.py` — Python's Plan Asm emitter; reference
   for emit-time behavior including cross-binding dedup via
   `_maybe_symbol`.
+
+---
+
+## Work plan for next session
+
+**Session anchor (2026-05-14, end of session):** compile-self diverges
+at byte 293921 of 1167435 (~25% identical), inside the boundary
+between `Compiler_parse_pin_rhs_pe` and what should follow it.
+
+### What changed this session (commits, oldest → newest)
+
+```
+132d578 fix(self-host): single-unary-arm + wildcard tag-check byte-identical
+b028d2f ci(tutorials): skip notebook smoke tests unless edited
+d1eb86b fix(self-host): hint propagation through z_body/m_body + binary single-arm tag-check
+e7afdb3 fix(self-host): binary handler m slot is const2(0), not wild
+```
+
+Plus a `test_single_unary_arm_with_wildcard` byte-identity fixture
+pinning the single-unary-arm path.
+
+Selfhost suite: **23 passing + 1 xfailed** (was 22+1 at session start).
+No regressions in any of `tests/bootstrap/`, `tests/compiler/`,
+`tests/prelude/`.
+
+### Divergence progression this session
+
+| After commit | Divergence byte | Issue                                                              |
+| ------------ | --------------- | ------------------------------------------------------------------ |
+| (start)      | 78148           | Single-unary-arm + wildcard lacks tag-check (`tok_eat_ident`)      |
+| 132d578      | 105280          | Free-var union missed `wild_body`; PCD base case lifted via `_wild_succ` |
+| 132d578      | 109909          | `cg_build_app_handler` z passed hint=0 (`is_atom_start`)           |
+| d1eb86b §3   | 229869          | Multi-arm dispatch hint=0; missing `<hint>_tag` rename             |
+| d1eb86b §4   | 232433          | Binary single-arm path lacked tag-check (`has_guard_sentinel`)     |
+| e7afdb3      | 293921          | Binary handler m-slot lifted wild instead of `const2(body_nat(0))` |
+
+### The wall — what blocks us at byte 293921
+
+The next divergence is **structural**, not a local codegen tweak:
+
+```
+REF[…]:  …(#pin Compiler_skip_ann) _3))))))\n(#bind Compiler_parse_expr      …
+ACT[…]:  …(#pin Compiler_skip_ann) _3))))))\n(#bind Compiler_parse_expr_dispatch …
+```
+
+REF's next binding is `parse_expr`; ACT's is `parse_expr_dispatch`.
+The two are part of a 5-member mutually-recursive SCC:
+
+```python
+SCC 454: [Compiler.parse_expr, Compiler.parse_expr_dispatch,
+          Compiler.parse_handle_arms, Compiler.parse_handle_expr,
+          Compiler.parse_handle_op_arm]
+```
+
+Python's bootstrap (`bootstrap/codegen.py::_compile_mutual_scc`,
+~L3822) detects this SCC via Tarjan and emits all 5 bindings under a
+**shared-pin encoding** (see `spec/02-mutual-recursion.md`):
+
+```
+shared_pin = P(selector_law  law_0  law_1  …  law_{n-1})
+```
+
+with each `law_i` lambda-lifted to accept the shared pin as its
+first argument. External wrapper laws of original arity are then
+emitted in lexicographic order within the SCC.
+
+The self-host (`compiler/src/Compiler.gls::cg_pass3`) just walks
+let-decls in source order and compiles each with `cg_compile_let_one`
+— **no SCC detection, no shared-pin encoding.** Each binding stands
+alone with EFix-based self-reference, and cross-SCC calls resolve
+via the global env.
+
+The two encodings are semantically equivalent for Reaver (both
+work at runtime), but byte-divergent. Closing this gap is the
+next major arc.
+
+### Recommended task order
+
+#### Task A — Shared-pin SCC encoding in Compiler.gls (BIG)
+
+**Estimate:** multi-session. This is the principal remaining work.
+
+Add Tarjan SCC analysis to `compile_program`, then route
+multi-member SCCs through a `cg_compile_mutual_scc` helper that
+mirrors `bootstrap/codegen.py::_compile_mutual_scc` (~L3822 onward).
+
+Concrete subtasks (in suggested order):
+
+1. **Dep graph builder.** Port `_build_dep_graph` to Compiler.gls.
+   For each `DLet`, walk its body collecting free `EVar` names that
+   resolve to other top-level lets. Output: `List (Pair Nat (List Nat))`
+   (binding → list-of-dependencies, by FQ nat). The body-walker
+   already exists for free-vars in `cg_collect_free` — repurpose or
+   parallel it.
+
+2. **Tarjan SCC.** Port `_tarjan_scc` (codegen.py L3773). Recursive
+   DFS with `index`, `lowlink`, `stack`. Within Gallowglass this needs
+   a pass-self pattern (no native mutual recursion) and explicit state
+   passing — likely a 3-tuple `(Nat /* next index */, List (Pair Nat Nat) /* index/lowlink */, List Nat /* stack */)`.
+
+3. **SCC ordering.** Sort each SCC's members lexicographically by FQ
+   name (`sorted(scc)` in Python L3808). Reaver.BPLAN.eq + a
+   `nat_lt` already-exists helper handles the comparison; the
+   sort itself can be insertion-sort on the list (mirror
+   `cg_insert_sorted_pair` at L4344).
+
+4. **Shared-pin selector law.** For SCC size n ≥ 2, build
+   `selector_law = L(n+1, 0, body)` where `body` dispatches on
+   the last argument (index 1..n) and returns the corresponding
+   `law_i` slot. Pattern: an op2 chain
+   `op2(law_0, succ(op2(law_1, succ(...), pred-1)), pred)`.
+   Mirror `bootstrap/codegen.py::_compile_mutual_scc` ~L3849.
+
+5. **Lambda-lifted member laws.** Each `law_i` gets one extra
+   parameter (the shared pin) prepended; references to other SCC
+   members in its body become `(shared_pin index_j)` applications.
+   Self-reference uses the corresponding index.
+
+6. **External wrappers.** After the shared pin is built, emit a
+   wrapper law of the original arity per member that partial-applies
+   `(shared_pin idx)` with the wrapper's params. These are the
+   bindings external callers see.
+
+7. **Pass through `cg_pass3`.** Replace the per-decl
+   `cg_compile_let_one` walk with: iterate decls in source order;
+   for each `DLet`, look up its SCC; if single-member, compile as
+   today; if multi-member and not yet emitted, emit the whole SCC
+   group (selector + wrappers) atomically.
+
+Reference reading:
+- `spec/02-mutual-recursion.md` — full encoding spec.
+- `bootstrap/codegen.py` L3773-3816 (`_tarjan_scc`).
+- `bootstrap/codegen.py` L3822-3935 (`_compile_mutual_scc`).
+- `bootstrap/codegen.py` L350-405 (`compile_program`'s SCC dispatch).
+
+**Validation strategy:**
+- Add a `test_mutual_recursion_byte_identical` fixture pairing a
+  minimal mutual-rec pair (e.g. `is_even`/`is_odd`) before tackling
+  the 5-member SCC inside Compiler.gls.
+- Each step should leave the existing 23 selfhost fixtures green.
+- Once the shared-pin emit lands, the compile-self gate should
+  jump well past byte 293921 — Compiler.gls has many SCCs (parser
+  chain, sr_dispatch chain, etc.) all of which currently emit in
+  source order.
+
+#### Task B — Document the next-after divergences (cheap)
+
+Before Task A lands, the compile-self gate can be probed for *what*
+the next divergences look like by temporarily reordering Compiler.gls's
+source to match Python's lexicographic SCC sort. This won't fix
+byte-identity (shared-pin shape still differs) but it will surface
+post-SCC bugs early.
+
+A simpler diagnostic: run `tools/selfcompile.py` on a minimal mutual-rec
+fixture (`is_even`/`is_odd`) and confirm the divergence shape matches
+the expected shared-pin vs source-order split. This is a 30-line
+fixture, fast to write.
+
+#### Task C — Hold-over follow-ups (small, opportunistic)
+
+These are unchanged from the prior session's plan; address if
+convenient between Task A iterations:
+
+* **Dwarf #4** — ambiguity check in short-tail fallbacks
+  (`cg_global_lookup_by_short`, `cg_contab_lookup_by_short`).
+  Documented in earlier sections; no current trigger.
+
+* **Hobbit cuts** — helper-inlining suggestions for
+  `cg_global_lookup_by_short`, `cg_contab_lookup_by_short`, and the
+  `cg_pcd_z_for_op2`/`cg_pcd_pairs_for_inner` pair. Re-evaluated
+  twice now: list-walks don't inline cleanly in Gallowglass; left
+  in place.
+
+* **Compile-self as a test fixture.** Once byte-identical, add
+  `TestPhaseHFixedPoint::test_compile_self` gated behind an env-var
+  (the 600s runtime is too slow for the default pytest run but fine
+  for slow-CI).
+
+### Repro recipes (unchanged from prior session)
+
+```bash
+# Selfhost byte-identity fixtures (fast, ~30s):
+python3 -m pytest tests/reaver/test_selfhost.py -q
+
+# Single fixture isolation:
+python3 -m pytest tests/reaver/test_selfhost.py::TestPhaseG3ByteIdentity::test_single_unary_arm_with_wildcard -v
+
+# Custom probe through the diff harness:
+python3 tools/selfcompile.py /path/to/source.gls
+
+# The full compile-self gate (~600s, run sparingly):
+timeout 600 python3 tools/selfcompile.py compiler/src/Compiler.gls \
+  --write-actual /tmp/cs.actual.txt 2>/tmp/cs.diff.txt
+cat /tmp/cs.diff.txt
+```
+
+To find which binding contains a given divergence byte:
+
+```bash
+python3 -c "
+import sys, re
+sys.setrecursionlimit(200000)
+from bootstrap.lexer import lex
+from bootstrap.parser import parse
+from bootstrap.scope import resolve
+from bootstrap.codegen import compile_program
+from bootstrap.emit_pla import emit_program
+src = open('compiler/src/Compiler.gls').read()
+prog = parse(lex(src, '<>'), '<>')
+resolved, _ = resolve(prog, 'Compiler', {}, '<>')
+compiled = compile_program(resolved, 'Compiler')
+out = emit_program(compiled)
+binds = [(m.start(), m.group(1)) for m in re.finditer(r'\(#bind (\w+) ', out)]
+TARGET = 293921  # ← replace with the current divergence byte
+for i, (start, name) in enumerate(binds):
+    if start <= TARGET and (i+1 == len(binds) or binds[i+1][0] > TARGET):
+        print(f'Byte {TARGET} is in {name}, offset {TARGET-start}')
+        break
+"
+```
+
+To decode an LE-packed law-name nat (when output shows e.g.
+`(#law "1886413151" …)`):
+
+```bash
+python3 -c "
+n = 1886413151
+out=[]
+while n>0: out.append(n&0xFF); n>>=8
+print(bytes(out))
+# → b'_app'
+"
+```
+
+### Key files (updated)
+
+- `compiler/src/Compiler.gls` — the self-host compiler source. New
+  notable areas as of this session:
+  - L4711-4754 — `cg_pcd_pairs_for_inner` / `cg_pcd_z_for_op2` helpers.
+  - L4738-4830 — `cg_build_precompiled_nat_dispatch` with wild-aware
+    z-arm (commits d1eb86b / e7afdb3).
+  - L4914-4980 — `cg_build_z_body` / `cg_build_m_body` with hint
+    parameter (commit d1eb86b).
+  - L5039-5159 — `cg_build_unary_handler_body` single-arm + wild
+    tag-check (commit 132d578).
+  - L5193-5237 — `cg_build_unary_m_body` Nil-tag>0 branch (commit
+    e7afdb3, returns `const2(body_nat(0))` regardless of wild).
+  - L5293-5354 — `cg_build_binary_handler_body` single-arm tag-check
+    (commit d1eb86b).
+  - L5368-5414 — `cg_build_app_handler` with wild_body in free-var
+    union (commit 132d578).
+
+- `tests/reaver/test_selfhost.py` — byte-identity fixtures.
+  `test_single_unary_arm_with_wildcard` added this session.
+
+- `bootstrap/codegen.py` — Python bootstrap reference. The SCC work
+  in Task A targets ~L350-405 (compile_program), L3773-3816
+  (_tarjan_scc), L3822-3935 (_compile_mutual_scc).
+
+- `spec/02-mutual-recursion.md` — the formal specification of shared
+  pins; read this before starting Task A.
+
+---
+
+## Work plan for next session (2026-05-16)
+
+**Session anchor (end of 2026-05-15):** compile-self diverges at byte
+**550551** of 1223796 (~45%), inside `Compiler_collect_record_types_go`
+at offset 8638 — still inside the same binding as the previous wall,
+but ~250K bytes deeper.  Two Phase H fixes landed this session:
+
+* **Task F (commit f10457b)** dropped `__shared__` from
+  `cg_build_app_handler`'s capture set via the new `cg_drop_shared`
+  helper.  Python's `_build_field_arm_law` uses `_collect_all_names`
+  (no `__shared__` rule); our generic `cg_free_vars_bodies` adds it
+  via `cg_cf_dispatch`'s PMutual implicit-capture rule.  Inside a
+  wild-pred sub-law the outer `_make_pred_succ_law` frame already
+  captures `__shared__`, so adding it again grew the handler's arity
+  by 1 and broke byte-identity.  Pinned by
+  `test_mutual_recursion_app_handler_no_extra_shared`.  Gate gain:
+  byte 306230 → 542118 (~25% → 44%).
+
+* **Task H (commit 39d741a)** added `cg_build_wild_app_handler` and
+  routed `cg_compile_con_match`'s no-field-arms branch through
+  `cg_build_reflect_dispatch` with the new handler when a wildcard is
+  present.  Mirrors Python's `_compile_adt_dispatch` decision at
+  codegen.py L2380 (type-has-field-sibling case).  Conservative
+  application (always when wild exists, even on pure-nullary types) is
+  safe in Compiler.gls because no nullary-only type is matched with a
+  wildcard (verified by inspection).  Pinned by
+  `test_match_nullary_arm_plus_wild_on_field_type`.  Gate gain: byte
+  542118 → 550551 (~44% → 45%, modest because the next divergence is
+  a similar shape inside `cg_build_m_body`'s recursive nat dispatch).
+
+The remaining structural change — Tarjan SCC analysis, shared-pin
+encoding, lambda-lifted member laws, and external wrappers — landed
+in the prior session (commit 208fc91).  Today's session is purely
+local capture-counting fixes layered on top.
+
+### Open follow-up: `_m` law capture mismatch at byte 550551
+
+Decoded law names at the new divergence:
+
+* REF: `collect_record_types_go_m` (arity 4) — body uses
+  `((#pin 66) ((((((Elim id) id) id) ((#pin 66) (...))) ...) ...))`
+  (inline BPLAN-66 Elim invocations inside z and m slots).
+* ACT: `collect_record_types_go_m` (arity 3) — body uses `_3` as the
+  z slot (a captured slot reference) instead of an inline dispatch.
+
+The `_m` law's body comes from `cg_build_m_body`'s Cons case
+(Compiler.gls L5053-5107), which calls `cg_build_nat_dispatch` with a
+lifted `pred_env`.  REF and ACT diverge in the resulting law's arity
+(4 vs 3 — ACT is missing one capture).  Same shape as Task F's bug
+but in a different code path; the candidate root causes are:
+
+1. **Free-var analysis in `cg_build_m_body`** (Compiler.gls L5066)
+   uses `cg_free_vars_bodies all_bodies Nil env`.  Python's
+   `_compile_adt_dispatch` (codegen.py L2476-2491) uses `_collect_free`
+   over remaining_nullary bodies + wild_body with `bound_set =
+   {wild_var_con}`.  Self-host passes `Nil` (empty) — possibly losing
+   the `wild_var_con` filter.  But for the typical `| _ → body` case,
+   `wild_var_con` is None, so this should match.
+2. **`cg_free_vars_bodies` over-strips or under-collects.**  Worth a
+   focused probe: build a minimal fixture with a nested match inside
+   an SCC member's wild arm whose body has tag>0 nullary arms,
+   forcing the m-body path.
+3. **`cg_drop_shared` missing here too.**  Less likely since the
+   arity is *smaller* in ACT, not larger — but possible if some other
+   helper is over-stripping.
+
+### Recommended task order
+
+#### Task I — Diagnose the `_m` capture mismatch (start here)
+
+Write a minimal fixture mirroring `collect_record_types_go`'s shape:
+a nested match where the outer wild arm contains a *multi-arm*
+nullary match (forcing the m-body's recursive nat dispatch).  Inside
+an SCC member with a PMutual reference in the bodies.  Iterate at
+~30s/cycle via `tools/selfcompile.py` (or `python3 -m pytest
+tests/reaver/test_selfhost.py -q` if the fixture is added to the
+suite — that's ~1s/cycle).
+
+Then diff REF vs ACT bytes around the divergence to identify which
+specific capture is missing, instrument the bootstrap's
+`_compile_adt_dispatch` free-var collection, and compare against the
+self-host's `cg_build_m_body` free-vars output.
+
+#### Task J — Fix the `_m` capture
+
+Likely a small adjustment to `cg_build_m_body`'s free-var bound set or
+collection mode, depending on what Task I reveals.  May parallel the
+`cg_drop_shared` shape (an extra filter at the right callsite) or
+require routing through a different walker.
+
+#### Task K — Subsequent divergences
+
+Re-run compile-self after Task J.  Expect more local divergences;
+each iteration moves the gate forward.  At ~45% byte-identical with
+two relatively small local fixes per session, the remaining ~55%
+likely requires 3–5 more sessions of similar shape (or one big
+session if the m-body refactor surfaces a broader pattern).
+
+#### Holdover (small, low priority — unchanged)
+
+* **Dwarf #4** — ambiguity check in short-tail fallbacks.
+* **Hobbit cuts** — helper-inlining suggestions.
+* **Compile-self test fixture.**  Once byte-identical, add
+  `TestPhaseHFixedPoint::test_compile_self` gated by env-var.
+
+### What changed this session (commits, oldest → newest)
+
+```
+39d741a feat(self-host): wild_app_handler for nullary-only + wild matches (Phase H)
+f10457b fix(self-host): drop __shared__ from App-handler captures (Phase H)
+```
+
+Selfhost suite: **26 passing + 1 xfailed** (was 24+1 at session
+start).  Two new byte-identity fixtures:
+
+* `test_mutual_recursion_app_handler_no_extra_shared` —
+  `(foo, bar)` mutual SCC where each body contains an outer
+  `match n { 0 → … | _ → match (Circle n) { … bar x | … bar … } }`,
+  pinning the `cg_drop_shared` filter at the inner App-handler.
+* `test_match_nullary_arm_plus_wild_on_field_type` —
+  `match m { | None → 0 | _ → 1 }` on a type with field siblings,
+  pinning `cg_build_wild_app_handler` and the
+  `cg_compile_con_match` routing change.
+
+No regressions in `tests/bootstrap/`, `tests/compiler/`,
+`tests/prelude/`, or `tests/reaver/`.
+
+### Key files (updated)
+
+* `compiler/src/Compiler.gls`:
+  - L4160-4185 — `cg_drop_shared` helper (Task F).
+  - L4540-4548 — `cg_build_app_handler` call site applying
+    `cg_drop_shared` (Task F).
+  - L5454-5552 — `cg_build_wild_app_handler` (Task H).
+  - L5574-5601 — `cg_compile_con_match`'s no-field-arms branch with
+    the wild-routing fork (Task H).
+  - L5053-5107 — `cg_build_m_body` Cons case (Task I/J target).
+* `bootstrap/codegen.py`:
+  - L2380-2386 — `_compile_con_match`'s type-has-field-sibling
+    decision (the reference for Task H).
+  - L2546-2600 — `_build_wild_app_handler` (the reference for
+    `cg_build_wild_app_handler`).
+  - L2602-2873 — `_build_field_arm_law` (the reference for the
+    `_collect_all_names` capture pattern Task F mirrors).
+  - L2476-2491 — `_compile_adt_dispatch` free-var collection (the
+    reference for Task I's analysis).
+
+### Repro recipes (unchanged shape)
+
+```bash
+# Fastest cycle — selfhost byte-identity fixtures (~13s):
+python3 -m pytest tests/reaver/test_selfhost.py -q
+
+# Probe arbitrary source (≈30s for tiny inputs):
+python3 tools/selfcompile.py /path/to/source.gls
+
+# Full compile-self gate (~15-20 min under Reaver, no jets):
+timeout 1500 python3 tools/selfcompile.py compiler/src/Compiler.gls \
+  --timeout 1200 --write-actual /tmp/cs.actual.txt 2>/tmp/cs.diff.txt
+cat /tmp/cs.diff.txt
+```
+
+To find which binding contains a given divergence byte:
+
+```bash
+python3 -c "
+import sys, re
+sys.setrecursionlimit(200000)
+from bootstrap.lexer import lex
+from bootstrap.parser import parse
+from bootstrap.scope import resolve
+from bootstrap.codegen import compile_program
+from bootstrap.emit_pla import emit_program
+src = open('compiler/src/Compiler.gls').read()
+prog = parse(lex(src, '<>'), '<>')
+resolved, _ = resolve(prog, 'Compiler', {}, '<>')
+compiled = compile_program(resolved, 'Compiler')
+out = emit_program(compiled)
+binds = [(m.start(), m.group(1)) for m in re.finditer(r'\(#bind (\w+) ', out)]
+TARGET = 550551  # current divergence byte
+for i, (start, name) in enumerate(binds):
+    if start <= TARGET and (i+1 == len(binds) or binds[i+1][0] > TARGET):
+        print(f'Byte {TARGET} is in {name}, offset {TARGET-start}')
+        break
+"
+```
+
+To decode a law-name nat (when output shows `(#law "<digits>" …)`):
+
+```bash
+python3 -c "
+n = 686544152743455736226259189713342032850143369973557051027299  # ← replace
+out=[]
+while n>0: out.append(n & 0xFF); n>>=8
+print(bytes(out))
+"
+```
+
+---
+
+## Work plan for prior session (2026-05-15)
+
+**Session anchor (end of 2026-05-14 / very early 2026-05-15):**
+compile-self diverges at byte **306230** of 1218740 (~25%), inside
+`Compiler_parse_expr` at offset 12190 — well past the byte 293921
+structural wall.  The wall is gone: Tarjan SCC analysis, shared-pin
+encoding, lambda-lifted member laws, and external wrappers all
+landed and are byte-identical to the bootstrap for the
+`is_even`/`is_odd` two-member fixture.  The new divergence is a
+local capture-counting bug deep inside the parse_expr 5-member SCC,
+not a structural problem.
+
+### What changed this session (commits, oldest → newest)
+
+```
+d5020c8 feat(self-host): dep-graph builder for SCC analysis (Phase H Task A1)
+2b074f4 feat(self-host): Tarjan SCC over dep graph (Phase H Task A2)
+208fc91 feat(self-host): shared-pin SCC encoding (Phase H Task A3-A7)
+9dc2baa test(selfhost): mutual-recursion is_even/is_odd byte-identity fixture
+```
+
+Plus this handoff doc update.
+
+Net: **+664 lines** in `compiler/src/Compiler.gls` (dep-graph builder,
+Tarjan SCC, selector-law / member-law / wrapper / scc-orchestrator
+helpers, `PMutual` PlanVal variant, `cg_var_from_env` PMutual
+interception, `cg_cf_dispatch` implicit-`__shared__` capture rule,
+and `cg_pass3` rewrite to route through SCC dispatch).
+
+Selfhost suite: **24 passing + 1 xfailed** (was 23+1 at session
+start — added `test_mutual_recursion_two_member_scc`).  No
+regressions in `tests/bootstrap/test_codegen.py`,
+`test_coverage_gaps.py`, or `test_programs.py`.
+
+### The wall is gone, but a new local bug emerged at byte 306230
+
+The diverging law is a deeply-nested lifted sub-law named
+`_0_wild_pred_inner` (LE-decoded from law nat `99653159036490844…`)
+inside `Compiler_parse_expr`.  It has one EXTRA captured argument
+in the self-host output:
+
+| Position                 | Reference                 | Actual (self-host)       |
+| ------------------------ | ------------------------- | ------------------------ |
+| `_0_wild_pred_app` sig   | `(_0 _1 _2 _3)` (arity 3) | `(_0 _1 _2 _3 _4)` (a 4) |
+| `_0_wild_pred_inner` sig | `(_0 _1 _2 _3 _4)` (a 4)  | `(_0 _1 _2 _3 _4 _5)` (5)|
+
+That's one extra slot in a chain of nested lifts.  The cascade
+suggests one root cause adds a spurious capture somewhere and
+downstream lifts inherit it via free-var propagation.
+
+**Strongest hypothesis:** the `__shared__` implicit-capture rule
+I added to `cg_cf_dispatch`'s EVar arm (commit 208fc91, mirrors
+`bootstrap/codegen.py::_collect_free` L1640-1646) is firing in a
+deeper-nested context where Python's version doesn't fire.
+Possible sub-cases to investigate:
+
+1. **Bound check semantics.**  Python checks `'__shared__' not in
+   bound`.  My check uses `cg_name_in_list` against the `bound`
+   parameter.  If a nested let or lambda has a param accidentally
+   named `nn___shared__` (LE-encoded), we'd over-add.  In practice
+   no user code does this, but a synthetic `__shared__` parameter
+   from a *different* SCC orchestration might collide.
+
+2. **MutualRef leakage across SCCs.**  `cg_register_mutual_refs`
+   adds PMutuals to env.globals.  After `cg_compile_mutual_law`
+   returns, the local env is dropped — but if any intermediate
+   lift's lifted_env was constructed by copying globals into a
+   long-lived structure (the `g = cenv_globals env` capture at
+   `cg_compile_lam_lifted` L5573 or similar), the PMutuals could
+   leak into a *subsequent* law's compilation.  Worth tracing
+   whether env.globals for a non-SCC top-level let contains any
+   PMutuals.
+
+3. **Outer-vs-lifted env analysis difference.**  Python's
+   `_free_vars` is called once per lift on the OUTER env.  Mine
+   uses the same convention via `cg_free_vars`.  But maybe my
+   `cg_compile_lam_lifted` or `cg_make_pred_succ_law` analysis env
+   differs subtly — e.g., if `cenv_locals` ordering differs by
+   one entry, the filtered list would change.
+
+### Recommended task order
+
+#### Task D — Minimal repro for the extra-capture bug (start here)
+
+Write a *small* mutual-rec fixture that triggers the same shape as
+parse_expr's `_0_wild_pred_inner`.  Goal: a fixture that's currently
+diverging by exactly one capture, so we can iterate at ~30s/cycle.
+
+Promising shape: 2–3 mutually-recursive functions whose bodies have
+a `match` with a wildcard arm whose body itself contains a nested
+`let` or another `match`.  This nests the wild-pred lift two levels
+deep, triggering the same cascade.
+
+Run via `tools/selfcompile.py /tmp/probe.gls` and compare bytes.
+The bootstrap reference is fast (<1s); Reaver part is ~30s.
+
+#### Task E — Diagnose the extra capture
+
+Once Task D's repro is in hand, two complementary probes:
+
+1. **Instrument the Python bootstrap** to print free_vars at each
+   lift site.  Diff against the self-host's emitted captures
+   (visible as the arity bump in lifted-law sigs).  Identify
+   exactly which lift produces the extra capture.
+
+2. **Inline the PMutual check minus the __shared__ branch.**  As a
+   bisection probe: temporarily make `cg_cf_dispatch`'s EVar arm
+   skip the `__shared__` addition.  This will break is_even/is_odd
+   byte identity (the existing fixture will fail), but it'll
+   reveal whether the extra capture comes from the new check or
+   from somewhere else entirely.  Restore after diagnosis.
+
+#### Task F — Fix the extra capture
+
+Almost certainly a one-line tweak once Task E nails the cause.
+Candidate fixes (depending on what E reveals):
+
+* Add a guard so the `__shared__` check only fires when the outer
+  env's `__shared__` slot is exactly slot 1 (the SCC member law's
+  body root).  Skip in deeper lifts.
+
+* Mirror Python's `env.globals.get(fq) or env.globals.get(short)`
+  fallback exactly — my version only checks FQ via
+  `cenv_global_lookup`, which might catch DIFFERENT entries than
+  Python's two-step lookup.
+
+* Wire `cg_global_lookup_by_short` (already exists) into the
+  cg_cf_dispatch check so both FQ and short are tried.
+
+#### Task G — Document and continue past byte 306230
+
+Once Task F lands, re-run compile-self.  Likely several more
+local divergences before the gate fully passes.  Each iteration
+~20 min under Reaver (no jets); cache the bootstrap-compiled
+Compiler.plan to avoid repeating the slow part.
+
+#### Holdover (small, low priority)
+
+* **Dwarf #4** — ambiguity check in short-tail fallbacks.
+  Unchanged from prior session.
+* **Hobbit cuts** — helper-inlining suggestions.  Unchanged.
+* **Compile-self test fixture.**  Once byte-identical, add
+  `TestPhaseHFixedPoint::test_compile_self` gated by env-var.
+
+### Repro recipes (unchanged shape)
+
+```bash
+# Fastest cycle — selfhost byte-identity fixtures (~12s):
+python3 -m pytest tests/reaver/test_selfhost.py -q
+
+# is_even/is_odd target fixture:
+python3 -m pytest tests/reaver/test_selfhost.py::TestPhaseG3ByteIdentity::test_mutual_recursion_two_member_scc -v
+
+# Probe arbitrary source (≈30s for tiny inputs; the Compiler.gls
+# bootstrap-compile happens each run):
+python3 tools/selfcompile.py /path/to/source.gls
+
+# Full compile-self gate (~15-20 min under Reaver, no jets):
+timeout 1500 python3 tools/selfcompile.py compiler/src/Compiler.gls \
+  --timeout 1200 --write-actual /tmp/cs.actual.txt 2>/tmp/cs.diff.txt
+cat /tmp/cs.diff.txt
+```
+
+To find which binding contains a given divergence byte (e.g. 306230):
+
+```bash
+python3 -c "
+import sys, re
+sys.setrecursionlimit(200000)
+from bootstrap.lexer import lex
+from bootstrap.parser import parse
+from bootstrap.scope import resolve
+from bootstrap.codegen import compile_program
+from bootstrap.emit_pla import emit_program
+src = open('compiler/src/Compiler.gls').read()
+prog = parse(lex(src, '<>'), '<>')
+resolved, _ = resolve(prog, 'Compiler', {}, '<>')
+compiled = compile_program(resolved, 'Compiler')
+out = emit_program(compiled)
+binds = [(m.start(), m.group(1)) for m in re.finditer(r'\(#bind (\w+) ', out)]
+TARGET = 306230  # current divergence byte
+for i, (start, name) in enumerate(binds):
+    if start <= TARGET and (i+1 == len(binds) or binds[i+1][0] > TARGET):
+        print(f'Byte {TARGET} is in {name}, offset {TARGET-start}')
+        break
+"
+```
+
+### Key files (current)
+
+- `compiler/src/Compiler.gls`:
+  - L3389-3398 — `nn_top_of_law` and `nn___shared__` constants.
+    `nn___shared__` MUST be declared early (before `cg_cf_dispatch`)
+    because it's used in the implicit-capture rule.
+  - L4060-4108 — `cg_cf_dispatch` EVar arm with `__shared__`
+    implicit capture.  THIS IS THE SUSPECTED SOURCE of the
+    over-capture; see Task E.
+  - L5680-5720 — `planval_is_mutual`, `planval_get_mutual_idx`,
+    `cg_mutual_ref_bapp` (must precede `cg_var_from_env`).
+  - L5731-5763 — `cg_var_from_env` with PMutual interception.
+  - L7106-7415 — SCC emit pipeline.  Six layers in order:
+    * dep graph (`cg_build_dep_graph`)
+    * Tarjan (`cg_tarjan_scc` and supporting `TState` record)
+    * selector law (`cg_build_selector_law`)
+    * shared row (`cg_build_shared_row`)
+    * external wrapper (`cg_build_mutual_wrapper`)
+    * member law (`cg_compile_mutual_law`)
+    * orchestrator (`cg_compile_mutual_scc`)
+  - L7416-7560 — new `cg_pass3` + `cg_pass3_go` + dep-graph
+    plumbing (`cg_fq_to_scc_members`, `cg_lookup_member_bodies`,
+    `cg_scc_rep`).
+
+- `tests/reaver/test_selfhost.py::test_mutual_recursion_two_member_scc`
+  — pins the byte-identity gain from this session.
+
+- `bootstrap/codegen.py`:
+  - L350-405 — `compile_program`'s SCC dispatch.
+  - L1640-1646 — the `__shared__` implicit-capture rule that
+    mirrors my `cg_cf_dispatch` change.  Cross-check carefully
+    during Task E.
+  - L3750-3942 — dep graph, Tarjan, mutual law/wrapper/scc.
