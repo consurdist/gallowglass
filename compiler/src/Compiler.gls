@@ -464,6 +464,7 @@ type Token =
   | TkBar
   | TkArrow
   | TkBackArrow
+  | TkFatArrow
   | TkEqual
   | TkColon
   | TkDot
@@ -669,6 +670,7 @@ let kw_lambda_uni   : Nat = 0xBBCE             -- "λ"  (CE BB)
 let kw_arrow_uni    : Nat = 0x9286E2           -- "→"  (E2 86 92)
 let kw_backarrow_uni: Nat = 0x9086E2           -- "←"  (E2 86 90)
 let kw_forall_uni   : Nat = 0x8088E2           -- "∀"  (E2 88 80)
+let kw_fatarrow_uni : Nat = 0x9287E2           -- "⇒"  (E2 87 92)
 let kw_underscore   : Nat = 0x5F               -- "_"
 let kw_fix          : Nat = 0x786966           -- "fix"
 let kw_class        : Nat = 0x7373616c63       -- "class"
@@ -1183,7 +1185,11 @@ let lex_one : Pair Nat Nat → LexPos → Pair Token LexPos
                                                                                                             match (Reaver.BPLAN.eq seq kw_backarrow_uni) {
                                                                                                               | 0 →
                                                                                                                   match (Reaver.BPLAN.eq seq kw_forall_uni) {
-                                                                                                                    | 0 → MkPair (TkErr b) pos3
+                                                                                                                    | 0 →
+                                                                                                                        match (Reaver.BPLAN.eq seq kw_fatarrow_uni) {
+                                                                                                                          | 0 → MkPair (TkErr b) pos3
+                                                                                                                          | k → MkPair TkFatArrow pos3
+                                                                                                                        }
                                                                                                                     | k → MkPair TkForall pos3
                                                                                                                   }
                                                                                                               | k → MkPair TkBackArrow pos3
@@ -1231,7 +1237,19 @@ let lex_one : Pair Nat Nat → LexPos → Pair Token LexPos
                                                                     | k → MkPair TkColonColon (lexpos_advance pos1)
                                                                   }
                                                             }
-                                                        | k → MkPair TkEqual pos1
+                                                        | k →
+                                                            -- '=': check for '=>' (FatArrow) before
+                                                            -- defaulting to bare TkEqual.  Without this,
+                                                            -- `Class a => …` in a type annotation lexes
+                                                            -- as TkEqual followed by a stray `>` byte,
+                                                            -- and `tok_skip_to_equal` stops on the `=`
+                                                            -- — discarding the constraint head and
+                                                            -- leaving the parser to consume gibberish
+                                                            -- as the let body.
+                                                            match (Reaver.BPLAN.eq (bytes_at src (lexpos_offset pos1)) 0x3E) {
+                                                              | 0 → MkPair TkEqual pos1
+                                                              | k → MkPair TkFatArrow (lexpos_advance pos1)
+                                                            }
                                                       }
                                                   | k → MkPair TkBar pos1
                                                 }
