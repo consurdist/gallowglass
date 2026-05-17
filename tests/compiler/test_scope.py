@@ -130,8 +130,13 @@ class ASTBuilder:
     def ArmCon(self, con, fields_list, body):
         return self._ev('ArmCon', con, self.MkPair(fields_list, body))
 
-    # Decl constructors
-    def DLet(self, n, body): return self._ev('DLet', n, body)
+    # Decl constructors.  DLet was extended in rc4-1 to carry a
+    # constraint class-name list, packed as Pair (List Nat) Expr;
+    # tests that don't care about constraints pass Nil.
+    def DLet(self, n, body, constraints=None):
+        if constraints is None:
+            constraints = self.Nil()
+        return self._ev('DLet', n, self.MkPair(constraints, body))
     def DType(self, n, cdefs): return self._ev('DType', n, cdefs)
     def DExt(self, mod, items): return self._ev('DExt', mod, items)
     def MkConDef(self, name, arity): return self._ev('MkConDef', name, arity)
