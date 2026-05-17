@@ -1,7 +1,7 @@
 # Gallowglass Roadmap
 
-**Last updated:** 2026-04-30
-**Current status:** v0.99999-beta released. Reaver migration complete (Phases 0/A/B+C/D/E/F merged via #47–#53). Self-host validation on Reaver (Phase G) is the next coherent arc. 1261 tests passing.
+**Last updated:** 2026-05-16
+**Current status:** v1.0.0-rc3 released. Phase H compile-self fixed point landed; Phase I shipped Python-less build path + 6/8 surface-coverage gaps closed. The two remaining gaps (typeclass constrained-let codegen, effect handler CPS alignment) have been promoted from 1.1.0 to 1.0 blockers and are the rc4 scope.
 
 This document is the delivery plan: what ships in what order and why. The *what* of each feature is in `SPEC.md` and the `spec/` documents. The *why* of ordering decisions is in `DECISIONS.md`.
 
@@ -643,22 +643,32 @@ All of the above complete. Acceptance criteria:
 - Full Gallowglass surface syntax (`spec/06-surface-syntax.md`) compiles correctly
 - Core prelude (`prelude/src/Core/`) fully implemented and split across modules
 - Effect handlers, typeclasses, and mutual recursion all working and self-hosted
+  (self-host produces byte-identical output to the Python bootstrap for every
+  single-file restricted-dialect program — see rc4 blockers below for the
+  remaining gaps that prevent this today)
 - The `Data.Csv` example from `spec/06-surface-syntax.md §15` compiles and runs
 - Prelude published as pinned DAG; user programs reference pins, not inlined defs (M16)
 - Glass IR emission for prelude with round-trip verification (M17)
 - CI passes: Python harness + planvm seed loading + M8.8 Path A equivalent for 1.0 compiler
 
----
+**Scope caveat for "self-hosted":** multi-file compilation via ``use`` / ``import``
+remains a Python-bootstrap-only capability by design — the self-host is
+intentionally single-file (see `compiler/COMPILER.md §5 "Architectural
+Decision: Single-File Compiler"`).  The prelude build (8 modules with
+cross-module references) will continue to use the Python bootstrap. "Self-
+hosted" in the criteria above is satisfied when the self-host handles every
+*single-file* restricted-dialect program byte-identically.
 
-## 1.1.0 — Self-host coverage parity (Phase I follow-up)
+### rc4 blockers (promoted from 1.1.0)
 
-**Status:** scheduled.  Rolls forward the two self-host codegen gaps
-that Phase I (v1.0.0-rc3) mapped but didn't close — both are byte-
-identity gaps where the Python bootstrap already compiles the feature
-correctly, so 1.0 ships with them documented as known limitations
-and 1.1.0 lands the self-host parity.
+Two self-host codegen gaps remain after rc3.  Both are byte-identity gaps
+where the Python bootstrap already compiles the feature correctly; the self-
+host's output diverges and so `tests/reaver/test_selfhost.py` carries the
+two as xfails.  rc3 originally deferred these to 1.1.0; for rc4 they have
+been promoted to 1.0 blockers so the "and self-hosted" qualifier on the
+typeclass/effect criterion can be honestly claimed.
 
-### 1.1.0-1 — Typeclass constrained-let codegen
+#### rc4-1 — Typeclass constrained-let codegen
 
 Close `test_typeclass_simple` in `tests/reaver/test_selfhost.py`.
 
@@ -682,15 +692,13 @@ What's missing — three coupled pieces (reference:
   `_compile_constrained_app` inserts the instance dict as the first
   arg: `same inst_Eq_Nat 7 7`.
 
-Estimate: **3-5 days** of focused work.
-
-### 1.1.0-2 — Effect handler CPS alignment
+#### rc4-2 — Effect handler CPS alignment
 
 Close `test_do_notation_simple` in `tests/reaver/test_selfhost.py`.
 
 What's already there in `Compiler.gls`:
-* `cg_compile_handle` (L6636) and `cg_compile_do` (L6691) — wired up
-  and produce non-trivial CPS output (not the `0` fallback).
+* `cg_compile_handle` and `cg_compile_do` — wired up and produce non-
+  trivial CPS output (not the `0` fallback).
 
 What's wrong — three observable byte-level divergences from Python's
 `_compile_handle` / `_compile_do`:
@@ -704,29 +712,6 @@ What's wrong — three observable byte-level divergences from Python's
 * **Mis-numbering of let-binding slots inside lifted continuations.**
   The `_5((_2 _3))` shapes in the output show let-bindings allocating
   slots that don't quite line up with Python's numbering.
-
-Estimate: **3-5 days** of careful byte-level alignment.
-
-### Why these are 1.1.0 and not 1.0
-
-Neither gap is a *blocker* for 1.0.  The Python bootstrap can still
-compile any user code using typeclasses or effects; the byte-identity
-gap only matters when the self-host needs to produce that output as
-part of compiling user programs from a Python-less build path.
-Since rc3 ships with the bootstrap fallback intact, users can still
-use these features today.  1.1.0 promotes the self-host to handle
-them too, completing the "self-host can fully replace the Python
-bootstrap for single-file restricted-dialect programs" arc.
-
-**Scope caveat:** multi-file compilation via ``use`` / ``import``
-remains a Python-bootstrap-only capability by design — the self-host
-is intentionally single-file (see `compiler/COMPILER.md §5
-"Architectural Decision: Single-File Compiler"`).  The prelude build
-(8 modules with cross-module references) will continue to use the
-Python bootstrap for the foreseeable future.  Closing the two 1.1.0
-gaps means the self-host handles every *single-file* restricted-
-dialect program byte-identically; it does not, and is not intended
-to, replace the Python bootstrap for multi-module builds.
 
 ---
 
