@@ -117,14 +117,53 @@ Three coupled changes to `compiler/src/Compiler.gls`:
 
 ## rc4-2 — Effect handler CPS alignment
 
-**Gate test:** `tests/reaver/test_selfhost.py::test_do_notation_simple`
-(currently xfail; flip to pass).
+**Status:** not started.  Pickup notes for a fresh continuation below.
+
+### Fresh-continuation handoff
+
+1. **Reproduce the byte-diff loop** that worked for rc4-1.  Local
+   Reaver is pre-built (no nix needed), so:
+   ```
+   cat > /tmp/effect_fixture.gls <<'EOF'
+   eff Counter {
+     inc : Nat → Nat
+   }
+   let comp : Nat = xx ← inc 1 in inc xx
+   let result : Nat = handle comp {
+     | return rr → rr
+     | inc _ kk → kk 7
+   }
+   let main = result
+   EOF
+   python3 tools/selfcompile.py -v /tmp/effect_fixture.gls
+   ```
+   Each iteration is ~1 second.  The Python reference is also a
+   single-line away via the same script.
+2. **Reference code:** `bootstrap/codegen.py::_compile_handle` and
+   `_compile_do` (post-M13.3 open-continuation protocol; the GLS
+   side got the protocol port in M13.4 but didn't reach byte-
+   identity).  Self-host equivalents:
+   * `cg_compile_handle` (search for `let cg_compile_handle\b`)
+   * `cg_compile_do`
+   * `cg_compile_dispatch_fn`, `cg_compile_return_fn`,
+     `cg_build_handle_dispatch`
+   * `cg_register_eff_ops`, `cg_register_effs`
+3. **Watch for the bootstrap-codegen pitfalls** documented in
+   `CLAUDE.md §"Bootstrap Codegen Pitfalls"`.  rc4-1 was bitten
+   twice (binary-single-arm match dispatch in `cg_collect_app_args_go`
+   — workaround: use predicate-based form via `cg_expr_is_app` /
+   `cg_app_fun` / `cg_app_arg`).  Forward references also bit
+   twice (helpers must be defined before callers — use local
+   mirrors like `cg_concat_dot_app`, or move definitions earlier).
+4. **`fn` is reserved as the ASCII alias for `λ`** — don't name a
+   parameter `fn` (the lexer re-lexes it as a second `λ` token
+   producing a confusing parse error).  Use `fv` or `f`.
+
+### Three known divergences from Python's emit, per rc3 investigation
 
 **Reference:** `bootstrap/codegen.py::_compile_handle` and
 `_compile_do` (post-M13.3 open-continuation protocol; the GLS side
 got the protocol port in M13.4 but didn't reach byte-identity).
-
-Three known divergences from Python's emit, per rc3 investigation:
 
 1. **Extra captured-slot indirections in the dispatch chain.**
    Self-host's lifted continuation laws have one or two extra slots
