@@ -895,6 +895,241 @@ class TestPhaseG3ByteIdentity(unittest.TestCase):
         )
         self._assert_byte_identical(src)
 
+    # ------------------------------------------------------------------
+    # Phase I — language-coverage parity for 1.0.0-rc3.  Each fixture
+    # below exercises a feature that the bootstrap supports but that
+    # ``Compiler.gls`` itself does not use directly (so Phase H's
+    # compile-self gate doesn't pin them).  A passing fixture proves
+    # the self-host's codegen for that feature is byte-identical to
+    # the bootstrap; an ``xfail`` flags a known gap.
+    # ------------------------------------------------------------------
+
+    def test_fix_lambda_anonymous_recursion(self):
+        """``fix λ self n → …`` — anonymous recursion via fix.
+
+        Pins ``cg_compile_fix`` in the self-host: the fix expression
+        binds the lambda's first param to the law's own self-pin so
+        the body can recurse without a top-level name.
+        """
+        src = (
+            'external mod Reaver.BPLAN {\n'
+            '  sub : Nat → Nat → Nat\n'
+            '}\n'
+            'let countdown : Nat → Nat\n'
+            '  = fix λ self n → match n {\n'
+            '      | 0 → 999\n'
+            '      | _ → self (Reaver.BPLAN.sub n 1)\n'
+            '    }\n'
+            'let main = countdown 5\n'
+        )
+        self._assert_byte_identical(src)
+
+    def test_or_pattern_constructor(self):
+        """``match c { | Red | Green → 1 | _ → 0 }`` — or-pattern
+        across two nullary constructors of the same type.
+
+        Pins the ctab ``has_field_sib`` flag (Phase I rc3-3):
+        ``cg_compile_con_match``'s no-field-arms + wild branch routes
+        through ``cg_build_nat_dispatch`` (App branch = id_pin) for
+        pure-nullary types, matching Python's ``_build_nat_dispatch``
+        path.  Previously self-host unconditionally lifted a
+        ``wild_app_handler``, diverging from the bootstrap whenever a
+        pure-nullary type was matched with a wild.
+        """
+        src = (
+            'type Color = | Red | Green | Blue\n'
+            'let is_warm : Color → Nat\n'
+            '  = λ c → match c {\n'
+            '      | Red | Green → 1\n'
+            '      | _ → 0\n'
+            '    }\n'
+            'let main = is_warm Red\n'
+        )
+        self._assert_byte_identical(src)
+
+    def test_or_pattern_nat(self):
+        """``match n { | 0 | 1 → 0 | _ → 1 }`` — or-pattern across
+        two Nat literals.  Pins the Nat-or-pattern handling in
+        ``parse_match_arm_pe`` (Phase I rc3-3): when the Nat arm is
+        followed by ``|`` instead of ``→``, recurse to collect the
+        alternatives and synthesise a shared body, mirroring
+        ``arm_con_upper_pe`` for constructor or-patterns."""
+        src = (
+            'let classify : Nat → Nat\n'
+            '  = λ n → match n {\n'
+            '      | 0 | 1 → 0\n'
+            '      | _ → 1\n'
+            '    }\n'
+            'let main = classify 0\n'
+        )
+        self._assert_byte_identical(src)
+
+    def test_list_literal_empty(self):
+        """``[]`` desugars to ``Nil``."""
+        src = (
+            'type List a = | Nil | Cons a (List a)\n'
+            'let xs : List Nat = []\n'
+            'let main = xs\n'
+        )
+        self._assert_byte_identical(src)
+
+    def test_list_literal_three(self):
+        """``[1, 2, 3]`` desugars to ``Cons 1 (Cons 2 (Cons 3 Nil))``.
+        Pins the top-level App inlining fix in ``cg_resolve_global_val``
+        (Phase I rc3-3): a top-level ``let main = xs`` whose RHS is an
+        App-valued global emits the structural App inlined, matching
+        Python's emit-side behaviour where ``_bind_skip_id`` suppresses
+        bind-symbol dedup for the value currently being emitted."""
+        src = (
+            'type List a = | Nil | Cons a (List a)\n'
+            'let xs : List Nat = [1, 2, 3]\n'
+            'let main = xs\n'
+        )
+        self._assert_byte_identical(src)
+
+    def test_list_cons_pattern(self):
+        """``match xs { | [] → 0 | h :: t → h }`` — list patterns
+        with the cons operator."""
+        src = (
+            'type List a = | Nil | Cons a (List a)\n'
+            'let head_or_zero : List Nat → Nat\n'
+            '  = λ xs → match xs {\n'
+            '      | [] → 0\n'
+            '      | h :: t → h\n'
+            '    }\n'
+            'let main = head_or_zero [42]\n'
+        )
+        self._assert_byte_identical(src)
+
+    def test_guard_pattern(self):
+        """``match n { | x if guard → 1 | _ → 0 }`` — guarded match arm.
+        Bootstrap M15.5 (per ``bootstrap/parser.py::_parse_match_arm``
+        L1109) uses the ``if`` keyword between pattern and guard.
+        Pins the self-host's existing guard desugar in
+        ``parse_match_expr_pe`` (binds ``__guard_scrut``, rewrites
+        each guarded arm into ``| pat → if guard then body else
+        match __guard_scrut { remaining }``)."""
+        src = (
+            'external mod Reaver.BPLAN {\n'
+            '  eq : Nat → Nat → Nat\n'
+            '}\n'
+            'let is_seven : Nat → Nat\n'
+            '  = λ n → match n {\n'
+            '      | x if Reaver.BPLAN.eq x 7 → 1\n'
+            '      | _ → 0\n'
+            '    }\n'
+            'let main = is_seven 7\n'
+        )
+        self._assert_byte_identical(src)
+
+    def test_record_construct(self):
+        """``type Pt = { x : Nat, y : Nat }; let p = { x = 1, y = 2 }`` —
+        record type and construction.  Bootstrap M15.1.
+
+        Pins two coupled fixes in Phase I rc3-3:
+        * ``parse_record_fields_go`` had its EOF check arms inverted,
+          so it returned (count=0, names=[]) immediately for any
+          non-EOF, non-``}`` token — every record-type declaration
+          silently produced a nullary constructor with arity 0.
+        * ``skip_record_field_type`` didn't actually advance past
+          the field's type tokens (it returned the token stream
+          unchanged for any non-comma, non-RBrace, non-EOF token).
+        Both are now fixed; records construct, project, and pattern
+        all work byte-identically with the bootstrap."""
+        src = (
+            'type Pt = { x : Nat, y : Nat }\n'
+            'let origin : Pt = { x = 0, y = 0 }\n'
+            'let main = origin\n'
+        )
+        self._assert_byte_identical(src)
+
+    def test_record_pattern(self):
+        """``match p { | { x = a, y = b } → add a b }`` — record
+        pattern.  Note: ``sum_xy { x = 3, y = 4 }`` parses as record
+        UPDATE on sum_xy, not function application — use a bound
+        intermediate to disambiguate."""
+        src = (
+            'external mod Reaver.BPLAN {\n'
+            '  add : Nat → Nat → Nat\n'
+            '}\n'
+            'type Pt = { x : Nat, y : Nat }\n'
+            'let sum_xy : Pt → Nat\n'
+            '  = λ p → match p {\n'
+            '      | { x = a, y = b } → Reaver.BPLAN.add a b\n'
+            '    }\n'
+            'let pt : Pt = { x = 3, y = 4 }\n'
+            'let main : Nat = sum_xy pt\n'
+        )
+        self._assert_byte_identical(src)
+
+    @unittest.expectedFailure
+    def test_typeclass_simple(self):
+        """``class Eq a {...}; instance Eq Nat {...}; let same : ∀ a.
+        Eq a => a → a → Nat = λ x y → eq x y`` — single-method
+        typeclass with a constrained let.  Bootstrap M11.
+
+        The constrained-let pattern is necessary for this fixture to
+        be meaningful: a bare top-level call like ``eq 7 7`` fails in
+        the Python bootstrap too (no dict to insert at the call
+        site), so it wouldn't isolate self-host behaviour.  The
+        constrained-let form bundles the dict-param and call-site
+        dispatch through Python's ``_compile_constrained_let`` and
+        ``_compile_constrained_app`` (codegen.py L1067 onward).
+
+        Self-host gap (the byte-identity divergence this fixture
+        pins): ``Compiler.gls`` does not yet have a
+        ``cg_compile_constrained_let`` mirror.  The constraint
+        ``Eq a =>`` is parsed but the arity adjustment + call-site
+        dict insertion + single-method dict shortcut emission are
+        missing.  See ``ROADMAP.md`` §1.1.0 for the closure plan
+        (estimated 3-5 days)."""
+        src = (
+            'external mod Reaver.BPLAN {\n'
+            '  eq : Nat → Nat → Nat\n'
+            '}\n'
+            'class MyEq a {\n'
+            '  myeq : a → a → Nat\n'
+            '}\n'
+            'let nat_eq_impl : Nat → Nat → Nat\n'
+            '  = λ x y → Reaver.BPLAN.eq x y\n'
+            'instance MyEq Nat {\n'
+            '  myeq = nat_eq_impl\n'
+            '}\n'
+            'let same : ∀ a. MyEq a => a → a → Nat\n'
+            '  = λ x y → myeq x y\n'
+            'let main : Nat = same 7 7\n'
+        )
+        self._assert_byte_identical(src)
+
+    @unittest.expectedFailure
+    def test_do_notation_simple(self):
+        """``xx ← inc () in inc xx`` — do-notation bind inside
+        ``handle``.  Bootstrap M10 (CPS transform for effect handlers).
+
+        Self-host's ``cg_compile_do`` and ``cg_compile_handle`` exist
+        and produce *something* (not just the `0` fallback), but the
+        emitted laws diverge from Python's CPS output in several
+        places: extra captured-slot indirections in the dispatch
+        chain, ``(#pin inc)`` rather than the named-effect-op symbol
+        for cross-references, and apparent mis-numbering of
+        let-binding slots inside lifted continuations.  Closing
+        requires aligning the self-host's CPS transform with
+        ``bootstrap/codegen.py::_compile_handle`` /
+        ``_compile_do`` byte-for-byte — estimated 3-5 days of focused
+        work.  Deferred to rc4."""
+        src = (
+            'eff Counter {\n'
+            '  inc : Nat → Nat\n'
+            '}\n'
+            'let comp : Nat = xx ← inc 1 in inc xx\n'
+            'let result : Nat = handle comp {\n'
+            '  | return rr → rr\n'
+            '  | inc _ kk → kk 7\n'
+            '}\n'
+            'let main = result\n'
+        )
+        self._assert_byte_identical(src)
+
     @unittest.expectedFailure
     def test_same_constructor_literal_field_collapses(self):
         """`match (MkPair 0 99) { | MkPair 0 _ -> 1 | MkPair n _ -> 2 }` —
@@ -944,6 +1179,10 @@ class TestPhaseHFixedPoint(unittest.TestCase):
         self-host; assert byte-identity to the Python bootstrap output
         of the same source.
         """
+        # Match the recursion limit used by `_compile_compiler_to_plan`
+        # — Compiler.gls's nested ADT dispatch trees exceed Python's
+        # default 1000-frame limit during emit.
+        sys.setrecursionlimit(max(sys.getrecursionlimit(), 50000))
         with open(COMPILER_GLS) as f:
             src = f.read()
 
