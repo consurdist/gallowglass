@@ -6303,8 +6303,20 @@ let cg_var_from_env : Nat → CEnv → PlanVal
                   -- PMutual sentinel (mutual-SCC member): emit the
                   -- shared-pin bapp pattern instead of tagging the
                   -- value.  See cg_compile_mutual_law for setup.
+                  -- PConstrained sentinel (constrained-let binding):
+                  -- unwrap to the underlying law before
+                  -- cg_resolve_global_val, so emit produces the bare
+                  -- ``Module_foo`` symbol just like an unconstrained
+                  -- global.  Constrained-call dispatch happens one
+                  -- layer up in cg_compile_app via the lookup that
+                  -- still sees PConstrained.
                   match (planval_is_mutual val) {
-                    | 0 → cg_resolve_global_val n val env
+                    | 0 →
+                        match (planval_is_constrained val) {
+                          | 0 → cg_resolve_global_val n val env
+                          | _ → cg_resolve_global_val n
+                                  (planval_get_constrained_underlying val) env
+                        }
                     | _ → cg_mutual_ref_bapp (planval_get_mutual_idx val) env
                   }
               | None →
@@ -6317,7 +6329,12 @@ let cg_var_from_env : Nat → CEnv → PlanVal
                         match pair {
                           | MkPair fq val →
                               match (planval_is_mutual val) {
-                                | 0 → cg_resolve_global_val fq val env
+                                | 0 →
+                                    match (planval_is_constrained val) {
+                                      | 0 → cg_resolve_global_val fq val env
+                                      | _ → cg_resolve_global_val fq
+                                              (planval_get_constrained_underlying val) env
+                                    }
                                 | _ → cg_mutual_ref_bapp
                                         (planval_get_mutual_idx val) env
                               }
@@ -6364,16 +6381,309 @@ let cg_compile_var : Expr → CEnv → List (Pair Nat (Pair Nat (Pair Nat Nat)))
 -- `bit_or_wild_pred_wild_pred_then_succ` for an if-expression buried
 -- inside an App, where Python's reference is just `_then_succ`.  Pass
 -- 0 (empty hint) to children for byte-identity.
+-- cg_concat_dot_app: local mirror of name_concat_dot (defined far
+-- below at line ~7216).  Same rationale as cg_concat_under (line
+-- ~4785): bootstrap SCC ordering doesn't permit forward references,
+-- and cg_compile_constrained_app needs to construct ``Module.foo``
+-- FQ names well before name_concat_dot's definition.
+let cg_concat_dot_app : Nat → Nat → Nat
+  = λ mod_name item_name →
+      let blen = nat_byte_len mod_name in
+      let dot = shift_left 0x2E (mul 8 blen) in
+      let item_shifted = shift_left item_name (mul 8 (add blen 1)) in
+      add (add mod_name dot) item_shifted
+
+-- "Nat" little-endian name nat: 'N' 'a' 't' = 0x4E 0x61 0x74.
+let nn_Nat : Nat = 0x74614E
+
+-- cg_app_root_name: walk an EApp chain's leftmost spine to find the
+-- root EVar's name nat.  Returns 0 if the root isn't an EVar (or the
+-- expression isn't an App).  Used by cg_compile_app to detect calls
+-- to constrained lets.
+let cg_app_root_name : Expr → Nat
+  = λ expr →
+      match expr {
+        | EApp f _ → cg_app_root_name f
+        | EVar n → n
+        | _ → 0
+      }
+
+-- cg_expr_is_app: 1 if EApp, 0 otherwise.  Uses single-arm + wildcard;
+-- relies on the post-Phase-H tag-check fix to discriminate.
+let cg_expr_is_app : Expr → Nat
+  = λ e → match e { | EApp _ _ → 1 | _ → 0 }
+
+-- cg_collect_app_args_go: walk an EApp chain, prepending each arg as
+-- we descend.  Because we visit the OUTERmost App first (which has
+-- the LAST arg), prepending into the accumulator yields the args in
+-- ORIGINAL (left-to-right) source order.  Uses cg_app_fun /
+-- cg_app_arg (already known to work) rather than a direct
+-- ``match expr { | EApp f a → … | _ → … }`` — the direct form looked
+-- like it ought to work but observably returned [] for the gate test;
+-- decomposing via the predicate + accessors threads the loop without
+-- relying on the binary-single-arm dispatch shape.
+let cg_collect_app_args_go : Expr → List Expr → List Expr
+  = λ expr acc →
+      match (nat_eq (cg_expr_is_app expr) 0) {
+        | 0 → cg_collect_app_args_go (cg_app_fun expr) (Cons (cg_app_arg expr) acc)
+        | _ → acc
+      }
+
+-- cg_collect_app_args: user args of an App chain, in source order.
+let cg_collect_app_args : Expr → List Expr
+  = λ expr → cg_collect_app_args_go expr Nil
+
+-- cg_lookup_global_or_short: look up a name in env.globals, falling
+-- back to the short-tail scan that cg_var_from_env uses for bare
+-- EVars.  Returns Some(fq, val) on hit, None on miss.
+let cg_lookup_global_or_short : Nat → CEnv → Option (Pair Nat PlanVal)
+  = λ n env →
+      match (cenv_global_lookup env n) {
+        | Some val → Some (MkPair n val)
+        | None → cg_global_lookup_by_short n (cenv_globals env)
+      }
+
+-- cg_infer_type_key: derive a type-key name nat from an expression
+-- for instance-dict resolution.  Currently supports Nat literals
+-- only (ENat → ``Nat``) — good enough for the rc4-1 gate test.
+-- EText literals could map to ``Text`` but the self-host's text
+-- encoding is different from Python's so that path is deferred.
+let cg_infer_type_key : Expr → Nat
+  = λ expr →
+      match expr {
+        | ENat _ → nn_Nat
+        | _ → 0
+      }
+
+-- cg_find_first_fq_for_val_go: scan env.globals (which is stored
+-- most-recent-first via prepending) and return the LAST match —
+-- equivalently, the FIRST source-order binding that has this value.
+-- ``Reaver.BPLAN.eq`` is structural equality, so an instance bound
+-- via the bare-EVar inlining shortcut (which stores the SAME
+-- PlanVal object as the impl it points at) matches the impl's
+-- binding.  Mirrors Python emit's ``bind_table`` which keeps the
+-- first id() to register.
+let cg_find_first_fq_for_val_go
+      : PlanVal → List (Pair Nat PlanVal) → Nat → Nat
+  = λ val kvs best →
+      match kvs {
+        | Nil → best
+        | Cons kv rest →
+            match kv {
+              | MkPair fq v →
+                  match (Reaver.BPLAN.eq v val) {
+                    | 0 → cg_find_first_fq_for_val_go val rest best
+                    | _ → cg_find_first_fq_for_val_go val rest fq
+                  }
+            }
+      }
+
+let cg_find_first_fq_for_val : PlanVal → List (Pair Nat PlanVal) → Nat
+  = λ val kvs → cg_find_first_fq_for_val_go val kvs 0
+
+-- cg_resolve_instance_dict: look up the instance dict for a given
+-- constraint class + first-arg type.  Tries the single-method
+-- shortcut name first (Module.inst_<Class>_<TypeKey>); on miss,
+-- falls back to the short-tail scan to find a cross-module
+-- equivalent.
+--
+-- Once a matching value is found, we re-scan globals for the
+-- FIRST source-order binding with the SAME value and tag with
+-- THAT FQ.  This matches Python emit's bind_table semantics
+-- (first id() to register wins), which picks
+-- ``Compiler_nat_eq_impl`` rather than ``Compiler_inst_MyEq_Nat``
+-- when the single-method shortcut is bound to the same object as
+-- the impl function.
+let cg_resolve_instance_dict
+      : Nat → Nat → Nat → CEnv → Option PlanVal
+  = λ mod_name class_name type_key env →
+      let inst_bare = cg_concat_under
+                        (cg_concat_under nn_inst class_name)
+                        type_key in
+      let inst_fq = cg_concat_dot_app mod_name inst_bare in
+      let lookup = match (cenv_global_lookup env inst_fq) {
+                     | Some val → Some (MkPair inst_fq val)
+                     | None → cg_global_lookup_by_short inst_bare
+                                (cenv_globals env)
+                   } in
+      match lookup {
+        | None → None
+        | Some pair →
+            match pair {
+              | MkPair _ val →
+                  let canon_fq = cg_find_first_fq_for_val val
+                                   (cenv_globals env) in
+                  match (Reaver.BPLAN.eq canon_fq 0) {
+                    | 0 → Some (cg_tag_global canon_fq val)
+                    | _ →
+                        -- Defensive: structural-eq scan returned 0
+                        -- (no match) even though the direct lookup
+                        -- hit.  Fall back to the lookup's own fq.
+                        match pair {
+                          | MkPair fq v → Some (cg_tag_global fq v)
+                        }
+                  }
+            }
+      }
+
+-- cg_apply_args: fold a list of compiled arg values onto a function
+-- value via cg_apply (which selects A-app vs bapp based on arity).
+-- ``fv`` not ``fn`` because ``fn`` is the ASCII alias for ``λ``
+-- (lexer keyword).
+let cg_apply_args : PlanVal → List PlanVal → Nat → PlanVal
+  = λ fv args arity →
+      match args {
+        | Nil → fv
+        | Cons a rest → cg_apply_args (cg_apply fv a arity) rest arity
+      }
+
+-- cg_compile_constrained_app: dispatched from cg_compile_app when the
+-- App-chain's root EVar resolves to a PConstrained value.
+--
+-- Walks the App chain to collect user args, then for each constraint
+-- class in PConstrained's constraint list inserts the resolved
+-- instance dict (looked up via cg_resolve_instance_dict) as a leading
+-- arg.  Finally applies the user args in source order.
+--
+-- Mirrors Python bootstrap's _compile_constrained_app
+-- (codegen.py L1354).  Single-method-class assumption: each
+-- constraint contributes exactly one dict arg.  Multi-method classes
+-- aren't supported in this path; their instance methods are stored
+-- as per-method bindings only and won't match the
+-- Module.inst_<Class>_<Type> shortcut shape that this function looks
+-- up.
+-- cg_resolve_dicts: for each constraint class name, look up the
+-- instance dict for the given type key.  Returns the resolved
+-- dict-val list in constraint order.
+let cg_resolve_dicts
+      : List Nat → Nat → Nat → CEnv → List PlanVal
+  = λ cons type_key mod_name env →
+      match cons {
+        | Nil → Nil
+        | Cons class_name rest →
+            let dict = match (cg_resolve_instance_dict mod_name class_name type_key env) {
+                         | None → PNat 0
+                         | Some v → v
+                       } in
+            Cons dict (cg_resolve_dicts rest type_key mod_name env)
+      }
+
+-- cg_compile_args: compile each user arg via the cg_compile_expr
+-- continuation.
+let cg_compile_args
+      : List Expr → CEnv
+      → List (Pair Nat (Pair Nat (Pair Nat Nat)))
+      → (Expr → CEnv → List (Pair Nat (Pair Nat (Pair Nat Nat))) → Nat → PlanVal)
+      → List PlanVal
+  = λ args env ctab ce →
+      match args {
+        | Nil → Nil
+        | Cons a rest →
+            Cons (ce a env ctab 0) (cg_compile_args rest env ctab ce)
+      }
+
+let cg_compile_constrained_app
+      : Expr → CEnv → List (Pair Nat (Pair Nat (Pair Nat Nat))) → Nat
+      → PlanVal → Nat
+      → (Expr → CEnv → List (Pair Nat (Pair Nat (Pair Nat Nat))) → Nat → PlanVal)
+      → PlanVal
+  = λ expr env ctab hint root_val mod_name ce →
+      let root_name = cg_app_root_name expr in
+      let args = cg_collect_app_args expr in
+      let cons = planval_get_constraints root_val in
+      let type_key = match args {
+                       | Nil → 0
+                       | Cons a _ → cg_infer_type_key a
+                     } in
+      -- Resolve the fn ref.  Use cg_compile_var on the root so we get
+      -- the same PNamed-tagging treatment as a normal global ref
+      -- (call-site needs to emit `Compiler_same`, not inline the law).
+      let fn_val = cg_compile_var (EVar root_name) env ctab 0 in
+      -- For each constraint class: resolve the instance dict and
+      -- accumulate as a dict-val list.  A missing dict yields PNat 0
+      -- and the call will be wrong — but we keep going so the diff
+      -- shows where the resolution failed rather than aborting.
+      let dict_vals = cg_resolve_dicts cons type_key mod_name env in
+      let user_vals = cg_compile_args args env ctab ce in
+      cg_apply_args (cg_apply_args fn_val dict_vals (cenv_arity env))
+                    user_vals (cenv_arity env)
+
+-- shift_right_inv_combined: drop the top ``strip`` bytes of ``fq``
+-- treating fq as a little-endian byte sequence.  Effectively
+-- ``fq mod 256^(fq_len - strip)`` — what's left after removing the
+-- trailing ``strip`` bytes.  Used by cg_module_from_fq.
+let shift_right_inv_combined : Nat → Nat → Nat
+  = λ fq strip →
+      let fq_len = nat_byte_len fq in
+      match (lte fq_len strip) {
+        | 0 →
+            let keep = sub fq_len strip in
+            mod_nat fq (Reaver.BPLAN.bex (mul 8 keep))
+        | _ → 0
+      }
+
+-- cg_module_from_fq: extract the module-name prefix from an
+-- (fq_name, val) pair.  The fq is ``Module.short`` little-endian;
+-- the module prefix is everything before the LAST ``.``.  Used at
+-- constrained-call sites to qualify ``inst_<Class>_<Type>`` lookups
+-- against the binding's home module.
+let cg_module_from_fq : Pair Nat PlanVal → Nat
+  = λ p →
+      match p {
+        | MkPair fq _ →
+            let short = cg_short_after_dot fq in
+            let strip = Core.PLAN.inc (nat_byte_len short) in
+            shift_right_inv_combined fq strip
+      }
+
 let cg_compile_app : Expr → CEnv → List (Pair Nat (Pair Nat (Pair Nat Nat))) → Nat → PlanVal
                    → (Expr → CEnv → List (Pair Nat (Pair Nat (Pair Nat Nat))) → Nat → PlanVal) → PlanVal
   = λ expr env ctab hint ce →
       match expr {
         | EApp f a →
-            let fv = ce f env ctab 0 in
-            let av = ce a env ctab 0 in
-            cg_apply fv av (cenv_arity env)
+            -- Constrained-let detection: walk to the App's root EVar
+            -- and check if its global value is PConstrained.  If so,
+            -- route to cg_compile_constrained_app which collects all
+            -- user args via its own chain unwrap and inserts the
+            -- resolved instance dicts ahead of them.
+            let root_name = cg_app_root_name expr in
+            match (Reaver.BPLAN.eq root_name 0) {
+              | 0 →
+                  match (cg_lookup_global_or_short root_name env) {
+                    | None →
+                        let fv = ce f env ctab 0 in
+                        let av = ce a env ctab 0 in
+                        cg_apply fv av (cenv_arity env)
+                    | Some fq_val_pair →
+                        match fq_val_pair {
+                          | MkPair _ val →
+                              match (planval_is_constrained val) {
+                                | 0 →
+                                    let fv = ce f env ctab 0 in
+                                    let av = ce a env ctab 0 in
+                                    cg_apply fv av (cenv_arity env)
+                                | _ →
+                                    -- The module name is encoded in
+                                    -- the looked-up fq prefix.  For
+                                    -- the resolve_instance_dict
+                                    -- lookup we use cenv_self's
+                                    -- module prefix as a proxy; for
+                                    -- top-level main this is None, so
+                                    -- we extract from the PConstrained
+                                    -- binding's fq instead.
+                                    let mod_name = cg_module_from_fq fq_val_pair in
+                                    cg_compile_constrained_app expr env ctab hint val mod_name ce
+                              }
+                        }
+                  }
+              | _ →
+                  let fv = ce f env ctab 0 in
+                  let av = ce a env ctab 0 in
+                  cg_apply fv av (cenv_arity env)
+            }
         | _ → PNat 0
       }
+
 
 -- cg_compile_enat: compile ENat
 let cg_compile_enat : Expr → CEnv → Nat → PlanVal
@@ -7359,8 +7669,102 @@ let cg_compile_let_one : Nat → Expr → Nat → CEnv → List (Pair Nat (Pair 
         | _ → MkPair env compiled
       }
 
--- cg_compile_inst_members: compile each method body in a DInst
-let cg_compile_inst_members
+-- cg_wrap_methods: wrap an Expr in nested ``λ m1 → λ m2 → … → body``
+-- given the method names ``[m1, m2, …]``.  Outermost lambda binds
+-- the first method in the list, matching Python's slot order (first
+-- dict param at slot 1).
+let cg_wrap_methods : List Nat → Expr → Expr
+  = λ methods body →
+      match methods {
+        | Nil → body
+        | Cons m rest → ELam m (cg_wrap_methods rest body)
+      }
+
+-- cg_wrap_constraint_lams: prepend constraint dict params as nested
+-- lambdas around the let's body.  For each class in ``cons`` order,
+-- looks up the class's method names from ``cls_methods`` and wraps
+-- with one lambda per method.  Outermost wrapping = first class's
+-- first method = dict-param slot 1.  Matches Python bootstrap's
+-- _compile_constrained_let (codegen.py L1067) flat-dict-passing
+-- shape — one slot per method per constraint.
+let cg_wrap_constraint_lams
+      : List Nat → List (Pair Nat (List Nat)) → Expr → Expr
+  = λ cons cls_methods body →
+      match cons {
+        | Nil → body
+        | Cons class_name rest →
+            let methods = match (assoc_lookup class_name cls_methods) {
+                            | None → Nil
+                            | Some ms → ms
+                          } in
+            cg_wrap_methods methods (cg_wrap_constraint_lams rest cls_methods body)
+      }
+
+-- cg_compile_constrained_let: compile a constrained let.
+-- Builds dict params by wrapping the body in extra lambdas (one per
+-- method per constraint), then compiles normally.  The resulting
+-- PLaw has arity = base + total_dict_count.  Wraps the val in
+-- PConstrained so cg_compile_app can detect call sites and insert
+-- dict args.
+--
+-- Mirrors Python bootstrap's _compile_constrained_let
+-- (codegen.py L1067) and _compile_let's constraint-branch
+-- (L1041 onward).
+let cg_compile_constrained_let
+      : Nat → List Nat → Expr → Nat → CEnv
+      → List (Pair Nat (Pair Nat (Pair Nat Nat)))
+      → List (Pair Nat (List Nat))
+      → List (Pair Nat PlanVal)
+      → Pair CEnv (List (Pair Nat PlanVal))
+  = λ name cons body mod_name env ctab cls_methods compiled →
+      match (Reaver.BPLAN.eq name 0) {
+        | 0 →
+            let fq_name = name_concat_dot mod_name name in
+            let fq_env = cenv_mark_top_of_law
+                           (cenv_set_self (cenv_set_arity env 0) (Some fq_name)) in
+            let wrapped = cg_wrap_constraint_lams cons cls_methods body in
+            let raw_val = cg_compile_expr wrapped fq_env ctab name in
+            let tagged = PConstrained cons raw_val in
+            let new_env = cenv_bind_global env fq_name tagged in
+            -- Bind the UNWRAPPED raw_val into `compiled` (the emit-time
+            -- bindings list) so emit produces just the law text.
+            -- PConstrained lives only in env.globals for call-site
+            -- detection; it must never reach emit.
+            MkPair new_env (Cons (MkPair fq_name raw_val) compiled)
+        | _ → MkPair env compiled
+      }
+
+-- cg_collect_class_methods_go: accumulator for cg_collect_class_methods.
+let cg_collect_class_methods_go
+      : List Decl → List (Pair Nat (List Nat)) → List (Pair Nat (List Nat))
+  = λ decls acc →
+      match decls {
+        | Nil → acc
+        | Cons d rest →
+            match (nat_eq (decl_is_class d) 0) {
+              | 0 →
+                  let class_name = decl_get_class_name d in
+                  let methods    = decl_get_class_methods d in
+                  cg_collect_class_methods_go rest
+                    (Cons (MkPair class_name methods) acc)
+              | _ → cg_collect_class_methods_go rest acc
+            }
+      }
+
+-- cg_collect_class_methods: bare class name → method names registry.
+-- Built from DClass decls.  Keyed by bare class name (not FQ) because
+-- constrained-let annotations reference classes by bare name (the
+-- parser doesn't qualify type-annotation tokens).  Constraints that
+-- name an unknown class get an empty method list — the resulting
+-- wrap is a no-op (dict-param count stays at 0) and the call site
+-- will fail to resolve the dict.
+let cg_collect_class_methods : List Decl → List (Pair Nat (List Nat))
+  = λ decls → cg_collect_class_methods_go decls Nil
+
+-- cg_compile_inst_members_go: compile each method body in a DInst.
+-- The outer wrapper (cg_compile_inst_members) also emits the single-
+-- method dict shortcut when the instance provides exactly one method.
+let cg_compile_inst_members_go
       : List (Pair Nat Expr) → Nat → Nat → CEnv → List (Pair Nat (Pair Nat (Pair Nat Nat))) → List (Pair Nat PlanVal)
       → Pair CEnv (List (Pair Nat PlanVal))
   = λ members inst_prefix mod_name env ctab compiled →
@@ -7389,8 +7793,49 @@ let cg_compile_inst_members
                               | _ → cg_compile_expr body fq_env ctab bare
                             } in
                   let new_env = cenv_bind_global env fq_name val in
-                  cg_compile_inst_members rest inst_prefix mod_name new_env ctab
+                  cg_compile_inst_members_go rest inst_prefix mod_name new_env ctab
                     (Cons (MkPair fq_name val) compiled)
+            }
+      }
+
+-- cg_compile_inst_members: wrapper that also emits the single-method
+-- dict shortcut (Module.inst_ClassName_TypeName = the one method's
+-- value).  Mirrors Python bootstrap's _compile_inst single-method
+-- branch (codegen.py L896-903).
+--
+-- Why this matters: at constrained-let call sites, the call-site dict
+-- insertion looks up the dict by Module.inst_<Class>_<Type>.  For
+-- single-method classes the dict IS the one method; emitting this
+-- shortcut lets call sites resolve to a single value rather than
+-- needing to build a method-dispatch record.
+--
+-- Multi-method classes are out of rc4-1 scope — only the per-method
+-- bindings (Module.inst_<Class>_<Type>_<method>) are emitted.
+let cg_compile_inst_members
+      : List (Pair Nat Expr) → Nat → Nat → CEnv → List (Pair Nat (Pair Nat (Pair Nat Nat))) → List (Pair Nat PlanVal)
+      → Pair CEnv (List (Pair Nat PlanVal))
+  = λ members inst_prefix mod_name env ctab compiled →
+      match (cg_compile_inst_members_go members inst_prefix mod_name env ctab compiled) {
+        | MkPair new_env new_compiled →
+            match (nat_eq (length members) 1) {
+              | 0 → MkPair new_env new_compiled
+              | _ →
+                  match members {
+                    | Nil → MkPair new_env new_compiled
+                    | Cons pair _ →
+                        match pair {
+                          | MkPair method_name _ →
+                              let bare = name_concat_under inst_prefix method_name in
+                              let method_fq = name_concat_dot mod_name bare in
+                              match (cenv_global_lookup new_env method_fq) {
+                                | None → MkPair new_env new_compiled
+                                | Some val →
+                                    let shortcut_fq = name_concat_dot mod_name inst_prefix in
+                                    let env2 = cenv_bind_global new_env shortcut_fq val in
+                                    MkPair env2 (Cons (MkPair shortcut_fq val) new_compiled)
+                              }
+                        }
+                  }
             }
       }
 
@@ -8117,8 +8562,9 @@ let cg_pass3_go
   : List Decl → Nat → CEnv → List (Pair Nat (Pair Nat (Pair Nat Nat)))
   → List (Pair Nat PlanVal)
   → List (Pair Nat Expr) → List (Pair Nat (List Nat)) → List Nat
+  → List (Pair Nat (List Nat))
   → List (Pair Nat PlanVal)
-  = λ decls mod_name env ctab compiled lets_by_fq fq_to_members emitted →
+  = λ decls mod_name env ctab compiled lets_by_fq fq_to_members emitted cls_methods →
       match decls {
         | Nil → compiled
         | Cons decl rest →
@@ -8126,20 +8572,38 @@ let cg_pass3_go
               | 0 →
                   -- DLet: route through SCC.
                   let nm = decl_get_let_name decl in
+                  let cons = decl_get_let_constraints decl in
                   match (Reaver.BPLAN.eq nm 0) {
                     | 0 →
                         let fq = name_concat_dot mod_name nm in
                         match (assoc_lookup fq fq_to_members) {
                           | None →
                               -- No SCC entry (shouldn't happen): fall
-                              -- back to single-let compile.
-                              match (cg_compile_let_one nm
-                                       (decl_get_let_body decl)
-                                       mod_name env ctab compiled) {
-                                | MkPair new_env new_compiled →
-                                    cg_pass3_go rest mod_name new_env ctab
-                                      new_compiled lets_by_fq fq_to_members
-                                      emitted
+                              -- back to single-let compile.  Constrained
+                              -- lets are never multi-member (Python doesn't
+                              -- allow constraints on mutual-SCC members
+                              -- either), so route constraints through
+                              -- cg_compile_constrained_let.
+                              match cons {
+                                | Nil →
+                                    match (cg_compile_let_one nm
+                                             (decl_get_let_body decl)
+                                             mod_name env ctab compiled) {
+                                      | MkPair new_env new_compiled →
+                                          cg_pass3_go rest mod_name new_env ctab
+                                            new_compiled lets_by_fq fq_to_members
+                                            emitted cls_methods
+                                    }
+                                | Cons _ _ →
+                                    match (cg_compile_constrained_let nm cons
+                                             (decl_get_let_body decl)
+                                             mod_name env ctab cls_methods
+                                             compiled) {
+                                      | MkPair new_env new_compiled →
+                                          cg_pass3_go rest mod_name new_env ctab
+                                            new_compiled lets_by_fq fq_to_members
+                                            emitted cls_methods
+                                    }
                               }
                           | Some members →
                               let rep = cg_scc_rep members in
@@ -8150,7 +8614,11 @@ let cg_pass3_go
                                     match (nat_eq (length members) 1) {
                                       | 0 →
                                           -- Multi-member SCC: compile via
-                                          -- shared-pin encoding.
+                                          -- shared-pin encoding.  Constraints
+                                          -- on multi-member SCC bindings
+                                          -- are not supported (Python rejects
+                                          -- them via the SCC generalization
+                                          -- pass); silently ignored here.
                                           let pairs =
                                             cg_lookup_member_bodies members
                                               lets_by_fq in
@@ -8160,32 +8628,49 @@ let cg_pass3_go
                                                 cg_pass3_go rest mod_name
                                                   new_env ctab new_compiled
                                                   lets_by_fq fq_to_members
-                                                  new_emitted
+                                                  new_emitted cls_methods
                                           }
                                       | _ →
-                                          -- Singleton SCC: today's path.
-                                          match (cg_compile_let_one nm
-                                                   (decl_get_let_body decl)
-                                                   mod_name env ctab
-                                                   compiled) {
-                                            | MkPair new_env new_compiled →
-                                                cg_pass3_go rest mod_name
-                                                  new_env ctab new_compiled
-                                                  lets_by_fq fq_to_members
-                                                  new_emitted
+                                          -- Singleton SCC: route through
+                                          -- cg_compile_constrained_let if the
+                                          -- let carries constraints, otherwise
+                                          -- the existing unconstrained path.
+                                          match cons {
+                                            | Nil →
+                                                match (cg_compile_let_one nm
+                                                         (decl_get_let_body decl)
+                                                         mod_name env ctab
+                                                         compiled) {
+                                                  | MkPair new_env new_compiled →
+                                                      cg_pass3_go rest mod_name
+                                                        new_env ctab new_compiled
+                                                        lets_by_fq fq_to_members
+                                                        new_emitted cls_methods
+                                                }
+                                            | Cons _ _ →
+                                                match (cg_compile_constrained_let nm cons
+                                                         (decl_get_let_body decl)
+                                                         mod_name env ctab cls_methods
+                                                         compiled) {
+                                                  | MkPair new_env new_compiled →
+                                                      cg_pass3_go rest mod_name
+                                                        new_env ctab new_compiled
+                                                        lets_by_fq fq_to_members
+                                                        new_emitted cls_methods
+                                                }
                                           }
                                     }
                                 | _ →
                                     -- SCC already emitted; skip this decl.
                                     cg_pass3_go rest mod_name env ctab
                                       compiled lets_by_fq fq_to_members
-                                      emitted
+                                      emitted cls_methods
                               }
                         }
                     | _ →
                         -- Sentinel name=0: type-alias placeholder, skip.
                         cg_pass3_go rest mod_name env ctab compiled
-                          lets_by_fq fq_to_members emitted
+                          lets_by_fq fq_to_members emitted cls_methods
                   }
               | _ →
                   -- DInst or other non-let: compile in-line.
@@ -8204,12 +8689,12 @@ let cg_pass3_go
                                 | MkPair new_env new_compiled →
                                     cg_pass3_go rest mod_name new_env ctab
                                       new_compiled lets_by_fq fq_to_members
-                                      emitted
+                                      emitted cls_methods
                               }
                         }
                     | _ →
                         cg_pass3_go rest mod_name env ctab compiled
-                          lets_by_fq fq_to_members emitted
+                          lets_by_fq fq_to_members emitted cls_methods
                   }
             }
       }
@@ -8227,8 +8712,9 @@ let cg_pass3 : List Decl → Nat → CEnv → List (Pair Nat (Pair Nat (Pair Nat
       let graph         = cg_build_dep_graph decls mod_name in
       let sccs          = cg_tarjan_scc graph in
       let fq_to_members = cg_fq_to_scc_members sccs in
+      let cls_methods   = cg_collect_class_methods decls in
       cg_pass3_go decls mod_name env ctab compiled lets_by_fq
-        fq_to_members Nil
+        fq_to_members Nil cls_methods
 
 -- compile_program: compile a full program to a list of (fq_name, PlanVal) pairs
 -- compile_program: thread the four codegen passes and reverse the
