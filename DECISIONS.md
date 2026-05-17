@@ -860,3 +860,40 @@ case.  Removing it without a structural-identity replacement re-breaks Phase H.
 
 See `tests/reaver/test_selfhost.py::test_list_literal_three` for the
 user-visible shape and `plans/phase_i_rc3.md` for the full investigation.
+
+## Self-host constrained-let codegen (Phase I, v1.0.0-rc4)
+
+The self-host's typeclass dispatch (`cg_compile_constrained_let` +
+`cg_compile_constrained_app`) mirrors Python's `_compile_constrained_let`
+in spirit but threads constraint info via a new `PConstrained` sentinel
+in `env.globals` rather than a parallel `_constrained_lets` dict.
+
+The non-obvious decision: **`cg_find_first_fq_for_law` keys on PLaw
+NAME nat + ARITY** rather than full structural equality.
+
+Python's emit-side `bind_table` dedupes by `id()` — every cross-binding
+reference at the call site collapses to the FIRST source-order binding
+sharing that value identity.  For our gate test, the dict shortcut
+`Compiler.inst_MyEq_Nat` shares an object with the impl
+`Compiler.nat_eq_impl` (via the bare-EVar inlining shortcut), so
+Python's call site emits `Compiler_nat_eq_impl`.
+
+Self-host can't mirror that directly:
+- `Reaver.BPLAN.eq` (op 66 ["Eq"]) is `nat x == nat y` — for non-Nat
+  values `nat` returns 0, so any two laws compare equal.  Useless for
+  identity.
+- `op 66 ["Equal"]` (deepseq + Haskell `==`) IS structural equality,
+  but isn't in `bootstrap/bplan_deps.py` or the `Reaver.BPLAN` external
+  mod in `Compiler.gls`.  Threading it would mean a bplan_deps bump +
+  scope-resolver addition + sanity test update.
+
+Compromise: name+arity match.  Sufficient for the bare-EVar inlining
+case because shared-object bindings have IDENTICAL PLaw name + arity
+(same encoded source name, same flattened lambda count).  Two distinct
+top-level lets compiling to PLaws with colliding name nats AND arities
+would mis-alias, but source shadowing isn't permitted and name nats
+encode the binding name verbatim, so the collision risk is negligible.
+
+If the limitation bites in practice, the fix is to wire `BPLAN.Equal`
+through bplan_deps + scope + sanity tests and swap
+`cg_find_first_fq_for_law` to use it for the inner predicate.
