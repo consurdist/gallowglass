@@ -520,7 +520,13 @@ type MatchArm =
   | ArmCon Nat (Pair (List Nat) Expr)   -- con_name, (field_names, body)
 
 type Decl =
-  | DLet Nat Expr
+  -- DLet: name, (constraints, body).  Constraints is a list of class
+  -- name nats extracted from the type annotation (empty if
+  -- unconstrained).  Packed as a Pair so DLet stays a binary
+  -- constructor — adding a third field would create a mixed-arity
+  -- dispatch with the other 6 binary Decl constructors, which is a
+  -- bootstrap codegen hazard (CLAUDE.md §"Bootstrap Codegen Pitfalls").
+  | DLet Nat (Pair (List Nat) Expr)
   | DType Nat (List ConDef)
   | DExt Nat (List Nat)
   | DClass Nat (List Nat)
@@ -558,6 +564,24 @@ type PlanVal =
                                     -- the emit path; if it does, the
                                     -- emit-side fallback arms produce a
                                     -- '!' sentinel to fail loud.
+  | PConstrained (List Nat) PlanVal -- constrained-let sentinel: (constraint
+                                    -- class names, underlying value).  Lives
+                                    -- ONLY in env.globals as the binding for
+                                    -- a constrained let.  The underlying
+                                    -- value is the compiled law (already
+                                    -- carrying its dict params in arity).
+                                    -- cg_compile_app's EApp dispatch checks
+                                    -- the root EVar's lookup: a
+                                    -- PConstrained value routes to
+                                    -- cg_compile_constrained_app, which
+                                    -- inserts dict args before user args.
+                                    -- Other consumers of env.globals
+                                    -- (cg_resolve_global_val,
+                                    -- cg_var_from_env's PMutual check,
+                                    -- planval_is_*) unwrap and treat as the
+                                    -- underlying value.  Mirrors Python
+                                    -- bootstrap's _constrained_lets dict
+                                    -- (codegen.py L254).
 
 -- Compilation environment (4 fields → nested Pairs)
 -- globals : List (Pair Nat PlanVal)
@@ -2841,12 +2865,71 @@ let parse_ext_items : List Token → Pair (List Nat) (List Token)
         | k → MkPair Nil toks
       }
 
+-- extract_constraints_go: walk the type-annotation tokens looking for
+-- ``Class ident =>`` prefix patterns and accumulate the class names.
+-- Stops at TkEqual (end of annotation) or EOF.  Single-pass scan;
+-- each non-match advances one token.
+--
+-- Currently supports the common form ``Class typevar =>`` with one
+-- type-var.  Multi-arg constraints (``Class a b =>``) and grouped
+-- forms (``(Eq a, Ord a) =>``) are not yet supported — they'd extend
+-- the inner pattern check but aren't needed for any current self-host
+-- fixture.  See bootstrap/codegen.py::_extract_constraints for the
+-- full reference.
+let extract_constraints_go : List Token → List Nat → List Nat
+  = λ toks acc →
+      match toks {
+        | Nil → reverse acc
+        | Cons _ _ →
+            match (tok_is toks TkEof) {
+              | 0 →
+                  match (tok_is toks TkEqual) {
+                    | 0 →
+                        match (tok_eat_ident toks) {
+                          | MkPair class_n r1 →
+                              match (Reaver.BPLAN.eq class_n 0) {
+                                | 0 →
+                                    match (tok_eat_ident r1) {
+                                      | MkPair var_n r2 →
+                                          match (Reaver.BPLAN.eq var_n 0) {
+                                            | 0 →
+                                                match (tok_is r2 TkFatArrow) {
+                                                  | 0 → extract_constraints_go (tok_tail toks) acc
+                                                  | _ →
+                                                      extract_constraints_go
+                                                        (tok_tail r2)
+                                                        (Cons class_n acc)
+                                                }
+                                            | _ → extract_constraints_go (tok_tail toks) acc
+                                          }
+                                    }
+                                | _ → extract_constraints_go (tok_tail toks) acc
+                              }
+                        }
+                    | _ → reverse acc
+                  }
+              | _ → reverse acc
+            }
+      }
+
+-- extract_constraints_from_ann: pull constraint class names out of the
+-- tokens between ``:`` and ``=`` of a let's type annotation.  Returns
+-- Nil if there is no annotation (the let head was ``let name = …``
+-- rather than ``let name : T = …``).
+let extract_constraints_from_ann : List Token → List Nat
+  = λ toks →
+      match (tok_is toks TkColon) {
+        | 0 → Nil
+        | _ → extract_constraints_go (tok_tail toks) Nil
+      }
+
 -- parse_let_decl: finish parsing a top-level let after name
 -- toks is positioned on ':' or '='
 let parse_let_decl : List (Pair Nat (List Nat)) → Nat → List Token → Pair Decl (List Token)
   = λ rt name toks →
+      let cons = extract_constraints_from_ann toks in
       match (parse_expr rt (skip_ann toks)) {
-        | MkPair body rest → MkPair (DLet name body) rest
+        | MkPair body rest → MkPair (DLet name (MkPair cons body)) rest
       }
 
 -- skip_to_decl_boundary: skip tokens until is_arity_stop says stop
@@ -2936,7 +3019,7 @@ let parse_type_decl_body : Nat → List Token → Pair Decl (List Token)
             match (tok_is toks2 TkBar) {
               | 0 →
                   match (tok_is toks2 TkLBrace) {
-                    | 0 → MkPair (DLet 0 (ENat 0)) (skip_to_decl_boundary toks2)
+                    | 0 → MkPair (DLet 0 (MkPair Nil (ENat 0))) (skip_to_decl_boundary toks2)
                     | k →
                         -- Record: parse { field : Type, ... }
                         match (parse_record_fields_go (tok_tail toks2) 0 Nil) {
@@ -2952,7 +3035,7 @@ let parse_type_decl_body : Nat → List Token → Pair Decl (List Token)
                     | MkPair cdefs rest → MkPair (DType name cdefs) rest
                   }
             }
-        | k → MkPair (DLet 0 (ENat 0)) (skip_to_decl_boundary (tok_tail toks))
+        | k → MkPair (DLet 0 (MkPair Nil (ENat 0))) (skip_to_decl_boundary (tok_tail toks))
       }
 
 -- parse_ext_decl: finish parsing external mod after mod name
@@ -3332,7 +3415,7 @@ let parse_decl : List (Pair Nat (List Nat)) → List Token → Pair Decl (List T
                                     match (tok_is toks TkEff) {
                                       | 0 →
                                           match (tok_is toks TkUse) {
-                                            | 0 → MkPair (DLet 0 (EVar 0)) (tok_tail toks)
+                                            | 0 → MkPair (DLet 0 (MkPair Nil (EVar 0))) (tok_tail toks)
                                             | k → parse_use_decl (tok_tail toks)
                                           }
                                       | k → parse_eff_decl (tok_tail toks)
@@ -3364,7 +3447,7 @@ let parse_decl : List (Pair Nat (List Nat)) → List Token → Pair Decl (List T
             match (tok_eat_ident (tok_tail toks)) {
               | MkPair name toks2 →
                   match name {
-                    | 0 → MkPair (DLet 0 (EVar 0)) toks
+                    | 0 → MkPair (DLet 0 (MkPair Nil (EVar 0))) toks
                     | _ → parse_let_decl rt name toks2
                   }
             }
@@ -3628,6 +3711,18 @@ let planval_is_law : PlanVal → Nat
 
 let planval_get_pin_inner : PlanVal → PlanVal
   = λ v → match v { | PPin inner → inner | _ → v }
+
+-- PConstrained predicates (see PlanVal definition for the sentinel's
+-- role).  Single-arm + wildcard: protected by the post-Phase-H tag-
+-- check fix in _build_field_arm_law / _compile_single_arm_field_bind.
+let planval_is_constrained : PlanVal → Nat
+  = λ v → match v { | PConstrained _ _ → 1 | _ → 0 }
+
+let planval_get_constraints : PlanVal → List Nat
+  = λ v → match v { | PConstrained cs _ → cs | _ → Nil }
+
+let planval_get_constrained_underlying : PlanVal → PlanVal
+  = λ v → match v { | PConstrained _ inner → inner | _ → v }
 
 -- -------------------------------------------------------------------
 -- Layer 2: PLAN value builders
@@ -3932,8 +4027,23 @@ let decl_is_ext : Decl → Nat
 let decl_get_let_name : Decl → Nat
   = λ d → match d { | DLet n _ → n | _ → 0 }
 
+-- decl_get_let_body extracts the body Expr from the (constraints,body)
+-- Pair carried by DLet.  Returns ``EVar 0`` for non-DLet decls to
+-- match the historical sentinel callers expect.
 let decl_get_let_body : Decl → Expr
-  = λ d → match d { | DLet _ b → b | _ → EVar 0 }
+  = λ d → match d {
+      | DLet _ p → match p { | MkPair _ b → b }
+      | _ → EVar 0
+    }
+
+-- decl_get_let_constraints: list of constraint class names extracted
+-- from the let's type annotation by parse_let_decl.  Empty if the
+-- decl has no annotation, or has an annotation without a ``=>``.
+let decl_get_let_constraints : Decl → List Nat
+  = λ d → match d {
+      | DLet _ p → match p { | MkPair c _ → c }
+      | _ → Nil
+    }
 
 let decl_get_type_name : Decl → Nat
   = λ d → match d { | DType n _ → n | _ → 0 }
@@ -8558,8 +8668,13 @@ let sr_resolve_decls
         | Nil → Nil
         | Cons decl rest →
             let new_decl = match decl {
-                             | DLet name body →
-                                 DLet name (sr_rewrite_expr body Nil gtab)
+                             | DLet name body_pair →
+                                 match body_pair {
+                                   | MkPair cons body →
+                                       DLet name
+                                         (MkPair cons
+                                           (sr_rewrite_expr body Nil gtab))
+                                 }
                              | DType _ _ → decl
                              | DExt _ _  → decl
                              | DClass _ _ → decl
