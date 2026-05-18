@@ -464,6 +464,7 @@ type Token =
   | TkBar
   | TkArrow
   | TkBackArrow
+  | TkFatArrow
   | TkEqual
   | TkColon
   | TkDot
@@ -519,7 +520,13 @@ type MatchArm =
   | ArmCon Nat (Pair (List Nat) Expr)   -- con_name, (field_names, body)
 
 type Decl =
-  | DLet Nat Expr
+  -- DLet: name, (constraints, body).  Constraints is a list of class
+  -- name nats extracted from the type annotation (empty if
+  -- unconstrained).  Packed as a Pair so DLet stays a binary
+  -- constructor — adding a third field would create a mixed-arity
+  -- dispatch with the other 6 binary Decl constructors, which is a
+  -- bootstrap codegen hazard (CLAUDE.md §"Bootstrap Codegen Pitfalls").
+  | DLet Nat (Pair (List Nat) Expr)
   | DType Nat (List ConDef)
   | DExt Nat (List Nat)
   | DClass Nat (List Nat)
@@ -557,6 +564,24 @@ type PlanVal =
                                     -- the emit path; if it does, the
                                     -- emit-side fallback arms produce a
                                     -- '!' sentinel to fail loud.
+  | PConstrained (List Nat) PlanVal -- constrained-let sentinel: (constraint
+                                    -- class names, underlying value).  Lives
+                                    -- ONLY in env.globals as the binding for
+                                    -- a constrained let.  The underlying
+                                    -- value is the compiled law (already
+                                    -- carrying its dict params in arity).
+                                    -- cg_compile_app's EApp dispatch checks
+                                    -- the root EVar's lookup: a
+                                    -- PConstrained value routes to
+                                    -- cg_compile_constrained_app, which
+                                    -- inserts dict args before user args.
+                                    -- Other consumers of env.globals
+                                    -- (cg_resolve_global_val,
+                                    -- cg_var_from_env's PMutual check,
+                                    -- planval_is_*) unwrap and treat as the
+                                    -- underlying value.  Mirrors Python
+                                    -- bootstrap's _constrained_lets dict
+                                    -- (codegen.py L254).
 
 -- Compilation environment (4 fields → nested Pairs)
 -- globals : List (Pair Nat PlanVal)
@@ -669,6 +694,7 @@ let kw_lambda_uni   : Nat = 0xBBCE             -- "λ"  (CE BB)
 let kw_arrow_uni    : Nat = 0x9286E2           -- "→"  (E2 86 92)
 let kw_backarrow_uni: Nat = 0x9086E2           -- "←"  (E2 86 90)
 let kw_forall_uni   : Nat = 0x8088E2           -- "∀"  (E2 88 80)
+let kw_fatarrow_uni : Nat = 0x9287E2           -- "⇒"  (E2 87 92)
 let kw_underscore   : Nat = 0x5F               -- "_"
 let kw_fix          : Nat = 0x786966           -- "fix"
 let kw_class        : Nat = 0x7373616c63       -- "class"
@@ -1183,7 +1209,11 @@ let lex_one : Pair Nat Nat → LexPos → Pair Token LexPos
                                                                                                             match (Reaver.BPLAN.eq seq kw_backarrow_uni) {
                                                                                                               | 0 →
                                                                                                                   match (Reaver.BPLAN.eq seq kw_forall_uni) {
-                                                                                                                    | 0 → MkPair (TkErr b) pos3
+                                                                                                                    | 0 →
+                                                                                                                        match (Reaver.BPLAN.eq seq kw_fatarrow_uni) {
+                                                                                                                          | 0 → MkPair (TkErr b) pos3
+                                                                                                                          | k → MkPair TkFatArrow pos3
+                                                                                                                        }
                                                                                                                     | k → MkPair TkForall pos3
                                                                                                                   }
                                                                                                               | k → MkPair TkBackArrow pos3
@@ -1231,7 +1261,19 @@ let lex_one : Pair Nat Nat → LexPos → Pair Token LexPos
                                                                     | k → MkPair TkColonColon (lexpos_advance pos1)
                                                                   }
                                                             }
-                                                        | k → MkPair TkEqual pos1
+                                                        | k →
+                                                            -- '=': check for '=>' (FatArrow) before
+                                                            -- defaulting to bare TkEqual.  Without this,
+                                                            -- `Class a => …` in a type annotation lexes
+                                                            -- as TkEqual followed by a stray `>` byte,
+                                                            -- and `tok_skip_to_equal` stops on the `=`
+                                                            -- — discarding the constraint head and
+                                                            -- leaving the parser to consume gibberish
+                                                            -- as the let body.
+                                                            match (Reaver.BPLAN.eq (bytes_at src (lexpos_offset pos1)) 0x3E) {
+                                                              | 0 → MkPair TkEqual pos1
+                                                              | k → MkPair TkFatArrow (lexpos_advance pos1)
+                                                            }
                                                       }
                                                   | k → MkPair TkBar pos1
                                                 }
@@ -1370,6 +1412,21 @@ let tok_eat_ident : List Token → Pair Nat (List Token)
       match (tok_peek toks) {
         | TkIdent n → MkPair n (tok_tail toks)
         | _ → MkPair 0 toks
+      }
+
+-- tok_eat_ident_or_wild: like tok_eat_ident, but a leading `_` token is
+-- accepted and rewritten to `kw_underscore` (0x5F).  Used by handler-arm
+-- parsing where the op-arg or resume slot may be the wildcard.  Without
+-- this the wildcard terminates the arm parse with name=0, collapsing
+-- every wildcard-form arm to a sentinel arm and giving the enclosing
+-- handler an effectively empty arm list.  Defined here (next to
+-- tok_eat_ident) so that source-order SCC compilation reaches it
+-- before parse_handle_op_arm's SCC fires via parse_expr.
+let tok_eat_ident_or_wild : List Token → Pair Nat (List Token)
+  = λ toks →
+      match (tok_is toks TkUnderscore) {
+        | 0 → tok_eat_ident toks
+        | _ → MkPair kw_underscore (tok_tail toks)
       }
 
 -- skip tokens until TkEqual is consumed; used to discard type annotations
@@ -2823,12 +2880,71 @@ let parse_ext_items : List Token → Pair (List Nat) (List Token)
         | k → MkPair Nil toks
       }
 
+-- extract_constraints_go: walk the type-annotation tokens looking for
+-- ``Class ident =>`` prefix patterns and accumulate the class names.
+-- Stops at TkEqual (end of annotation) or EOF.  Single-pass scan;
+-- each non-match advances one token.
+--
+-- Currently supports the common form ``Class typevar =>`` with one
+-- type-var.  Multi-arg constraints (``Class a b =>``) and grouped
+-- forms (``(Eq a, Ord a) =>``) are not yet supported — they'd extend
+-- the inner pattern check but aren't needed for any current self-host
+-- fixture.  See bootstrap/codegen.py::_extract_constraints for the
+-- full reference.
+let extract_constraints_go : List Token → List Nat → List Nat
+  = λ toks acc →
+      match toks {
+        | Nil → reverse acc
+        | Cons _ _ →
+            match (tok_is toks TkEof) {
+              | 0 →
+                  match (tok_is toks TkEqual) {
+                    | 0 →
+                        match (tok_eat_ident toks) {
+                          | MkPair class_n r1 →
+                              match (Reaver.BPLAN.eq class_n 0) {
+                                | 0 →
+                                    match (tok_eat_ident r1) {
+                                      | MkPair var_n r2 →
+                                          match (Reaver.BPLAN.eq var_n 0) {
+                                            | 0 →
+                                                match (tok_is r2 TkFatArrow) {
+                                                  | 0 → extract_constraints_go (tok_tail toks) acc
+                                                  | _ →
+                                                      extract_constraints_go
+                                                        (tok_tail r2)
+                                                        (Cons class_n acc)
+                                                }
+                                            | _ → extract_constraints_go (tok_tail toks) acc
+                                          }
+                                    }
+                                | _ → extract_constraints_go (tok_tail toks) acc
+                              }
+                        }
+                    | _ → reverse acc
+                  }
+              | _ → reverse acc
+            }
+      }
+
+-- extract_constraints_from_ann: pull constraint class names out of the
+-- tokens between ``:`` and ``=`` of a let's type annotation.  Returns
+-- Nil if there is no annotation (the let head was ``let name = …``
+-- rather than ``let name : T = …``).
+let extract_constraints_from_ann : List Token → List Nat
+  = λ toks →
+      match (tok_is toks TkColon) {
+        | 0 → Nil
+        | _ → extract_constraints_go (tok_tail toks) Nil
+      }
+
 -- parse_let_decl: finish parsing a top-level let after name
 -- toks is positioned on ':' or '='
 let parse_let_decl : List (Pair Nat (List Nat)) → Nat → List Token → Pair Decl (List Token)
   = λ rt name toks →
+      let cons = extract_constraints_from_ann toks in
       match (parse_expr rt (skip_ann toks)) {
-        | MkPair body rest → MkPair (DLet name body) rest
+        | MkPair body rest → MkPair (DLet name (MkPair cons body)) rest
       }
 
 -- skip_to_decl_boundary: skip tokens until is_arity_stop says stop
@@ -2918,7 +3034,7 @@ let parse_type_decl_body : Nat → List Token → Pair Decl (List Token)
             match (tok_is toks2 TkBar) {
               | 0 →
                   match (tok_is toks2 TkLBrace) {
-                    | 0 → MkPair (DLet 0 (ENat 0)) (skip_to_decl_boundary toks2)
+                    | 0 → MkPair (DLet 0 (MkPair Nil (ENat 0))) (skip_to_decl_boundary toks2)
                     | k →
                         -- Record: parse { field : Type, ... }
                         match (parse_record_fields_go (tok_tail toks2) 0 Nil) {
@@ -2934,7 +3050,7 @@ let parse_type_decl_body : Nat → List Token → Pair Decl (List Token)
                     | MkPair cdefs rest → MkPair (DType name cdefs) rest
                   }
             }
-        | k → MkPair (DLet 0 (ENat 0)) (skip_to_decl_boundary (tok_tail toks))
+        | k → MkPair (DLet 0 (MkPair Nil (ENat 0))) (skip_to_decl_boundary (tok_tail toks))
       }
 
 -- parse_ext_decl: finish parsing external mod after mod name
@@ -3168,12 +3284,12 @@ let parse_handle_op_arm
             match op_name {
               | 0 → MkPair (MkPair 0 (MkPair 0 (EVar 0))) toks
               | _ →
-                match (tok_eat_ident rest) {
+                match (tok_eat_ident_or_wild rest) {
                   | MkPair arg_name rest2 →
                       match arg_name {
                         | 0 → MkPair (MkPair op_name (MkPair 0 (EVar 0))) rest
                         | _ →
-                          match (tok_eat_ident rest2) {
+                          match (tok_eat_ident_or_wild rest2) {
                             | MkPair k_name rest3 →
                                 match k_name {
                                   | 0 → MkPair (MkPair op_name (MkPair arg_name (EVar 0))) rest2
@@ -3211,34 +3327,44 @@ let parse_handle_arms
 
 -- parse_handle_expr: parse handle comp { | return x → body | op ... }
 -- toks positioned after 'handle' keyword
+--
+-- Restructured to hoist the second parse_expr call out of the deeply
+-- nested match arms.  The previous version had it five levels deep
+-- inside the `| _ → match (parse_expr rt …) { … }` chain; the
+-- bootstrap codegen lambda-lifts each match-arm body into a sub-law,
+-- and the slot resolution for the mutual-SCC shared-pin reference to
+-- ``parse_expr`` was returning the wrong closure for the second call,
+-- making it always yield the ``EVar 0`` parse-failure sentinel for
+-- the return-arm body.  Flattening to ``let`` chains keeps parse_expr
+-- calls at the outer-lambda's body root, where slot resolution is
+-- already correct (the first parse_expr call works there).
 let parse_handle_expr : List (Pair Nat (List Nat)) → List Token → Pair Expr (List Token)
   = λ rt toks →
       match (parse_expr rt toks) {
         | MkPair comp rest →
-            -- skip opening {
             let rest2 = tok_tail rest in
-            -- skip | before 'return'
             let rest3 = match (tok_is rest2 TkBar) {
                           | 0 → rest2
                           | k → tok_tail rest2
                         } in
-            -- eat 'return' ident, then return var name, then → then body
             let rest4 = tok_tail rest3 in
-            match (tok_eat_ident rest4) {
-              | MkPair ret_var rest5 →
-                  match ret_var {
-                    | 0 → MkPair (EVar 0) toks
-                    | _ →
-                      match (parse_expr rt (tok_tail rest5)) {
-                        | MkPair ret_body rest6 →
-                            match (parse_handle_arms rt rest6) {
-                              | MkPair op_arms rest7 →
-                                  -- skip closing }
-                                  MkPair (EHandle comp (MkPair (ELam ret_var ret_body) op_arms))
-                                         (tok_tail rest7)
-                            }
-                      }
-                  }
+            let ret_var_pair = tok_eat_ident rest4 in
+            let ret_var = match ret_var_pair { | MkPair v _ → v } in
+            let rest5   = match ret_var_pair { | MkPair _ r → r } in
+            match (nat_eq ret_var 0) {
+              | 0 →
+                  -- parse the return body at the outer let level (not
+                  -- inside a nested match arm) so the mutual-SCC slot
+                  -- resolution for parse_expr stays correct.
+                  let body_pair = parse_expr rt (tok_tail rest5) in
+                  let ret_body  = match body_pair { | MkPair b _ → b } in
+                  let rest6     = match body_pair { | MkPair _ r → r } in
+                  let arms_pair = parse_handle_arms rt rest6 in
+                  let op_arms   = match arms_pair { | MkPair a _ → a } in
+                  let rest7     = match arms_pair { | MkPair _ r → r } in
+                  MkPair (EHandle comp (MkPair (ELam ret_var ret_body) op_arms))
+                         (tok_tail rest7)
+              | _ → MkPair (EVar 0) toks
             }
       }
 
@@ -3314,7 +3440,7 @@ let parse_decl : List (Pair Nat (List Nat)) → List Token → Pair Decl (List T
                                     match (tok_is toks TkEff) {
                                       | 0 →
                                           match (tok_is toks TkUse) {
-                                            | 0 → MkPair (DLet 0 (EVar 0)) (tok_tail toks)
+                                            | 0 → MkPair (DLet 0 (MkPair Nil (EVar 0))) (tok_tail toks)
                                             | k → parse_use_decl (tok_tail toks)
                                           }
                                       | k → parse_eff_decl (tok_tail toks)
@@ -3346,7 +3472,7 @@ let parse_decl : List (Pair Nat (List Nat)) → List Token → Pair Decl (List T
             match (tok_eat_ident (tok_tail toks)) {
               | MkPair name toks2 →
                   match name {
-                    | 0 → MkPair (DLet 0 (EVar 0)) toks
+                    | 0 → MkPair (DLet 0 (MkPair Nil (EVar 0))) toks
                     | _ → parse_let_decl rt name toks2
                   }
             }
@@ -3610,6 +3736,47 @@ let planval_is_law : PlanVal → Nat
 
 let planval_get_pin_inner : PlanVal → PlanVal
   = λ v → match v { | PPin inner → inner | _ → v }
+
+-- planval_get_law_name: name nat of a PLaw, 0 otherwise.
+let planval_get_law_name : PlanVal → Nat
+  = λ v → match v {
+      | PLaw n _ → n
+      | _ → 0
+    }
+
+-- planval_get_law_arity: arity of a PLaw, 0 otherwise.
+let planval_get_law_arity : PlanVal → Nat
+  = λ v → match v {
+      | PLaw _ p → match p { | MkPair a _ → a }
+      | _ → 0
+    }
+
+-- planval_get_pin_law_name: name nat of a PPin(PLaw _ _), 0 otherwise.
+-- Pinned laws (e.g. instance methods stored as PPin(PLaw _)) are the
+-- common shape for ``bind`` values in self-host output.
+let planval_get_pin_law_name : PlanVal → Nat
+  = λ v → match v {
+      | PPin inner → planval_get_law_name inner
+      | _ → planval_get_law_name v
+    }
+
+let planval_get_pin_law_arity : PlanVal → Nat
+  = λ v → match v {
+      | PPin inner → planval_get_law_arity inner
+      | _ → planval_get_law_arity v
+    }
+
+-- PConstrained predicates (see PlanVal definition for the sentinel's
+-- role).  Single-arm + wildcard: protected by the post-Phase-H tag-
+-- check fix in _build_field_arm_law / _compile_single_arm_field_bind.
+let planval_is_constrained : PlanVal → Nat
+  = λ v → match v { | PConstrained _ _ → 1 | _ → 0 }
+
+let planval_get_constraints : PlanVal → List Nat
+  = λ v → match v { | PConstrained cs _ → cs | _ → Nil }
+
+let planval_get_constrained_underlying : PlanVal → PlanVal
+  = λ v → match v { | PConstrained _ inner → inner | _ → v }
 
 -- -------------------------------------------------------------------
 -- Layer 2: PLAN value builders
@@ -3914,8 +4081,23 @@ let decl_is_ext : Decl → Nat
 let decl_get_let_name : Decl → Nat
   = λ d → match d { | DLet n _ → n | _ → 0 }
 
+-- decl_get_let_body extracts the body Expr from the (constraints,body)
+-- Pair carried by DLet.  Returns ``EVar 0`` for non-DLet decls to
+-- match the historical sentinel callers expect.
 let decl_get_let_body : Decl → Expr
-  = λ d → match d { | DLet _ b → b | _ → EVar 0 }
+  = λ d → match d {
+      | DLet _ p → match p { | MkPair _ b → b }
+      | _ → EVar 0
+    }
+
+-- decl_get_let_constraints: list of constraint class names extracted
+-- from the let's type annotation by parse_let_decl.  Empty if the
+-- decl has no annotation, or has an annotation without a ``=>``.
+let decl_get_let_constraints : Decl → List Nat
+  = λ d → match d {
+      | DLet _ p → match p { | MkPair c _ → c }
+      | _ → Nil
+    }
 
 let decl_get_type_name : Decl → Nat
   = λ d → match d { | DType n _ → n | _ → 0 }
@@ -6175,8 +6357,20 @@ let cg_var_from_env : Nat → CEnv → PlanVal
                   -- PMutual sentinel (mutual-SCC member): emit the
                   -- shared-pin bapp pattern instead of tagging the
                   -- value.  See cg_compile_mutual_law for setup.
+                  -- PConstrained sentinel (constrained-let binding):
+                  -- unwrap to the underlying law before
+                  -- cg_resolve_global_val, so emit produces the bare
+                  -- ``Module_foo`` symbol just like an unconstrained
+                  -- global.  Constrained-call dispatch happens one
+                  -- layer up in cg_compile_app via the lookup that
+                  -- still sees PConstrained.
                   match (planval_is_mutual val) {
-                    | 0 → cg_resolve_global_val n val env
+                    | 0 →
+                        match (planval_is_constrained val) {
+                          | 0 → cg_resolve_global_val n val env
+                          | _ → cg_resolve_global_val n
+                                  (planval_get_constrained_underlying val) env
+                        }
                     | _ → cg_mutual_ref_bapp (planval_get_mutual_idx val) env
                   }
               | None →
@@ -6189,7 +6383,12 @@ let cg_var_from_env : Nat → CEnv → PlanVal
                         match pair {
                           | MkPair fq val →
                               match (planval_is_mutual val) {
-                                | 0 → cg_resolve_global_val fq val env
+                                | 0 →
+                                    match (planval_is_constrained val) {
+                                      | 0 → cg_resolve_global_val fq val env
+                                      | _ → cg_resolve_global_val fq
+                                              (planval_get_constrained_underlying val) env
+                                    }
                                 | _ → cg_mutual_ref_bapp
                                         (planval_get_mutual_idx val) env
                               }
@@ -6236,16 +6435,346 @@ let cg_compile_var : Expr → CEnv → List (Pair Nat (Pair Nat (Pair Nat Nat)))
 -- `bit_or_wild_pred_wild_pred_then_succ` for an if-expression buried
 -- inside an App, where Python's reference is just `_then_succ`.  Pass
 -- 0 (empty hint) to children for byte-identity.
+-- cg_concat_dot_app: local mirror of name_concat_dot (defined far
+-- below at line ~7216).  Same rationale as cg_concat_under (line
+-- ~4785): bootstrap SCC ordering doesn't permit forward references,
+-- and cg_compile_constrained_app needs to construct ``Module.foo``
+-- FQ names well before name_concat_dot's definition.
+let cg_concat_dot_app : Nat → Nat → Nat
+  = λ mod_name item_name →
+      let blen = nat_byte_len mod_name in
+      let dot = shift_left 0x2E (mul 8 blen) in
+      let item_shifted = shift_left item_name (mul 8 (add blen 1)) in
+      add (add mod_name dot) item_shifted
+
+-- "Nat" little-endian name nat: 'N' 'a' 't' = 0x4E 0x61 0x74.
+let nn_Nat : Nat = 0x74614E
+
+-- cg_app_root_name: walk an EApp chain's leftmost spine to find the
+-- root EVar's name nat.  Returns 0 if the root isn't an EVar (or the
+-- expression isn't an App).  Used by cg_compile_app to detect calls
+-- to constrained lets.
+let cg_app_root_name : Expr → Nat
+  = λ expr →
+      match expr {
+        | EApp f _ → cg_app_root_name f
+        | EVar n → n
+        | _ → 0
+      }
+
+-- cg_expr_is_app: 1 if EApp, 0 otherwise.  Uses single-arm + wildcard;
+-- relies on the post-Phase-H tag-check fix to discriminate.
+let cg_expr_is_app : Expr → Nat
+  = λ e → match e { | EApp _ _ → 1 | _ → 0 }
+
+-- cg_collect_app_args_go: walk an EApp chain, prepending each arg as
+-- we descend.  Because we visit the OUTERmost App first (which has
+-- the LAST arg), prepending into the accumulator yields the args in
+-- ORIGINAL (left-to-right) source order.  Uses cg_app_fun /
+-- cg_app_arg (already known to work) rather than a direct
+-- ``match expr { | EApp f a → … | _ → … }`` — the direct form looked
+-- like it ought to work but observably returned [] for the gate test;
+-- decomposing via the predicate + accessors threads the loop without
+-- relying on the binary-single-arm dispatch shape.
+let cg_collect_app_args_go : Expr → List Expr → List Expr
+  = λ expr acc →
+      match (nat_eq (cg_expr_is_app expr) 0) {
+        | 0 → cg_collect_app_args_go (cg_app_fun expr) (Cons (cg_app_arg expr) acc)
+        | _ → acc
+      }
+
+-- cg_collect_app_args: user args of an App chain, in source order.
+let cg_collect_app_args : Expr → List Expr
+  = λ expr → cg_collect_app_args_go expr Nil
+
+-- cg_lookup_global_or_short: look up a name in env.globals, falling
+-- back to the short-tail scan that cg_var_from_env uses for bare
+-- EVars.  Returns Some(fq, val) on hit, None on miss.
+let cg_lookup_global_or_short : Nat → CEnv → Option (Pair Nat PlanVal)
+  = λ n env →
+      match (cenv_global_lookup env n) {
+        | Some val → Some (MkPair n val)
+        | None → cg_global_lookup_by_short n (cenv_globals env)
+      }
+
+-- cg_infer_type_key: derive a type-key name nat from an expression
+-- for instance-dict resolution.  Currently supports Nat literals
+-- only (ENat → ``Nat``) — good enough for the rc4-1 gate test.
+-- EText literals could map to ``Text`` but the self-host's text
+-- encoding is different from Python's so that path is deferred.
+let cg_infer_type_key : Expr → Nat
+  = λ expr →
+      match expr {
+        | ENat _ → nn_Nat
+        | _ → 0
+      }
+
+-- cg_find_first_fq_for_law_go: scan env.globals (most-recent-first
+-- via prepending) and return the LAST match — i.e. the FIRST
+-- source-order binding whose PLaw has the SAME name nat and arity
+-- as the search target.
+--
+-- Why name+arity instead of full structural eq: ``Reaver.BPLAN.eq``
+-- is a nat-value comparison (see Plan.hs L457; ``nat`` returns 0
+-- for non-Nat values, so any two non-Nat values compare equal —
+-- useless for our purpose).  ``op 66 ["Equal"]`` would be true
+-- structural eq via deepseq+(==) but isn't currently in
+-- bplan_deps.py / Reaver.BPLAN's external mod.
+--
+-- name+arity matches the only case we need to handle: the bare-EVar
+-- inlining shortcut in cg_compile_inst_members_go and
+-- cg_compile_let_one stores the SAME PLaw object as a referenced
+-- binding, and the single-method dict shortcut in
+-- cg_compile_inst_members propagates that further.  Same object →
+-- same name nat (= encode_name of the original binding) and same
+-- arity.  This mirrors Python emit's ``bind_table`` which keys on
+-- id() and keeps the first to register.
+--
+-- Limitation: if two distinct top-level lets happen to compile to
+-- laws with identical name nats AND arities (extremely unlikely
+-- since name nat = encode_name of the binding name and source
+-- shadowing isn't permitted), they'd alias.  Worth a follow-up to
+-- thread BPLAN.Equal.
+let cg_find_first_fq_for_law_go
+      : Nat → Nat → List (Pair Nat PlanVal) → Nat → Nat
+  = λ target_name target_arity kvs best →
+      match kvs {
+        | Nil → best
+        | Cons kv rest →
+            match kv {
+              | MkPair fq v →
+                  let v_name = planval_get_pin_law_name v in
+                  let v_arity = planval_get_pin_law_arity v in
+                  match (Reaver.BPLAN.eq v_name 0) {
+                    | 0 →
+                        match (Reaver.BPLAN.eq v_name target_name) {
+                          | 0 → cg_find_first_fq_for_law_go target_name target_arity rest best
+                          | _ →
+                              match (Reaver.BPLAN.eq v_arity target_arity) {
+                                | 0 → cg_find_first_fq_for_law_go target_name target_arity rest best
+                                | _ → cg_find_first_fq_for_law_go target_name target_arity rest fq
+                              }
+                        }
+                    | _ → cg_find_first_fq_for_law_go target_name target_arity rest best
+                  }
+            }
+      }
+
+-- cg_find_first_fq_for_val: returns the canonical (first source-order)
+-- FQ name for a PlanVal, or 0 if no match.  Only handles PLaw values
+-- (incl. PPin-wrapped); other shapes return 0 (caller should fall
+-- back to the binding's own fq).
+let cg_find_first_fq_for_val : PlanVal → List (Pair Nat PlanVal) → Nat
+  = λ val kvs →
+      let target_name = planval_get_pin_law_name val in
+      match (Reaver.BPLAN.eq target_name 0) {
+        | 0 → cg_find_first_fq_for_law_go target_name (planval_get_pin_law_arity val) kvs 0
+        | _ → 0
+      }
+
+-- cg_resolve_instance_dict: look up the instance dict for a given
+-- constraint class + first-arg type.  Tries the single-method
+-- shortcut name first (Module.inst_<Class>_<TypeKey>); on miss,
+-- falls back to the short-tail scan to find a cross-module
+-- equivalent.
+--
+-- Once a matching value is found, we re-scan globals for the
+-- FIRST source-order binding with the SAME value and tag with
+-- THAT FQ.  This matches Python emit's bind_table semantics
+-- (first id() to register wins), which picks
+-- ``Compiler_nat_eq_impl`` rather than ``Compiler_inst_MyEq_Nat``
+-- when the single-method shortcut is bound to the same object as
+-- the impl function.
+let cg_resolve_instance_dict
+      : Nat → Nat → Nat → CEnv → Option PlanVal
+  = λ mod_name class_name type_key env →
+      let inst_bare = cg_concat_under
+                        (cg_concat_under nn_inst class_name)
+                        type_key in
+      let inst_fq = cg_concat_dot_app mod_name inst_bare in
+      let lookup = match (cenv_global_lookup env inst_fq) {
+                     | Some val → Some (MkPair inst_fq val)
+                     | None → cg_global_lookup_by_short inst_bare
+                                (cenv_globals env)
+                   } in
+      match lookup {
+        | None → None
+        | Some pair →
+            match pair {
+              | MkPair _ val →
+                  let canon_fq = cg_find_first_fq_for_val val
+                                   (cenv_globals env) in
+                  match (Reaver.BPLAN.eq canon_fq 0) {
+                    | 0 → Some (cg_tag_global canon_fq val)
+                    | _ →
+                        -- Defensive: structural-eq scan returned 0
+                        -- (no match) even though the direct lookup
+                        -- hit.  Fall back to the lookup's own fq.
+                        match pair {
+                          | MkPair fq v → Some (cg_tag_global fq v)
+                        }
+                  }
+            }
+      }
+
+-- cg_apply_args: fold a list of compiled arg values onto a function
+-- value via cg_apply (which selects A-app vs bapp based on arity).
+-- ``fv`` not ``fn`` because ``fn`` is the ASCII alias for ``λ``
+-- (lexer keyword).
+let cg_apply_args : PlanVal → List PlanVal → Nat → PlanVal
+  = λ fv args arity →
+      match args {
+        | Nil → fv
+        | Cons a rest → cg_apply_args (cg_apply fv a arity) rest arity
+      }
+
+-- cg_compile_constrained_app: dispatched from cg_compile_app when the
+-- App-chain's root EVar resolves to a PConstrained value.
+--
+-- Walks the App chain to collect user args, then for each constraint
+-- class in PConstrained's constraint list inserts the resolved
+-- instance dict (looked up via cg_resolve_instance_dict) as a leading
+-- arg.  Finally applies the user args in source order.
+--
+-- Mirrors Python bootstrap's _compile_constrained_app
+-- (codegen.py L1354).  Single-method-class assumption: each
+-- constraint contributes exactly one dict arg.  Multi-method classes
+-- aren't supported in this path; their instance methods are stored
+-- as per-method bindings only and won't match the
+-- Module.inst_<Class>_<Type> shortcut shape that this function looks
+-- up.
+-- cg_resolve_dicts: for each constraint class name, look up the
+-- instance dict for the given type key.  Returns the resolved
+-- dict-val list in constraint order.
+let cg_resolve_dicts
+      : List Nat → Nat → Nat → CEnv → List PlanVal
+  = λ cons type_key mod_name env →
+      match cons {
+        | Nil → Nil
+        | Cons class_name rest →
+            let dict = match (cg_resolve_instance_dict mod_name class_name type_key env) {
+                         | None → PNat 0
+                         | Some v → v
+                       } in
+            Cons dict (cg_resolve_dicts rest type_key mod_name env)
+      }
+
+-- cg_compile_args: compile each user arg via the cg_compile_expr
+-- continuation.
+let cg_compile_args
+      : List Expr → CEnv
+      → List (Pair Nat (Pair Nat (Pair Nat Nat)))
+      → (Expr → CEnv → List (Pair Nat (Pair Nat (Pair Nat Nat))) → Nat → PlanVal)
+      → List PlanVal
+  = λ args env ctab ce →
+      match args {
+        | Nil → Nil
+        | Cons a rest →
+            Cons (ce a env ctab 0) (cg_compile_args rest env ctab ce)
+      }
+
+let cg_compile_constrained_app
+      : Expr → CEnv → List (Pair Nat (Pair Nat (Pair Nat Nat))) → Nat
+      → PlanVal → Nat
+      → (Expr → CEnv → List (Pair Nat (Pair Nat (Pair Nat Nat))) → Nat → PlanVal)
+      → PlanVal
+  = λ expr env ctab hint root_val mod_name ce →
+      let root_name = cg_app_root_name expr in
+      let args = cg_collect_app_args expr in
+      let cons = planval_get_constraints root_val in
+      let type_key = match args {
+                       | Nil → 0
+                       | Cons a _ → cg_infer_type_key a
+                     } in
+      -- Resolve the fn ref.  Use cg_compile_var on the root so we get
+      -- the same PNamed-tagging treatment as a normal global ref
+      -- (call-site needs to emit `Compiler_same`, not inline the law).
+      let fn_val = cg_compile_var (EVar root_name) env ctab 0 in
+      -- For each constraint class: resolve the instance dict and
+      -- accumulate as a dict-val list.  A missing dict yields PNat 0
+      -- and the call will be wrong — but we keep going so the diff
+      -- shows where the resolution failed rather than aborting.
+      let dict_vals = cg_resolve_dicts cons type_key mod_name env in
+      let user_vals = cg_compile_args args env ctab ce in
+      cg_apply_args (cg_apply_args fn_val dict_vals (cenv_arity env))
+                    user_vals (cenv_arity env)
+
+-- shift_right_inv_combined: drop the top ``strip`` bytes of ``fq``
+-- treating fq as a little-endian byte sequence.  Effectively
+-- ``fq mod 256^(fq_len - strip)`` — what's left after removing the
+-- trailing ``strip`` bytes.  Used by cg_module_from_fq.
+let shift_right_inv_combined : Nat → Nat → Nat
+  = λ fq strip →
+      let fq_len = nat_byte_len fq in
+      match (lte fq_len strip) {
+        | 0 →
+            let keep = sub fq_len strip in
+            mod_nat fq (Reaver.BPLAN.bex (mul 8 keep))
+        | _ → 0
+      }
+
+-- cg_module_from_fq: extract the module-name prefix from an
+-- (fq_name, val) pair.  The fq is ``Module.short`` little-endian;
+-- the module prefix is everything before the LAST ``.``.  Used at
+-- constrained-call sites to qualify ``inst_<Class>_<Type>`` lookups
+-- against the binding's home module.
+let cg_module_from_fq : Pair Nat PlanVal → Nat
+  = λ p →
+      match p {
+        | MkPair fq _ →
+            let short = cg_short_after_dot fq in
+            let strip = Core.PLAN.inc (nat_byte_len short) in
+            shift_right_inv_combined fq strip
+      }
+
 let cg_compile_app : Expr → CEnv → List (Pair Nat (Pair Nat (Pair Nat Nat))) → Nat → PlanVal
                    → (Expr → CEnv → List (Pair Nat (Pair Nat (Pair Nat Nat))) → Nat → PlanVal) → PlanVal
   = λ expr env ctab hint ce →
       match expr {
         | EApp f a →
-            let fv = ce f env ctab 0 in
-            let av = ce a env ctab 0 in
-            cg_apply fv av (cenv_arity env)
+            -- Constrained-let detection: walk to the App's root EVar
+            -- and check if its global value is PConstrained.  If so,
+            -- route to cg_compile_constrained_app which collects all
+            -- user args via its own chain unwrap and inserts the
+            -- resolved instance dicts ahead of them.
+            let root_name = cg_app_root_name expr in
+            match (Reaver.BPLAN.eq root_name 0) {
+              | 0 →
+                  match (cg_lookup_global_or_short root_name env) {
+                    | None →
+                        let fv = ce f env ctab 0 in
+                        let av = ce a env ctab 0 in
+                        cg_apply fv av (cenv_arity env)
+                    | Some fq_val_pair →
+                        match fq_val_pair {
+                          | MkPair _ val →
+                              match (planval_is_constrained val) {
+                                | 0 →
+                                    let fv = ce f env ctab 0 in
+                                    let av = ce a env ctab 0 in
+                                    cg_apply fv av (cenv_arity env)
+                                | _ →
+                                    -- The module name is encoded in
+                                    -- the looked-up fq prefix.  For
+                                    -- the resolve_instance_dict
+                                    -- lookup we use cenv_self's
+                                    -- module prefix as a proxy; for
+                                    -- top-level main this is None, so
+                                    -- we extract from the PConstrained
+                                    -- binding's fq instead.
+                                    let mod_name = cg_module_from_fq fq_val_pair in
+                                    cg_compile_constrained_app expr env ctab hint val mod_name ce
+                              }
+                        }
+                  }
+              | _ →
+                  let fv = ce f env ctab 0 in
+                  let av = ce a env ctab 0 in
+                  cg_apply fv av (cenv_arity env)
+            }
         | _ → PNat 0
       }
+
 
 -- cg_compile_enat: compile ENat
 let cg_compile_enat : Expr → CEnv → Nat → PlanVal
@@ -6460,30 +6989,43 @@ let cps_id_open : PlanVal = PLaw 0 (MkPair 2 (PNat 2))
 let nn_null_dispatch : Nat = 0x68637461707369645f6c6c756e5f  -- "_null_dispatch"
 let cps_null_dispatch : PlanVal = PLaw nn_null_dispatch (MkPair 3 (PPin (PNat 0)))
 
--- _compose: L(3, name, A(N(1), A(N(2), N(3)))) — compose(f, g, x) = f(g(x))
-let nn_compose : Nat = 0x65736f706d6f635f  -- "_compose"
-let cps_compose : PlanVal = PLaw nn_compose (MkPair 3 (PApp (PNat 1) (PApp (PNat 2) (PNat 3))))
+-- Law bodies below use ``cg_bapp`` (= App(App(N 0, f), x)) for every
+-- application node so the emit-side body printer reads them as plain
+-- App spines.  A raw ``App(App(N 1, rhs), body)`` shape would be
+-- interpreted by emit as the let-binding form ``_d(rhs)\n  body``
+-- (see emit_bval_papp_app), silently mis-rendering helper laws whose
+-- spine starts with N(1).  Python wraps the same way via ``bapp`` —
+-- see _FORWARD_K / _COMPOSE_OPEN in bootstrap/codegen.py.
 
--- _compose_open: L(4, name, A(A(N(1), N(3)), A(N(2), N(4))))
+-- _compose: L(3, name, N(1)(N(2)(N(3)))) — compose(f, g, x) = f(g(x))
+let nn_compose : Nat = 0x65736f706d6f635f  -- "_compose"
+let cps_compose : PlanVal
+  = PLaw nn_compose (MkPair 3 (cg_bapp (PNat 1) (cg_bapp (PNat 2) (PNat 3))))
+
+-- _compose_open: L(4, name, N(1)(N(3))(N(2)(N(4))))
 -- compose_open(f_open, g, dispatch', x) = f_open(dispatch', g(x))
 let nn_compose_open : Nat = 0x6e65706f5f65736f706d6f635f  -- "_compose_open"
 let cps_compose_open : PlanVal
-  = PLaw nn_compose_open (MkPair 4 (PApp (PApp (PNat 1) (PNat 3)) (PApp (PNat 2) (PNat 4))))
+  = PLaw nn_compose_open (MkPair 4
+      (cg_bapp (cg_bapp (PNat 1) (PNat 3)) (cg_bapp (PNat 2) (PNat 4))))
 
--- _forward_k: L(4, name, A(A(N(1), A(N(2), N(3))), N(4)))
+-- _forward_k: L(4, name, N(1)(N(2)(N(3)))(N(4)))
 -- forward_k(k_open, dispatch_fn_base, dispatch', v) = k_open(dispatch_fn_base(dispatch'), v)
 -- Used when forwarding unhandled ops to preserve nested handler layers.
 let nn_forward_k : Nat = 0x6b5f64726177726f665f  -- "_forward_k"
 let cps_forward_k : PlanVal
-  = PLaw nn_forward_k (MkPair 4 (PApp (PApp (PNat 1) (PApp (PNat 2) (PNat 3))) (PNat 4)))
+  = PLaw nn_forward_k (MkPair 4
+      (cg_bapp (cg_bapp (PNat 1) (cg_bapp (PNat 2) (PNat 3))) (PNat 4)))
 
--- pure_law: L(3, "pure", A(A(N(3), N(2)), N(1))) — pure v dispatch k_open = k_open(dispatch, v)
-let cps_pure_law : PlanVal = PLaw kw_pure (MkPair 3 (PApp (PApp (PNat 3) (PNat 2)) (PNat 1)))
+-- pure_law: L(3, "pure", N(3)(N(2))(N(1))) — pure v dispatch k_open = k_open(dispatch, v)
+let cps_pure_law : PlanVal
+  = PLaw kw_pure (MkPair 3 (cg_bapp (cg_bapp (PNat 3) (PNat 2)) (PNat 1)))
 
--- run_law: L(1, "run", A(A(N(1), P(null_dispatch)), P(id_open)))
+-- run_law: L(1, "run", N(1)(P(null_dispatch))(P(id_open)))
 -- run comp = comp(null_dispatch, id_open)
 let cps_run_law : PlanVal
-  = PLaw kw_run (MkPair 1 (PApp (PApp (PNat 1) (PPin cps_null_dispatch)) (PPin cps_id_open)))
+  = PLaw kw_run (MkPair 1
+      (cg_bapp (cg_bapp (PNat 1) (PPin cps_null_dispatch)) (PPin cps_id_open)))
 
 -- Virtual de Bruijn index for resume during arm body compilation.
 -- Substituted with the real resume expression before embedding in the law body.
@@ -6561,15 +7103,20 @@ let cg_compile_dispatch_fn
       → List (Pair Nat (Pair Nat (Pair Nat Nat))) → Nat
       → (Expr → CEnv → List (Pair Nat (Pair Nat (Pair Nat Nat))) → Nat → PlanVal) → PlanVal
   = λ op_arms env ctab hint ce →
-      match op_arms {
-        | Nil →
-            -- No op arms: pure forwarder with forward_k wrapping
-            -- 4-arg law: [dp] [tag] [arg] [k_open]
-            -- k_fwd = forward_k(k_open, N(0)) — N(0) is self-ref (no captures)
-            let k_fwd = cg_bapp (cg_bapp (PPin cps_forward_k) (PNat 4)) (PNat 0) in
-            PPin (PLaw hint (MkPair 4
-              (cg_bapp (cg_bapp (cg_bapp (PNat 1) (PNat 2)) (PNat 3)) k_fwd)))
-        | _ →
+      -- Both the empty-arms forwarder and the main dispatch law take the
+      -- name ``encode_name(hint + "_dispatch")``.  Mirrors Python's
+      -- f'{name_hint}_dispatch' construction in _compile_dispatch_fn.
+      -- LE-packed encode_name("dispatch") = 7521983764486121828.
+      let nn_dispatch_s = 7521983764486121828 in
+      let disp_name = cg_concat_under hint nn_dispatch_s in
+      -- Use a length probe instead of ``match op_arms { | Nil → … | _ → … }``.
+      -- The Nil-vs-Cons match shape (nullary + binary, mixed-arity, 2-arm
+      -- one-explicit + wildcard) is one of the bootstrap codegen pitfalls
+      -- documented in CLAUDE.md — the wildcard arm body was silently
+      -- unreachable for any non-empty list, so every handler fell into the
+      -- Nil branch.  ``length op_arms == 0`` discriminates safely.
+      match (nat_eq (length op_arms) 0) {
+        | 0 →
             -- Collect free vars from all arm bodies
             let all_bodies = map (λ arm →
                                     match arm {
@@ -6600,18 +7147,34 @@ let cg_compile_dispatch_fn
             let forward_body = cg_bapp (cg_bapp (cg_bapp (PNat dp_idx) (PNat op_tag_idx)) (PNat op_arg_idx)) k_open_forwarded in
             -- Build tag dispatch with virtual resume substitution
             let dispatch_body = cg_build_handle_dispatch op_arms dispatch_env k_idx op_arg_idx op_tag_idx forward_body resume_expr ce ctab hint 0 in
-            let dispatch_law = PPin (PLaw hint (MkPair total_arity dispatch_body)) in
+            let dispatch_law = PPin (PLaw disp_name (MkPair total_arity dispatch_body)) in
             cg_apply_free_locals dispatch_law free_vars env
+        | _ →
+            -- No op arms: pure forwarder with forward_k wrapping
+            -- 4-arg law: [dp] [tag] [arg] [k_open]
+            -- k_fwd = forward_k(k_open, N(0)) — N(0) is self-ref (no captures)
+            let k_fwd = cg_bapp (cg_bapp (PPin cps_forward_k) (PNat 4)) (PNat 0) in
+            PPin (PLaw disp_name (MkPair 4
+              (cg_bapp (cg_bapp (cg_bapp (PNat 1) (PNat 2)) (PNat 3)) k_fwd)))
       }
 
 -- cg_compile_return_fn: build return handler law
 -- L(n_cap+1, name, body) where last param is the pure return value.
+-- Law name = ``encode_name(hint + "_return")``; sub-compile hint uses
+-- the same suffix.  Mirrors bootstrap/codegen.py::_compile_return_fn.
 let cg_compile_return_fn
       : Expr → CEnv → List (Pair Nat (Pair Nat (Pair Nat Nat))) → Nat
       → (Expr → CEnv → List (Pair Nat (Pair Nat (Pair Nat Nat))) → Nat → PlanVal) → PlanVal
   = λ ret_fn env ctab hint ce →
-      match ret_fn {
-        | ELam ret_var ret_body →
+      let nn_return_s = 121437875889522 in    -- "return" LE
+      let ret_name = cg_concat_under hint nn_return_s in
+      match (cg_is_lam ret_fn) {
+        | 0 →
+            -- Not an ELam — use the identity-handler default.
+            PPin cps_id_law
+        | _ →
+            let ret_var  = cg_lam_param ret_fn in
+            let ret_body = cg_lam_body  ret_fn in
             let free_vars = cg_free_vars ret_body (Cons ret_var Nil) env in
             let n_cap = length free_vars in
             let total_arity = add n_cap 1 in
@@ -6621,18 +7184,20 @@ let cg_compile_return_fn
             let ret_env1 = cg_bind_params free_vars ret_env0 in
             let ret_env2 = cenv_set_arity ret_env1 total_arity in
             let ret_env3 = cenv_bind_local ret_env2 ret_var val_idx in
-            let body_val = ce ret_body ret_env3 ctab hint in
-            let ret_law = PPin (PLaw hint (MkPair total_arity body_val)) in
+            let body_val = ce ret_body ret_env3 ctab ret_name in
+            let ret_law = PPin (PLaw ret_name (MkPair total_arity body_val)) in
             cg_apply_free_locals ret_law free_vars env
-        | _ →
-            -- Default: identity
-            PPin cps_id_law
       }
 
 -- cg_compile_handle: compile EHandle expression
 -- handle comp { | return x → body_r | op arg k → body_op }
 -- Open-continuation protocol:
 -- Produces: λ(dp, ko_open) → comp(dispatch(dp), compose_open(ko_open, ret_fn))
+--
+-- CPS law name = ``encode_name(hint + "_handle")``; the ``comp`` sub-expr
+-- is compiled with hint suffix ``_comp``.  Dispatch and return helpers
+-- carry their own suffixes (see cg_compile_dispatch_fn / _return_fn).
+-- Mirrors bootstrap/codegen.py::_compile_handle.
 let cg_compile_handle
       : Expr → CEnv → List (Pair Nat (Pair Nat (Pair Nat Nat))) → Nat → PlanVal
       → (Expr → CEnv → List (Pair Nat (Pair Nat (Pair Nat Nat))) → Nat → PlanVal) → PlanVal
@@ -6651,13 +7216,19 @@ let cg_compile_handle
                   let total_arity = add n_cap 2 in
                   let dp_idx = add n_cap 1 in
                   let ko_idx = add n_cap 2 in
+                  -- Sub-hint suffixes (match Python).
+                  -- LE-packed encode_name() of each suffix.
+                  let nn_comp_s   = 1886220131 in            -- "comp"
+                  let nn_handle_s = 111516215828840 in       -- "handle"
+                  let comp_hint = cg_concat_under hint nn_comp_s in
+                  let cps_name  = cg_concat_under hint nn_handle_s in
                   -- Build cps env
                   let g = cenv_globals env in
                   let cps_env0 = cenv_make g Nil 0 None in
                   let cps_env1 = cg_bind_params free_vars cps_env0 in
                   let cps_env = cenv_set_arity cps_env1 total_arity in
                   -- Compile comp in cps env
-                  let comp_val = ce comp cps_env ctab hint in
+                  let comp_val = ce comp cps_env ctab comp_hint in
                   -- Build dispatch function
                   let dispatch_fn = cg_compile_dispatch_fn op_arms cps_env ctab hint ce in
                   -- Build return function
@@ -6669,13 +7240,15 @@ let cg_compile_handle
                   let composed_k = cg_bapp (cg_bapp (PPin cps_compose_open) (PNat ko_idx)) return_fn in
                   -- CPS body: comp(dispatch(dp), composed_k_open)
                   let cps_body = cg_bapp (cg_bapp comp_val dispatch_applied) composed_k in
-                  let cps_law = PLaw hint (MkPair total_arity cps_body) in
-                  -- Apply to captures
+                  let cps_law = PLaw cps_name (MkPair total_arity cps_body) in
+                  -- At top level (env.arity == 0): return bare ``cps_law``;
+                  -- inside another law: PPin it and bapp-apply captures.
+                  -- Mirrors Python's ``if env.arity == 0`` branch.
                   match (nat_eq (cenv_arity env) 0) {
-                    | 0 → PPin cps_law
-                    | _ →
+                    | 0 →
                         let pinned = PPin cps_law in
                         cg_apply_free_locals pinned free_vars env
+                    | _ → cps_law
                   }
             }
         | _ → PNat 0
@@ -6688,6 +7261,11 @@ let cg_compile_handle
 --   Reordered: k_open_outer BEFORE dispatch so partial application
 --   with (caps, k_open_outer) gives a 2-arg open continuation.
 -- Outer body: rhs dispatch inner_cont_open
+--
+-- Law names: outer = ``encode_name(hint + "_do")``,
+-- inner = ``encode_name(hint + "_cont")``.  Sub-compile hints get
+-- ``_body``/``_rhs`` suffixes so any lambda-lifted sub-laws get unique
+-- names.  Mirrors bootstrap/codegen.py::_compile_do.
 let cg_compile_do
       : Expr → CEnv → List (Pair Nat (Pair Nat (Pair Nat Nat))) → Nat → PlanVal
       → (Expr → CEnv → List (Pair Nat (Pair Nat (Pair Nat Nat))) → Nat → PlanVal) → PlanVal
@@ -6710,6 +7288,16 @@ let cg_compile_do
                   let inner_k_open_idx   = add n_cap 1 in
                   let inner_dispatch_idx = add n_cap 2 in
                   let inner_x_idx        = add n_cap 3 in
+                  -- Sub-law / sub-compile hints (match Python's suffix scheme).
+                  -- LE-packed encode_name() of each suffix.
+                  let nn_body = 2036625250 in          -- "body"
+                  let nn_rhs  = 7563378 in             -- "rhs"
+                  let nn_cont = 1953394531 in          -- "cont"
+                  let nn_do   = 28516 in               -- "do"
+                  let body_hint  = cg_concat_under hint nn_body in
+                  let rhs_hint   = cg_concat_under hint nn_rhs in
+                  let cont_name  = cg_concat_under hint nn_cont in
+                  let do_name    = cg_concat_under hint nn_do in
                   -- Build inner env
                   let g = cenv_globals env in
                   let inner_env0 = cenv_make g Nil 0 None in
@@ -6717,29 +7305,33 @@ let cg_compile_do
                   let inner_env2 = cenv_set_arity inner_env1 (add n_cap 3) in
                   let inner_env3 = cenv_bind_local inner_env2 bind_name inner_x_idx in
                   -- Compile body in inner env
-                  let body_cps = ce body inner_env3 ctab hint in
+                  let body_cps = ce body inner_env3 ctab body_hint in
                   -- Inner body: body_cps(dispatch, k_open_outer)
                   let inner_body = cg_bapp (cg_bapp body_cps (PNat inner_dispatch_idx)) (PNat inner_k_open_idx) in
-                  let inner_law = PPin (PLaw hint (MkPair (add n_cap 3) inner_body)) in
+                  let inner_law = PPin (PLaw cont_name (MkPair (add n_cap 3) inner_body)) in
                   -- Build outer env
                   let outer_env0 = cenv_make g Nil 0 None in
                   let outer_env1 = cg_bind_params free_vars outer_env0 in
                   let outer_env  = cenv_set_arity outer_env1 (add n_cap 2) in
                   -- Compile rhs in outer env
-                  let rhs_val = ce rhs outer_env ctab hint in
+                  let rhs_val = ce rhs outer_env ctab rhs_hint in
                   -- Apply inner_law to captures + k_open_outer (NOT dispatch).
                   -- Result is a 2-arg open continuation: (dispatch, x) → body(dispatch, k_open_outer)
                   let inner_applied = cg_apply_range inner_law 1 n_cap in
                   let inner_cont_open = cg_bapp inner_applied (PNat outer_k_open_idx) in
                   -- Outer body: rhs_comp(dispatch, inner_cont_open)
                   let outer_body = cg_bapp (cg_bapp rhs_val (PNat outer_dispatch_idx)) inner_cont_open in
-                  let do_law = PLaw hint (MkPair (add n_cap 2) outer_body) in
-                  -- Apply to captures
+                  let do_law = PLaw do_name (MkPair (add n_cap 2) outer_body) in
+                  -- At top level (env.arity == 0): return bare ``do_law``;
+                  -- captures from env.locals are necessarily empty so there is
+                  -- nothing further to apply.  Inside another law: pin and
+                  -- bapp-apply free-local captures.  Mirrors Python's
+                  -- ``if env.arity == 0`` branch in _compile_do.
                   match (nat_eq (cenv_arity env) 0) {
-                    | 0 → do_law
-                    | _ →
+                    | 0 →
                         let pinned = PPin do_law in
                         cg_apply_free_locals pinned free_vars env
+                    | _ → do_law
                   }
             }
         | _ → PNat 0
@@ -7231,8 +7823,102 @@ let cg_compile_let_one : Nat → Expr → Nat → CEnv → List (Pair Nat (Pair 
         | _ → MkPair env compiled
       }
 
--- cg_compile_inst_members: compile each method body in a DInst
-let cg_compile_inst_members
+-- cg_wrap_methods: wrap an Expr in nested ``λ m1 → λ m2 → … → body``
+-- given the method names ``[m1, m2, …]``.  Outermost lambda binds
+-- the first method in the list, matching Python's slot order (first
+-- dict param at slot 1).
+let cg_wrap_methods : List Nat → Expr → Expr
+  = λ methods body →
+      match methods {
+        | Nil → body
+        | Cons m rest → ELam m (cg_wrap_methods rest body)
+      }
+
+-- cg_wrap_constraint_lams: prepend constraint dict params as nested
+-- lambdas around the let's body.  For each class in ``cons`` order,
+-- looks up the class's method names from ``cls_methods`` and wraps
+-- with one lambda per method.  Outermost wrapping = first class's
+-- first method = dict-param slot 1.  Matches Python bootstrap's
+-- _compile_constrained_let (codegen.py L1067) flat-dict-passing
+-- shape — one slot per method per constraint.
+let cg_wrap_constraint_lams
+      : List Nat → List (Pair Nat (List Nat)) → Expr → Expr
+  = λ cons cls_methods body →
+      match cons {
+        | Nil → body
+        | Cons class_name rest →
+            let methods = match (assoc_lookup class_name cls_methods) {
+                            | None → Nil
+                            | Some ms → ms
+                          } in
+            cg_wrap_methods methods (cg_wrap_constraint_lams rest cls_methods body)
+      }
+
+-- cg_compile_constrained_let: compile a constrained let.
+-- Builds dict params by wrapping the body in extra lambdas (one per
+-- method per constraint), then compiles normally.  The resulting
+-- PLaw has arity = base + total_dict_count.  Wraps the val in
+-- PConstrained so cg_compile_app can detect call sites and insert
+-- dict args.
+--
+-- Mirrors Python bootstrap's _compile_constrained_let
+-- (codegen.py L1067) and _compile_let's constraint-branch
+-- (L1041 onward).
+let cg_compile_constrained_let
+      : Nat → List Nat → Expr → Nat → CEnv
+      → List (Pair Nat (Pair Nat (Pair Nat Nat)))
+      → List (Pair Nat (List Nat))
+      → List (Pair Nat PlanVal)
+      → Pair CEnv (List (Pair Nat PlanVal))
+  = λ name cons body mod_name env ctab cls_methods compiled →
+      match (Reaver.BPLAN.eq name 0) {
+        | 0 →
+            let fq_name = name_concat_dot mod_name name in
+            let fq_env = cenv_mark_top_of_law
+                           (cenv_set_self (cenv_set_arity env 0) (Some fq_name)) in
+            let wrapped = cg_wrap_constraint_lams cons cls_methods body in
+            let raw_val = cg_compile_expr wrapped fq_env ctab name in
+            let tagged = PConstrained cons raw_val in
+            let new_env = cenv_bind_global env fq_name tagged in
+            -- Bind the UNWRAPPED raw_val into `compiled` (the emit-time
+            -- bindings list) so emit produces just the law text.
+            -- PConstrained lives only in env.globals for call-site
+            -- detection; it must never reach emit.
+            MkPair new_env (Cons (MkPair fq_name raw_val) compiled)
+        | _ → MkPair env compiled
+      }
+
+-- cg_collect_class_methods_go: accumulator for cg_collect_class_methods.
+let cg_collect_class_methods_go
+      : List Decl → List (Pair Nat (List Nat)) → List (Pair Nat (List Nat))
+  = λ decls acc →
+      match decls {
+        | Nil → acc
+        | Cons d rest →
+            match (nat_eq (decl_is_class d) 0) {
+              | 0 →
+                  let class_name = decl_get_class_name d in
+                  let methods    = decl_get_class_methods d in
+                  cg_collect_class_methods_go rest
+                    (Cons (MkPair class_name methods) acc)
+              | _ → cg_collect_class_methods_go rest acc
+            }
+      }
+
+-- cg_collect_class_methods: bare class name → method names registry.
+-- Built from DClass decls.  Keyed by bare class name (not FQ) because
+-- constrained-let annotations reference classes by bare name (the
+-- parser doesn't qualify type-annotation tokens).  Constraints that
+-- name an unknown class get an empty method list — the resulting
+-- wrap is a no-op (dict-param count stays at 0) and the call site
+-- will fail to resolve the dict.
+let cg_collect_class_methods : List Decl → List (Pair Nat (List Nat))
+  = λ decls → cg_collect_class_methods_go decls Nil
+
+-- cg_compile_inst_members_go: compile each method body in a DInst.
+-- The outer wrapper (cg_compile_inst_members) also emits the single-
+-- method dict shortcut when the instance provides exactly one method.
+let cg_compile_inst_members_go
       : List (Pair Nat Expr) → Nat → Nat → CEnv → List (Pair Nat (Pair Nat (Pair Nat Nat))) → List (Pair Nat PlanVal)
       → Pair CEnv (List (Pair Nat PlanVal))
   = λ members inst_prefix mod_name env ctab compiled →
@@ -7261,8 +7947,49 @@ let cg_compile_inst_members
                               | _ → cg_compile_expr body fq_env ctab bare
                             } in
                   let new_env = cenv_bind_global env fq_name val in
-                  cg_compile_inst_members rest inst_prefix mod_name new_env ctab
+                  cg_compile_inst_members_go rest inst_prefix mod_name new_env ctab
                     (Cons (MkPair fq_name val) compiled)
+            }
+      }
+
+-- cg_compile_inst_members: wrapper that also emits the single-method
+-- dict shortcut (Module.inst_ClassName_TypeName = the one method's
+-- value).  Mirrors Python bootstrap's _compile_inst single-method
+-- branch (codegen.py L896-903).
+--
+-- Why this matters: at constrained-let call sites, the call-site dict
+-- insertion looks up the dict by Module.inst_<Class>_<Type>.  For
+-- single-method classes the dict IS the one method; emitting this
+-- shortcut lets call sites resolve to a single value rather than
+-- needing to build a method-dispatch record.
+--
+-- Multi-method classes are out of rc4-1 scope — only the per-method
+-- bindings (Module.inst_<Class>_<Type>_<method>) are emitted.
+let cg_compile_inst_members
+      : List (Pair Nat Expr) → Nat → Nat → CEnv → List (Pair Nat (Pair Nat (Pair Nat Nat))) → List (Pair Nat PlanVal)
+      → Pair CEnv (List (Pair Nat PlanVal))
+  = λ members inst_prefix mod_name env ctab compiled →
+      match (cg_compile_inst_members_go members inst_prefix mod_name env ctab compiled) {
+        | MkPair new_env new_compiled →
+            match (nat_eq (length members) 1) {
+              | 0 → MkPair new_env new_compiled
+              | _ →
+                  match members {
+                    | Nil → MkPair new_env new_compiled
+                    | Cons pair _ →
+                        match pair {
+                          | MkPair method_name _ →
+                              let bare = name_concat_under inst_prefix method_name in
+                              let method_fq = name_concat_dot mod_name bare in
+                              match (cenv_global_lookup new_env method_fq) {
+                                | None → MkPair new_env new_compiled
+                                | Some val →
+                                    let shortcut_fq = name_concat_dot mod_name inst_prefix in
+                                    let env2 = cenv_bind_global new_env shortcut_fq val in
+                                    MkPair env2 (Cons (MkPair shortcut_fq val) new_compiled)
+                              }
+                        }
+                  }
             }
       }
 
@@ -7270,6 +7997,15 @@ let cg_compile_inst_members
 -- Each op: L(3, op_name, dispatch(tag, op_arg, k))
 -- N(1)=op_arg, N(2)=dispatch, N(3)=k
 -- body = A(A(A(N(2), tag_val), N(1)), N(3))
+--
+-- Bind ONLY under the FQ name.  The bare-name binding the Python
+-- bootstrap also creates (env.globals[op.name] = val) isn't safe here:
+-- sr_dispatch has a known gap where it sometimes leaves cross-binding
+-- EVars un-qualified (phase_h_handoff.md L289-293), and if the bare
+-- binding exists the lookup picks it up and PNamed-tags with the bare
+-- name — emit then prints ``(#pin inc)`` instead of the FQ symbol.
+-- Without the bare binding the cg_var_from_env short-tail fallback in
+-- cg_global_lookup_by_short fires and resolves to the canonical FQ.
 let cg_register_eff_ops
       : List Nat → Nat → Nat → CEnv → List (Pair Nat PlanVal) → Nat
       → Pair CEnv (Pair (List (Pair Nat PlanVal)) Nat)
@@ -7283,7 +8019,7 @@ let cg_register_eff_ops
             -- body = dispatch(tag, op_arg, k) = A(A(A(N(2), tag_val), N(1)), N(3))
             let body = cg_bapp (cg_bapp (cg_bapp (PNat 2) tag_val) (PNat 1)) (PNat 3) in
             let val = PLaw op_name (MkPair 3 body) in
-            let new_env = cenv_bind_global (cenv_bind_global env fq_op val) op_name val in
+            let new_env = cenv_bind_global env fq_op val in
             let new_compiled = Cons (MkPair fq_op val) compiled in
             cg_register_eff_ops rest eff_fq mod_name new_env new_compiled (add tag 1)
       }
@@ -7989,8 +8725,9 @@ let cg_pass3_go
   : List Decl → Nat → CEnv → List (Pair Nat (Pair Nat (Pair Nat Nat)))
   → List (Pair Nat PlanVal)
   → List (Pair Nat Expr) → List (Pair Nat (List Nat)) → List Nat
+  → List (Pair Nat (List Nat))
   → List (Pair Nat PlanVal)
-  = λ decls mod_name env ctab compiled lets_by_fq fq_to_members emitted →
+  = λ decls mod_name env ctab compiled lets_by_fq fq_to_members emitted cls_methods →
       match decls {
         | Nil → compiled
         | Cons decl rest →
@@ -7998,20 +8735,38 @@ let cg_pass3_go
               | 0 →
                   -- DLet: route through SCC.
                   let nm = decl_get_let_name decl in
+                  let cons = decl_get_let_constraints decl in
                   match (Reaver.BPLAN.eq nm 0) {
                     | 0 →
                         let fq = name_concat_dot mod_name nm in
                         match (assoc_lookup fq fq_to_members) {
                           | None →
                               -- No SCC entry (shouldn't happen): fall
-                              -- back to single-let compile.
-                              match (cg_compile_let_one nm
-                                       (decl_get_let_body decl)
-                                       mod_name env ctab compiled) {
-                                | MkPair new_env new_compiled →
-                                    cg_pass3_go rest mod_name new_env ctab
-                                      new_compiled lets_by_fq fq_to_members
-                                      emitted
+                              -- back to single-let compile.  Constrained
+                              -- lets are never multi-member (Python doesn't
+                              -- allow constraints on mutual-SCC members
+                              -- either), so route constraints through
+                              -- cg_compile_constrained_let.
+                              match cons {
+                                | Nil →
+                                    match (cg_compile_let_one nm
+                                             (decl_get_let_body decl)
+                                             mod_name env ctab compiled) {
+                                      | MkPair new_env new_compiled →
+                                          cg_pass3_go rest mod_name new_env ctab
+                                            new_compiled lets_by_fq fq_to_members
+                                            emitted cls_methods
+                                    }
+                                | Cons _ _ →
+                                    match (cg_compile_constrained_let nm cons
+                                             (decl_get_let_body decl)
+                                             mod_name env ctab cls_methods
+                                             compiled) {
+                                      | MkPair new_env new_compiled →
+                                          cg_pass3_go rest mod_name new_env ctab
+                                            new_compiled lets_by_fq fq_to_members
+                                            emitted cls_methods
+                                    }
                               }
                           | Some members →
                               let rep = cg_scc_rep members in
@@ -8022,7 +8777,11 @@ let cg_pass3_go
                                     match (nat_eq (length members) 1) {
                                       | 0 →
                                           -- Multi-member SCC: compile via
-                                          -- shared-pin encoding.
+                                          -- shared-pin encoding.  Constraints
+                                          -- on multi-member SCC bindings
+                                          -- are not supported (Python rejects
+                                          -- them via the SCC generalization
+                                          -- pass); silently ignored here.
                                           let pairs =
                                             cg_lookup_member_bodies members
                                               lets_by_fq in
@@ -8032,32 +8791,49 @@ let cg_pass3_go
                                                 cg_pass3_go rest mod_name
                                                   new_env ctab new_compiled
                                                   lets_by_fq fq_to_members
-                                                  new_emitted
+                                                  new_emitted cls_methods
                                           }
                                       | _ →
-                                          -- Singleton SCC: today's path.
-                                          match (cg_compile_let_one nm
-                                                   (decl_get_let_body decl)
-                                                   mod_name env ctab
-                                                   compiled) {
-                                            | MkPair new_env new_compiled →
-                                                cg_pass3_go rest mod_name
-                                                  new_env ctab new_compiled
-                                                  lets_by_fq fq_to_members
-                                                  new_emitted
+                                          -- Singleton SCC: route through
+                                          -- cg_compile_constrained_let if the
+                                          -- let carries constraints, otherwise
+                                          -- the existing unconstrained path.
+                                          match cons {
+                                            | Nil →
+                                                match (cg_compile_let_one nm
+                                                         (decl_get_let_body decl)
+                                                         mod_name env ctab
+                                                         compiled) {
+                                                  | MkPair new_env new_compiled →
+                                                      cg_pass3_go rest mod_name
+                                                        new_env ctab new_compiled
+                                                        lets_by_fq fq_to_members
+                                                        new_emitted cls_methods
+                                                }
+                                            | Cons _ _ →
+                                                match (cg_compile_constrained_let nm cons
+                                                         (decl_get_let_body decl)
+                                                         mod_name env ctab cls_methods
+                                                         compiled) {
+                                                  | MkPair new_env new_compiled →
+                                                      cg_pass3_go rest mod_name
+                                                        new_env ctab new_compiled
+                                                        lets_by_fq fq_to_members
+                                                        new_emitted cls_methods
+                                                }
                                           }
                                     }
                                 | _ →
                                     -- SCC already emitted; skip this decl.
                                     cg_pass3_go rest mod_name env ctab
                                       compiled lets_by_fq fq_to_members
-                                      emitted
+                                      emitted cls_methods
                               }
                         }
                     | _ →
                         -- Sentinel name=0: type-alias placeholder, skip.
                         cg_pass3_go rest mod_name env ctab compiled
-                          lets_by_fq fq_to_members emitted
+                          lets_by_fq fq_to_members emitted cls_methods
                   }
               | _ →
                   -- DInst or other non-let: compile in-line.
@@ -8076,12 +8852,12 @@ let cg_pass3_go
                                 | MkPair new_env new_compiled →
                                     cg_pass3_go rest mod_name new_env ctab
                                       new_compiled lets_by_fq fq_to_members
-                                      emitted
+                                      emitted cls_methods
                               }
                         }
                     | _ →
                         cg_pass3_go rest mod_name env ctab compiled
-                          lets_by_fq fq_to_members emitted
+                          lets_by_fq fq_to_members emitted cls_methods
                   }
             }
       }
@@ -8099,8 +8875,9 @@ let cg_pass3 : List Decl → Nat → CEnv → List (Pair Nat (Pair Nat (Pair Nat
       let graph         = cg_build_dep_graph decls mod_name in
       let sccs          = cg_tarjan_scc graph in
       let fq_to_members = cg_fq_to_scc_members sccs in
+      let cls_methods   = cg_collect_class_methods decls in
       cg_pass3_go decls mod_name env ctab compiled lets_by_fq
-        fq_to_members Nil
+        fq_to_members Nil cls_methods
 
 -- compile_program: compile a full program to a list of (fq_name, PlanVal) pairs
 -- compile_program: thread the four codegen passes and reverse the
@@ -8540,8 +9317,13 @@ let sr_resolve_decls
         | Nil → Nil
         | Cons decl rest →
             let new_decl = match decl {
-                             | DLet name body →
-                                 DLet name (sr_rewrite_expr body Nil gtab)
+                             | DLet name body_pair →
+                                 match body_pair {
+                                   | MkPair cons body →
+                                       DLet name
+                                         (MkPair cons
+                                           (sr_rewrite_expr body Nil gtab))
+                                 }
                              | DType _ _ → decl
                              | DExt _ _  → decl
                              | DClass _ _ → decl

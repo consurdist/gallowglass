@@ -34,7 +34,11 @@ Plus pre-existing xfail: `test_same_constructor_literal_field_collapses`
 Selfhost suite: 36 passed + 1 skipped (compile-self gate, env-gated) +
 3 xfailed.
 
-### Deferred to rc4 (1.0 follow-ups)
+### Promoted to rc4 (1.0 blockers — see `plans/phase_i_rc4.md`)
+
+The two items below were originally scheduled as 1.1.0 follow-ups but
+have been promoted to 1.0 acceptance criteria so the "self-hosted"
+qualifier on `ROADMAP.md §1.0` can be honestly claimed.
 
 * **Typeclass constrained-let codegen.**  ``let same : ∀ a. Eq a => a
   → a → Nat = λ x y → eq x y`` needs:
@@ -43,10 +47,8 @@ Selfhost suite: 36 passed + 1 skipped (compile-self gate, env-gated) +
     pointing directly to the method).
   - Call-site dict insertion (Python's ``_constrained_lets`` registry +
     ``_compile_constrained_app``).
-  Estimated 3-5 days.
 * **Effect handler CPS port.**  ``handle (do x ← op in body) { ... }``
   needs the CPS transform mirroring `bootstrap/codegen.py::_compile_handle`.
-  Estimated 3-5 days.
 
 ---
 
