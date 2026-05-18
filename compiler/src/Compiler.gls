@@ -593,7 +593,7 @@ type PlanVal =
                                     -- by cg_register_eff_ops.  The tag is the
                                     -- global op-index (matching Python's
                                     -- _next_op_tag counter), needed by
-                                    -- cg_compile_dispatch_fn so each handler
+                                    -- cg_build_dispatch_law so each handler
                                     -- arm can look up the actual dispatch
                                     -- tag for its op.  Without this, the
                                     -- self-host assigned tags positionally
@@ -7167,7 +7167,31 @@ let cps_run_law : PlanVal
 
 -- Virtual de Bruijn index for resume during arm body compilation.
 -- Substituted with the real resume expression before embedding in the law body.
+--
+-- Invariant: 9999999 is safe as a sentinel because no real de Bruijn
+-- slot in a handler arm body can reach this index.  Handler arm bodies
+-- live inside a dispatch-law of arity ``n_cap + 4`` where ``n_cap`` is
+-- the number of free-locals captured from the enclosing law — bounded
+-- by source structure, never near 10⁷.  If the compiler ever wraps a
+-- handler in a context where ``n_cap`` could approach this sentinel,
+-- bump the constant or switch to a structured sentinel.
 let virtual_resume_idx : Nat = 9999999
+
+-- Suffix nats for naming sub-laws produced during handler / do-notation
+-- codegen.  Each is the LE-packed ``encode_name(suffix)``.  Used via
+-- ``cg_concat_under hint nn_<suffix>`` to build deterministic names
+-- (e.g. ``comp_do``, ``result_handle``, ``inner_cont``).  These survive
+-- compilation as readable symbols in the emitted Plan Asm, which is
+-- load-bearing for debuggability.  Mirror Python's f'{name_hint}_<suffix>'
+-- in ``bootstrap/codegen.py::_compile_{do,handle,return_fn,dispatch_fn}``.
+let nn_do_suffix       : Nat = 28516                  -- "do"
+let nn_cont_suffix     : Nat = 1953394531             -- "cont"
+let nn_handle_suffix   : Nat = 111516215828840        -- "handle"
+let nn_dispatch_suffix : Nat = 7521983764486121828    -- "dispatch"
+let nn_return_suffix   : Nat = 121437875889522        -- "return"
+let nn_body_suffix     : Nat = 2036625250             -- "body"
+let nn_rhs_suffix      : Nat = 7563378                -- "rhs"
+let nn_comp_suffix     : Nat = 1886220131             -- "comp"
 
 -- subst_virtual_resume: walk PlanVal, replacing PNat(virtual_idx) with replacement.
 -- Only PNat and PApp nodes are affected; PLaw/PPin are opaque (no recursion needed
@@ -7221,17 +7245,17 @@ let cg_op_tag_lookup : Nat → CEnv → Nat
             }
       }
 
--- cg_compile_arm_bodies: compile each handle-arm's body and substitute
+-- cg_emit_handler_arm_bodies: compile each handle-arm's body and substitute
 -- the virtual resume sentinel with the actual resume expression.  Two
 -- resume expressions are passed in: ``deep`` (k_open of dispatch_current
 -- — the default, reinstalls this handler) and ``shallow`` (k_open of
 -- dispatch_parent — for ``once`` arms, the handler is discharged).
 --
 -- Returns a list of ``(op_name_fq, compiled_body)`` pairs in source
--- order.  The caller (cg_build_handle_dispatch) then looks up the
+-- order.  The caller (cg_dispatch_tag_ladder) then looks up the
 -- dispatch tag for each op_name via POpTag in env.globals and sorts
 -- by tag before building the Elim cascade.
-let cg_compile_arm_bodies
+let cg_emit_handler_arm_bodies
       : List (Pair Nat (Pair Nat (Pair Nat (Pair Nat Expr)))) → CEnv → Nat → PlanVal → PlanVal
       → (Expr → CEnv → List (Pair Nat (Pair Nat (Pair Nat Nat))) → Nat → PlanVal)
       → List (Pair Nat (Pair Nat (Pair Nat Nat))) → Nat → List (Pair Nat PlanVal)
@@ -7380,9 +7404,9 @@ let cg_build_op_dispatch_chain : List (Pair Nat PlanVal) → PlanVal → PlanVal
         | _ → wild_val
       }
 
--- cg_build_handle_dispatch: build the op-tag Elim dispatch for the
+-- cg_dispatch_tag_ladder: build the op-tag Elim dispatch for the
 -- handler.  Pipeline:
---   1. Compile each arm body (cg_compile_arm_bodies) — picks resume
+--   1. Compile each arm body (cg_emit_handler_arm_bodies) — picks resume
 --      expression per arm based on once_flag.  Result is
 --      ``[(op_name_fq, body), …]`` in source order.
 --   2. Pair each arm with its actual op-tag (cg_pair_arms_with_tags
@@ -7393,7 +7417,7 @@ let cg_build_op_dispatch_chain : List (Pair Nat PlanVal) → PlanVal → PlanVal
 -- Mirrors Python's ``_compile_dispatch_fn`` + ``_build_tag_chain`` flow
 -- in bootstrap/codegen.py.  Closes Gnome's rc4 finding: positional
 -- dispatch silently mis-routes any handler covering a non-zero-tag op.
-let cg_build_handle_dispatch
+let cg_dispatch_tag_ladder
       : List (Pair Nat (Pair Nat (Pair Nat (Pair Nat Expr)))) → CEnv
       → Nat → Nat → Nat → PlanVal → PlanVal → PlanVal
       → (Expr → CEnv → List (Pair Nat (Pair Nat (Pair Nat Nat))) → Nat → PlanVal)
@@ -7401,7 +7425,7 @@ let cg_build_handle_dispatch
   = λ arms dispatch_env k_idx op_arg_idx op_tag_idx forward_body resume_deep resume_shallow ce ctab hint →
       match (nat_eq (length arms) 0) {
         | 0 →
-            let op_body_pairs = cg_compile_arm_bodies arms dispatch_env op_arg_idx
+            let op_body_pairs = cg_emit_handler_arm_bodies arms dispatch_env op_arg_idx
                                   resume_deep resume_shallow ce ctab hint in
             let tag_body_pairs = cg_pair_arms_with_tags op_body_pairs dispatch_env in
             let sorted = cg_sort_arm_pairs tag_body_pairs in
@@ -7411,14 +7435,14 @@ let cg_build_handle_dispatch
         | _ → forward_body
       }
 
--- cg_compile_dispatch_fn: build dispatch law for handle expression
+-- cg_build_dispatch_law: build dispatch law for handle expression
 -- Open-continuation protocol: k_open is 2-arg (dispatch, value).
 -- Dispatch law: L(n_cap+4, name, body)
 -- Slots: [cap_1..cap_n] [dispatch_parent] [op_tag] [op_arg] [k_open]
 -- Deep handler: resume = k_open(dispatch_current)  — reinstalls this handler.
 -- Once  handler: resume = k_open(dispatch_parent)  — discharges this handler.
 -- Unhandled tags forward to dispatch_parent with k_open wrapped by forward_k.
-let cg_compile_dispatch_fn
+let cg_build_dispatch_law
       : List (Pair Nat (Pair Nat (Pair Nat (Pair Nat Expr)))) → CEnv
       → List (Pair Nat (Pair Nat (Pair Nat Nat))) → Nat
       → (Expr → CEnv → List (Pair Nat (Pair Nat (Pair Nat Nat))) → Nat → PlanVal) → PlanVal
@@ -7427,8 +7451,7 @@ let cg_compile_dispatch_fn
       -- name ``encode_name(hint + "_dispatch")``.  Mirrors Python's
       -- f'{name_hint}_dispatch' construction in _compile_dispatch_fn.
       -- LE-packed encode_name("dispatch") = 7521983764486121828.
-      let nn_dispatch_s = 7521983764486121828 in
-      let disp_name = cg_concat_under hint nn_dispatch_s in
+      let disp_name = cg_concat_under hint nn_dispatch_suffix in
       match (nat_eq (length op_arms) 0) {
         | 0 →
             -- Collect free vars from all arm bodies
@@ -7464,7 +7487,7 @@ let cg_compile_dispatch_fn
             let dispatch_current = cg_bapp dispatch_fn_base (PNat dp_idx) in
             -- Resume expressions: deep (default) reinstalls THIS dispatch;
             -- shallow (``once``) skips up to dispatch_parent so the handler
-            -- is discharged.  cg_compile_arm_bodies picks per-arm via the
+            -- is discharged.  cg_emit_handler_arm_bodies picks per-arm via the
             -- arm's once_flag.  Mirrors Python's _compile_dispatch_fn
             -- L3584-3589 branch on ``arm.once``.
             let resume_deep    = cg_bapp (PNat k_idx) dispatch_current in
@@ -7473,7 +7496,7 @@ let cg_compile_dispatch_fn
             let k_open_forwarded = cg_bapp (cg_bapp (PPin cps_forward_k) (PNat k_idx)) dispatch_fn_base in
             let forward_body = cg_bapp (cg_bapp (cg_bapp (PNat dp_idx) (PNat op_tag_idx)) (PNat op_arg_idx)) k_open_forwarded in
             -- Build tag dispatch with virtual resume substitution
-            let dispatch_body = cg_build_handle_dispatch op_arms dispatch_env k_idx op_arg_idx op_tag_idx forward_body resume_deep resume_shallow ce ctab hint in
+            let dispatch_body = cg_dispatch_tag_ladder op_arms dispatch_env k_idx op_arg_idx op_tag_idx forward_body resume_deep resume_shallow ce ctab hint in
             let dispatch_law = PPin (PLaw disp_name (MkPair total_arity dispatch_body)) in
             cg_apply_free_locals dispatch_law free_vars env
         | _ →
@@ -7493,8 +7516,7 @@ let cg_compile_return_fn
       : Expr → CEnv → List (Pair Nat (Pair Nat (Pair Nat Nat))) → Nat
       → (Expr → CEnv → List (Pair Nat (Pair Nat (Pair Nat Nat))) → Nat → PlanVal) → PlanVal
   = λ ret_fn env ctab hint ce →
-      let nn_return_s = 121437875889522 in    -- "return" LE
-      let ret_name = cg_concat_under hint nn_return_s in
+      let ret_name = cg_concat_under hint nn_return_suffix in
       match (cg_is_lam ret_fn) {
         | 0 →
             -- Not an ELam — use the identity-handler default.
@@ -7523,7 +7545,7 @@ let cg_compile_return_fn
 --
 -- CPS law name = ``encode_name(hint + "_handle")``; the ``comp`` sub-expr
 -- is compiled with hint suffix ``_comp``.  Dispatch and return helpers
--- carry their own suffixes (see cg_compile_dispatch_fn / _return_fn).
+-- carry their own suffixes (see cg_build_dispatch_law / _return_fn).
 -- Mirrors bootstrap/codegen.py::_compile_handle.
 let cg_compile_handle
       : Expr → CEnv → List (Pair Nat (Pair Nat (Pair Nat Nat))) → Nat → PlanVal
@@ -7545,10 +7567,8 @@ let cg_compile_handle
                   let ko_idx = add n_cap 2 in
                   -- Sub-hint suffixes (match Python).
                   -- LE-packed encode_name() of each suffix.
-                  let nn_comp_s   = 1886220131 in            -- "comp"
-                  let nn_handle_s = 111516215828840 in       -- "handle"
-                  let comp_hint = cg_concat_under hint nn_comp_s in
-                  let cps_name  = cg_concat_under hint nn_handle_s in
+                  let comp_hint = cg_concat_under hint nn_comp_suffix in
+                  let cps_name  = cg_concat_under hint nn_handle_suffix in
                   -- Build cps env
                   let g = cenv_globals env in
                   let cps_env0 = cenv_make g Nil 0 None in
@@ -7557,7 +7577,7 @@ let cg_compile_handle
                   -- Compile comp in cps env
                   let comp_val = ce comp cps_env ctab comp_hint in
                   -- Build dispatch function
-                  let dispatch_fn = cg_compile_dispatch_fn op_arms cps_env ctab hint ce in
+                  let dispatch_fn = cg_build_dispatch_law op_arms cps_env ctab hint ce in
                   -- Build return function
                   let return_fn = cg_compile_return_fn ret_fn cps_env ctab hint ce in
                   -- dispatch(dp): apply dp as first arg to dispatch_fn
@@ -7616,15 +7636,12 @@ let cg_compile_do
                   let inner_dispatch_idx = add n_cap 2 in
                   let inner_x_idx        = add n_cap 3 in
                   -- Sub-law / sub-compile hints (match Python's suffix scheme).
-                  -- LE-packed encode_name() of each suffix.
-                  let nn_body = 2036625250 in          -- "body"
-                  let nn_rhs  = 7563378 in             -- "rhs"
-                  let nn_cont = 1953394531 in          -- "cont"
-                  let nn_do   = 28516 in               -- "do"
-                  let body_hint  = cg_concat_under hint nn_body in
-                  let rhs_hint   = cg_concat_under hint nn_rhs in
-                  let cont_name  = cg_concat_under hint nn_cont in
-                  let do_name    = cg_concat_under hint nn_do in
+                  -- Suffix nats are hoisted top-level (see nn_*_suffix
+                  -- definitions near virtual_resume_idx).
+                  let body_hint  = cg_concat_under hint nn_body_suffix in
+                  let rhs_hint   = cg_concat_under hint nn_rhs_suffix in
+                  let cont_name  = cg_concat_under hint nn_cont_suffix in
+                  let do_name    = cg_concat_under hint nn_do_suffix in
                   -- Build inner env
                   let g = cenv_globals env in
                   let inner_env0 = cenv_make g Nil 0 None in
@@ -8346,7 +8363,7 @@ let cg_register_eff_ops
             -- body = dispatch(tag, op_arg, k) = A(A(A(N(2), tag_val), N(1)), N(3))
             let body = cg_bapp (cg_bapp (cg_bapp (PNat 2) tag_val) (PNat 1)) (PNat 3) in
             let val = PLaw op_name (MkPair 3 body) in
-            -- env carries the POpTag-wrapped val so cg_compile_dispatch_fn can
+            -- env carries the POpTag-wrapped val so cg_build_dispatch_law can
             -- look up the per-arm op-tag at handler compile time; `compiled`
             -- (the emit-time bindings) gets the bare PLaw — emit never sees
             -- POpTag (cg_var_from_env unwraps before tagging for emission).

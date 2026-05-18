@@ -27,3 +27,6 @@ Untitled[0-9]*.ipynb
 # Mathematica scratch
 *.nb
 *.nb.bak
+
+# Local design notes — not version-controlled
+plans/mcp_starter.md
