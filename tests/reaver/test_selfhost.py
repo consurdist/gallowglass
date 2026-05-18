@@ -1104,7 +1104,7 @@ class TestPhaseG3ByteIdentity(unittest.TestCase):
         Python's CPS output byte-for-byte: ``parse_handle_*`` use the
         ``_pe`` closure-passing convention so the mutual-SCC shared-pin
         slot resolves correctly inside lifted match-arm sub-laws, and
-        ``cg_build_handle_dispatch`` matches the
+        ``cg_dispatch_tag_ladder`` matches the
         ``bootstrap/codegen.py::_build_tag_chain`` shape
         (op_tag-direct scrutinee + const2-wrapped wild + arm body at
         Elim's zero slot).  See PR #106 for the full breakdown."""

@@ -1,23 +1,24 @@
 # Phase I — Toward 1.0.0-rc4
 
-**Status:** rc4-1 ✅ closed; rc4-2 deferred to a follow-up continuation.
+**Status:** ✅ closed.  Both rc4 gaps closed, Phase H compile-self
+fixed point verified, red-team correctness findings addressed.  Tag
+`v1.0.0-rc4` shipped 2026-05-17.  See `ROADMAP.md §1.0` for the
+promoted acceptance criteria.
 
-**Scope:** close the two remaining self-host codegen gaps that rc3 mapped
-but didn't close, so the 1.0 "self-hosted" qualifier can be honestly
-claimed.  See `ROADMAP.md §1.0` for the promoted acceptance criteria.
+This doc is preserved as the historical record of the rc4 arc.  The
+current state is the master branch; this is what landed and why.
 
-The Python bootstrap already compiles both features correctly — these are
-pure byte-identity gaps in the self-host's emission, not user-facing
-correctness bugs.
-
-## Status as of 2026-05-16
+## Final status
 
 | Gate | Status | Notes |
 |---|---|---|
-| `test_typeclass_simple` | ✅ closed | xfail flipped to pass; byte-identical to Python |
-| `test_do_notation_simple` | ⏳ deferred | rc4-2; not yet started |
-| Phase H `test_compile_self` | ⏳ pending | needs re-run after Compiler.gls changes (long; ~45 min) |
-| `compiler/dist/Compiler.plan` regen | ✅ done | MANIFEST updated, sanity tests pass |
+| `test_typeclass_simple` | ✅ closed | xfail flipped to pass; byte-identical to Python (PR #104) |
+| `test_do_notation_simple` | ✅ closed | xfail flipped (PR #106); single + multi-arm dispatch (PR #107) |
+| Phase H `test_compile_self` | ✅ passed | 46 min under Reaver no-jets; canonical compile-self fixed point verified |
+| `compiler/dist/Compiler.plan` regen | ✅ done | MANIFEST updated, sanity tests pass; pre-commit hook gates drift (PR #105) |
+| Red-team passes | ✅ ran | Angel / Gnome / Dwarf / Hobbit / Elf against the rc4 tag |
+| Red findings | ✅ fixed | PR #110 (skip_eff_op_type EOF guard + per-arm op-tag lookup) |
+| Yellow findings | ✅ fixed | PR #110 (handler arm arg_name + `once` modifier) |
 
 ## rc4-1 — Typeclass constrained-let codegen  ✅
 

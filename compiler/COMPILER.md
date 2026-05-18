@@ -287,6 +287,29 @@ Additional self-hosting constraints:
 - **Association-list maps only** (no BST until `Core.Map` is available)
 - **No text interpolation** (build error messages by concatenation)
 
+### Current handler limitations
+
+These are documented sharp edges in the self-host's handler codegen.
+The Python bootstrap supports each feature; the self-host's parity
+work is tracked under post-1.0 follow-ups.
+
+- **Single atom-pattern per arm.**  The spec at
+  `spec/06-surface-syntax.md` L481 allows ``AtomPat*`` (zero or more
+  atom patterns) for the op-arg slot.  The self-host parses exactly
+  one (or wildcard ``_``).  Multi-arg pattern destructuring per arm
+  is post-1.0.
+- **Sequential op tags assumed contiguous within an effect.**  Per-arm
+  op-tag lookup IS implemented (PR #110) so handlers across multiple
+  effects work correctly.  Programmer-visible ordering of arms within
+  a single eff also works — the dispatch is by actual tag.
+- **No malformed-input recovery in `handle` parser.**  Truncated
+  handler syntax (missing return arm, missing body after ``→``,
+  unbalanced braces in the comp expression) silently produces
+  ``EVar 0`` sentinels that propagate to codegen, often yielding
+  ``unbound variable`` errors rather than a parse-error diagnostic
+  with file:line:col.  Truncated ``eff`` declarations no longer hang
+  (PR #110 EOF guard), but error quality is still a recovery gap.
+
 ---
 
 ## 9. File Layout
