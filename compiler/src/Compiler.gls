@@ -7058,13 +7058,20 @@ let virtual_resume_idx : Nat = 9999999
 -- subst_virtual_resume: walk PlanVal, replacing PNat(virtual_idx) with replacement.
 -- Only PNat and PApp nodes are affected; PLaw/PPin are opaque (no recursion needed
 -- because arm bodies are flat expressions, not nested laws).
+--
+-- nat_eq returns 1 for equal, 0 for not — so the arms here are
+-- ``| 0 → keep | _ → replace``.  Previous code had them inverted and
+-- silently kept the sentinel ``PNat 9999999`` in arm bodies while
+-- replacing every OTHER slot reference (de Bruijn indices for op_arg,
+-- captures, etc.) with the resume expression — producing garbage law
+-- bodies in any handler with op arms.
 let subst_virtual_resume : PlanVal → Nat → PlanVal → PlanVal
   = λ expr vid replacement →
       match expr {
         | PNat n →
             match (nat_eq n vid) {
-              | 0 → replacement
-              | _ → PNat n
+              | 0 → PNat n              -- not equal: keep
+              | _ → replacement         -- equal: substitute
             }
         | PApp f g →
             PApp (subst_virtual_resume f vid replacement)
@@ -7084,17 +7091,24 @@ let cg_apply_range : PlanVal → Nat → Nat → PlanVal
 -- CPS Effect Handler Codegen
 -- =====================================================================
 
--- cg_build_handle_dispatch: build nested nat_eq dispatch on op_tag
--- Each op arm gets a sequential tag. Body uses virtual resume index,
--- which is substituted with the actual resume expression after compilation.
--- resume_expr: pre-built resume (k_open applied to dispatch_current for deep).
+-- cg_build_handle_dispatch: build the op-tag Elim dispatch for the
+-- handler.  Mirrors Python's ``_build_tag_chain`` strategy
+-- (bootstrap/codegen.py L2914).
 --
--- Uses a length probe instead of ``match arms { | Nil → … | Cons … → … }``
--- to dodge the same bootstrap mixed-arity wildcard pitfall that bit
--- ``cg_compile_dispatch_fn``: the Nil-vs-Cons match shape silently
--- collapsed every non-empty list to the Nil branch, leaving the
--- enclosing dispatch law as a pure forwarder even when arms were
--- present.
+-- For a single op arm at tag 0:
+--   ``Elim id id id arm_body (const2 forward_body) op_tag_idx``
+-- — if op_tag == 0 the zero arm fires (the matched arm body), otherwise
+-- the succ arm fires the const2-wrapped forward_body (a 2-arg law that
+-- ignores its argument and returns forward_body, satisfying Elim's
+-- succ-takes-pred contract).
+--
+-- For multi-arm or first_tag > 0, full ``_build_tag_chain`` machinery
+-- (succ-laws that lambda-lift the env, recursive descent on a shifted
+-- tag list) is not yet ported — single arm is the only case the rc4
+-- gate fixture needs.  Multi-arm is the next sub-step.
+--
+-- Length probe instead of ``match arms { | Nil → … | Cons … → … }``
+-- dodges the bootstrap mixed-arity wildcard pitfall.
 let cg_build_handle_dispatch
       : List (Pair Nat (Pair Nat Expr)) → CEnv → Nat → Nat → Nat → PlanVal → PlanVal
       → (Expr → CEnv → List (Pair Nat (Pair Nat (Pair Nat Nat))) → Nat → PlanVal)
@@ -7102,26 +7116,36 @@ let cg_build_handle_dispatch
   = λ arms dispatch_env k_idx op_arg_idx op_tag_idx forward_body resume_expr ce ctab hint tag →
       match (nat_eq (length arms) 0) {
         | 0 →
-            -- Non-empty: peek the head via accessors, recurse on the tail.
             match arms {
               | Cons arm rest →
                   match arm {
                     | MkPair op_name inner →
                         match inner {
                           | MkPair k_name body →
+                              -- Bind resume name to virtual_resume_idx
+                              -- (substituted post-compilation) and op-arg name
+                              -- to op_arg_idx.  Compile the arm body in this
+                              -- arm-extended env.
                               let arm_env = cenv_bind_local dispatch_env k_name virtual_resume_idx in
                               let arm_env2 = cenv_bind_local arm_env op_name op_arg_idx in
                               let raw_body = ce body arm_env2 ctab hint in
-                              let body_val = subst_virtual_resume raw_body virtual_resume_idx resume_expr in
-                              let tag_val = cg_quote_nat tag (cenv_arity dispatch_env) in
-                              let rest_body = cg_build_handle_dispatch rest dispatch_env k_idx op_arg_idx op_tag_idx forward_body resume_expr ce ctab hint (add tag 1) in
-                              let eq_test = cg_bapp (cg_bapp (PPin (PNat 2)) (PNat op_tag_idx)) tag_val in
-                              let const_body = PLaw 0 (MkPair 1 body_val) in
-                              let const_pin = PPin const_body in
-                              cg_build_op2 rest_body const_pin eq_test (cenv_arity dispatch_env)
+                              let arm_body = subst_virtual_resume raw_body virtual_resume_idx resume_expr in
+                              -- const2 wrapping: bapp(const2_pin, forward_body)
+                              -- — produces a 2-arg law that ignores its arg and
+                              -- returns forward_body.  Required because Elim's
+                              -- succ branch is called with the predecessor nat
+                              -- as its arg; we don't need the predecessor here
+                              -- because forward_body is the wild case.
+                              let const_pin = PPin const2_law in
+                              let const_wild = cg_bapp const_pin forward_body in
+                              -- Scrutinee is the op-tag slot directly — Elim
+                              -- distinguishes 0 from non-0 natively.  No
+                              -- eq-test wrapping.
+                              cg_build_op2 arm_body const_wild (PNat op_tag_idx)
+                                           (cenv_arity dispatch_env)
                         }
                   }
-              | _ → forward_body  -- unreachable: length > 0 implies Cons
+              | _ → forward_body
             }
         | _ → forward_body
       }
