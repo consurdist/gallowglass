@@ -7156,10 +7156,15 @@ let cg_compile_return_fn
       : Expr → CEnv → List (Pair Nat (Pair Nat (Pair Nat Nat))) → Nat
       → (Expr → CEnv → List (Pair Nat (Pair Nat (Pair Nat Nat))) → Nat → PlanVal) → PlanVal
   = λ ret_fn env ctab hint ce →
-      match ret_fn {
-        | ELam ret_var ret_body →
-            let nn_return_s = 121437875889522 in    -- "return" LE
-            let ret_name = cg_concat_under hint nn_return_s in
+      let nn_return_s = 121437875889522 in    -- "return" LE
+      let ret_name = cg_concat_under hint nn_return_s in
+      match (cg_is_lam ret_fn) {
+        | 0 →
+            -- Not an ELam — use the identity-handler default.
+            PPin cps_id_law
+        | _ →
+            let ret_var  = cg_lam_param ret_fn in
+            let ret_body = cg_lam_body  ret_fn in
             let free_vars = cg_free_vars ret_body (Cons ret_var Nil) env in
             let n_cap = length free_vars in
             let total_arity = add n_cap 1 in
@@ -7172,9 +7177,6 @@ let cg_compile_return_fn
             let body_val = ce ret_body ret_env3 ctab ret_name in
             let ret_law = PPin (PLaw ret_name (MkPair total_arity body_val)) in
             cg_apply_free_locals ret_law free_vars env
-        | _ →
-            -- Default: identity
-            PPin cps_id_law
       }
 
 -- cg_compile_handle: compile EHandle expression

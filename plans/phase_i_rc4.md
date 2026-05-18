@@ -187,31 +187,45 @@ byte in `result_return` law body).
 
 For ``handle comp { | return rr → body }``, the constructed
 ``result_return`` law has the right name and arity, but its body is
-``PNat 0`` (emits as ``_0``) instead of the compiled ``body``.  The
-ELam arm in ``cg_compile_return_fn`` clearly fires (we see the
-non-default ``result_return`` name in the output) yet
-``body_val = ce ret_body ret_env3 ctab ret_name`` produces ``PNat 0``
-for both ``ret_body = ENat 42`` (should be ``PApp(PNat 0)(PNat 42)``)
-and ``ret_body = EVar rr`` (should be ``PNat 1``, since rr is bound at
-val_idx=1).
+``PNat 0`` (emits as ``_0``) instead of the compiled ``body``.
 
-Hypotheses to investigate next:
+**Confirmed via in-tree probes** (replaced ``body_val`` in
+``cg_compile_return_fn`` with sentinels in turn):
 
-- ``parse_handle_expr``'s parse of the return body — maybe
-  ``parse_expr rt (tok_tail rest5)`` returns ``EVar 0`` sentinel (the
-  expression parser failing silently) instead of the actual body.
-  Verifiable by comparing Python's parsed AST for the gate fixture
-  with what the self-host's parser would produce.
-- Lambda-lifted sub-law capture in ``cg_compile_return_fn``'s ELam
-  arm.  The 13-let chain inside the arm body might be triggering a
-  bootstrap-codegen mis-lift where ``ce`` (the compile-function
-  closure parameter) is captured incorrectly.  Test by replacing
-  ``ce`` with the direct ``cg_compile_expr`` name — should be safe
-  since both are in the same mutual SCC.
-- The ``cps_id_law`` default path being silently selected after all,
-  with the law name appearing to be ``result_return`` because of
-  some other emit-side path.  Check by adding a sentinel like
-  ``PLaw 99999 …`` in the wildcard arm to see which branch fires.
+* ``cg_quote_nat 99 1`` emits ``99`` → the PLaw construction path is
+  correct; the law accepts whatever body_val we give it.
+* ``cg_quote_nat (cenv_arity ret_env3)`` emits ``99`` (quoted nat) →
+  ``ret_env3.arity == 1`` as expected.
+* ``ce (ENat 77) ret_env3 ctab ret_name`` emits ``77`` → ``ce`` (the
+  compile-function closure parameter) compiles ENat 77 correctly.
+* ``cg_quote_nat (expr_tag ret_fn) …`` emits ``2`` → ``ret_fn`` IS an
+  ``ELam`` (tag 2).
+* ``cg_quote_nat (expr_tag (cg_lam_body ret_fn)) …`` emits ``0`` →
+  the body extracted from the ELam has ``expr_tag == 0`` (EVar).
+* ``cg_quote_nat (cg_evar_name (cg_lam_body ret_fn)) …`` emits ``0`` →
+  it's specifically ``EVar 0`` — the parser-failure sentinel.
+
+So the bug is upstream of cg_compile_return_fn: ``parse_handle_expr``'s
+second ``parse_expr rt (tok_tail rest5)`` call (parsing the return-arm
+body after ``→``) is returning ``MkPair (EVar 0) rest`` even when the
+body is a simple ``ENat 42``.  The first ``parse_expr rt toks`` call in
+the same function (parsing ``comp``) works correctly, so it's the
+nested-arm-body position that's broken, not parse_expr generally.
+
+This points at a mutual-SCC compilation issue: ``parse_handle_expr``
+lives in a 5-member SCC with ``parse_expr``, ``parse_expr_dispatch``,
+``parse_handle_arms``, ``parse_handle_op_arm``.  The shared-pin slot
+resolution for ``parse_expr`` inside a deeply-nested match arm seems
+to be picking up something else.
+
+**Attempted workaround (reverted):** lifting the second parse_expr
+into its own helper (``parse_handle_expr_after_ret``) caused
+``parse_handle_expr`` to return ``EVar 0`` for the WHOLE expression,
+not just the body — likely the helper joined the same SCC and
+introduced a different breakage.  A successful workaround probably
+needs to break the SCC entirely: move the body parser to a separate
+non-recursive helper, or restructure parse_handle_expr to compute
+the return body BEFORE the nested match arms via direct let binding.
 
 ### Replay loop
 
@@ -226,8 +240,11 @@ EOF
 python3 tools/selfcompile.py -v /tmp/handle_return_42.gls
 ```
 
-Each iteration ~1s.  Once `result_return` body matches, run
-`/tmp/effect_fixture.gls` to confirm end-to-end.
+Each iteration ~1s.  Probes can be inserted in ``cg_compile_return_fn``
+(near L7160) — the helper-accessor approach (``cg_lam_param`` /
+``cg_lam_body`` / ``cg_evar_name``) is the canonical workaround for
+the Expr destructuring pitfall.  Once ``result_return`` body matches,
+run ``/tmp/effect_fixture.gls`` to confirm end-to-end.
 
 ## rc4-2 (original) — Effect handler CPS alignment
 
