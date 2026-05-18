@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+#
+# pre-commit hook — catch MANIFEST drift before it hits CI.
+#
+# CI runs tests/sanity/test_seed_compiler_plan.py, which checks the
+# BLAKE3 and size of `compiler/src/Compiler.gls` against
+# `compiler/dist/MANIFEST.json`.  Editing Compiler.gls without also
+# refreshing the seed Compiler.plan + MANIFEST entries causes that
+# test to fail.  This hook runs the same check locally whenever
+# Compiler.gls or MANIFEST.json is staged, so the drift surfaces at
+# commit time instead of waiting on CI.
+#
+# Install with `tools/install-hooks.sh`.  Bypass for a one-off commit
+# with `git commit --no-verify` (but don't ship drift to CI).
+#
+set -euo pipefail
+
+# Only re-run the sanity test when files it covers are actually
+# staged — otherwise this hook is a no-op.
+RELEVANT='^compiler/(src/Compiler\.gls|dist/(Compiler\.plan|MANIFEST\.json))$'
+
+if ! git diff --cached --name-only | grep -qE "$RELEVANT"; then
+    exit 0
+fi
+
+echo "[pre-commit] checking MANIFEST drift…"
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+cd "$REPO_ROOT"
+
+if ! python3 -m pytest -q tests/sanity/test_seed_compiler_plan.py; then
+    cat <<'EOF' >&2
+
+[pre-commit] MANIFEST drift detected.
+
+Compiler.gls or MANIFEST.json was modified but the BLAKE3 / size_bytes
+entries no longer match the on-disk files.  Re-bootstrap the seed and
+refresh the manifest:
+
+  python3 -c "
+  import sys, os, hashlib
+  sys.setrecursionlimit(100000)
+  from bootstrap.lexer import lex
+  from bootstrap.parser import parse
+  from bootstrap.scope import resolve
+  from bootstrap.codegen import compile_program
+  from bootstrap.emit_pla import emit_program
+  src = open('compiler/src/Compiler.gls').read()
+  prog = parse(lex(src, 'Compiler.gls'), 'Compiler.gls')
+  resolved, _ = resolve(prog, 'Compiler', {}, 'Compiler.gls')
+  compiled = compile_program(resolved, 'Compiler')
+  out = emit_program(compiled)
+  open('compiler/dist/Compiler.plan', 'w').write(out)
+  print(os.path.getsize('compiler/dist/Compiler.plan'))
+  "
+
+Then update compiler/dist/MANIFEST.json with the new size_bytes and
+blake3 (via `blake3` Python package or `b3sum`).  See
+`tests/sanity/test_seed_compiler_plan.py` for the expected fields.
+
+To bypass this hook for a one-off commit: `git commit --no-verify`.
+EOF
+    exit 1
+fi
