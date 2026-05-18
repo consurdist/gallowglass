@@ -1414,6 +1414,21 @@ let tok_eat_ident : List Token → Pair Nat (List Token)
         | _ → MkPair 0 toks
       }
 
+-- tok_eat_ident_or_wild: like tok_eat_ident, but a leading `_` token is
+-- accepted and rewritten to `kw_underscore` (0x5F).  Used by handler-arm
+-- parsing where the op-arg or resume slot may be the wildcard.  Without
+-- this the wildcard terminates the arm parse with name=0, collapsing
+-- every wildcard-form arm to a sentinel arm and giving the enclosing
+-- handler an effectively empty arm list.  Defined here (next to
+-- tok_eat_ident) so that source-order SCC compilation reaches it
+-- before parse_handle_op_arm's SCC fires via parse_expr.
+let tok_eat_ident_or_wild : List Token → Pair Nat (List Token)
+  = λ toks →
+      match (tok_is toks TkUnderscore) {
+        | 0 → tok_eat_ident toks
+        | _ → MkPair kw_underscore (tok_tail toks)
+      }
+
 -- skip tokens until TkEqual is consumed; used to discard type annotations
 -- tok_skip_to_equal: walk tokens until we hit the `=` that ends a type
 -- annotation.  Uses Reaver.BPLAN.eq instead of nat_eq because `t` may be
@@ -3269,12 +3284,12 @@ let parse_handle_op_arm
             match op_name {
               | 0 → MkPair (MkPair 0 (MkPair 0 (EVar 0))) toks
               | _ →
-                match (tok_eat_ident rest) {
+                match (tok_eat_ident_or_wild rest) {
                   | MkPair arg_name rest2 →
                       match arg_name {
                         | 0 → MkPair (MkPair op_name (MkPair 0 (EVar 0))) rest
                         | _ →
-                          match (tok_eat_ident rest2) {
+                          match (tok_eat_ident_or_wild rest2) {
                             | MkPair k_name rest3 →
                                 match k_name {
                                   | 0 → MkPair (MkPair op_name (MkPair arg_name (EVar 0))) rest2
@@ -6964,30 +6979,43 @@ let cps_id_open : PlanVal = PLaw 0 (MkPair 2 (PNat 2))
 let nn_null_dispatch : Nat = 0x68637461707369645f6c6c756e5f  -- "_null_dispatch"
 let cps_null_dispatch : PlanVal = PLaw nn_null_dispatch (MkPair 3 (PPin (PNat 0)))
 
--- _compose: L(3, name, A(N(1), A(N(2), N(3)))) — compose(f, g, x) = f(g(x))
-let nn_compose : Nat = 0x65736f706d6f635f  -- "_compose"
-let cps_compose : PlanVal = PLaw nn_compose (MkPair 3 (PApp (PNat 1) (PApp (PNat 2) (PNat 3))))
+-- Law bodies below use ``cg_bapp`` (= App(App(N 0, f), x)) for every
+-- application node so the emit-side body printer reads them as plain
+-- App spines.  A raw ``App(App(N 1, rhs), body)`` shape would be
+-- interpreted by emit as the let-binding form ``_d(rhs)\n  body``
+-- (see emit_bval_papp_app), silently mis-rendering helper laws whose
+-- spine starts with N(1).  Python wraps the same way via ``bapp`` —
+-- see _FORWARD_K / _COMPOSE_OPEN in bootstrap/codegen.py.
 
--- _compose_open: L(4, name, A(A(N(1), N(3)), A(N(2), N(4))))
+-- _compose: L(3, name, N(1)(N(2)(N(3)))) — compose(f, g, x) = f(g(x))
+let nn_compose : Nat = 0x65736f706d6f635f  -- "_compose"
+let cps_compose : PlanVal
+  = PLaw nn_compose (MkPair 3 (cg_bapp (PNat 1) (cg_bapp (PNat 2) (PNat 3))))
+
+-- _compose_open: L(4, name, N(1)(N(3))(N(2)(N(4))))
 -- compose_open(f_open, g, dispatch', x) = f_open(dispatch', g(x))
 let nn_compose_open : Nat = 0x6e65706f5f65736f706d6f635f  -- "_compose_open"
 let cps_compose_open : PlanVal
-  = PLaw nn_compose_open (MkPair 4 (PApp (PApp (PNat 1) (PNat 3)) (PApp (PNat 2) (PNat 4))))
+  = PLaw nn_compose_open (MkPair 4
+      (cg_bapp (cg_bapp (PNat 1) (PNat 3)) (cg_bapp (PNat 2) (PNat 4))))
 
--- _forward_k: L(4, name, A(A(N(1), A(N(2), N(3))), N(4)))
+-- _forward_k: L(4, name, N(1)(N(2)(N(3)))(N(4)))
 -- forward_k(k_open, dispatch_fn_base, dispatch', v) = k_open(dispatch_fn_base(dispatch'), v)
 -- Used when forwarding unhandled ops to preserve nested handler layers.
 let nn_forward_k : Nat = 0x6b5f64726177726f665f  -- "_forward_k"
 let cps_forward_k : PlanVal
-  = PLaw nn_forward_k (MkPair 4 (PApp (PApp (PNat 1) (PApp (PNat 2) (PNat 3))) (PNat 4)))
+  = PLaw nn_forward_k (MkPair 4
+      (cg_bapp (cg_bapp (PNat 1) (cg_bapp (PNat 2) (PNat 3))) (PNat 4)))
 
--- pure_law: L(3, "pure", A(A(N(3), N(2)), N(1))) — pure v dispatch k_open = k_open(dispatch, v)
-let cps_pure_law : PlanVal = PLaw kw_pure (MkPair 3 (PApp (PApp (PNat 3) (PNat 2)) (PNat 1)))
+-- pure_law: L(3, "pure", N(3)(N(2))(N(1))) — pure v dispatch k_open = k_open(dispatch, v)
+let cps_pure_law : PlanVal
+  = PLaw kw_pure (MkPair 3 (cg_bapp (cg_bapp (PNat 3) (PNat 2)) (PNat 1)))
 
--- run_law: L(1, "run", A(A(N(1), P(null_dispatch)), P(id_open)))
+-- run_law: L(1, "run", N(1)(P(null_dispatch))(P(id_open)))
 -- run comp = comp(null_dispatch, id_open)
 let cps_run_law : PlanVal
-  = PLaw kw_run (MkPair 1 (PApp (PApp (PNat 1) (PPin cps_null_dispatch)) (PPin cps_id_open)))
+  = PLaw kw_run (MkPair 1
+      (cg_bapp (cg_bapp (PNat 1) (PPin cps_null_dispatch)) (PPin cps_id_open)))
 
 -- Virtual de Bruijn index for resume during arm body compilation.
 -- Substituted with the real resume expression before embedding in the law body.
@@ -7065,15 +7093,20 @@ let cg_compile_dispatch_fn
       → List (Pair Nat (Pair Nat (Pair Nat Nat))) → Nat
       → (Expr → CEnv → List (Pair Nat (Pair Nat (Pair Nat Nat))) → Nat → PlanVal) → PlanVal
   = λ op_arms env ctab hint ce →
-      match op_arms {
-        | Nil →
-            -- No op arms: pure forwarder with forward_k wrapping
-            -- 4-arg law: [dp] [tag] [arg] [k_open]
-            -- k_fwd = forward_k(k_open, N(0)) — N(0) is self-ref (no captures)
-            let k_fwd = cg_bapp (cg_bapp (PPin cps_forward_k) (PNat 4)) (PNat 0) in
-            PPin (PLaw hint (MkPair 4
-              (cg_bapp (cg_bapp (cg_bapp (PNat 1) (PNat 2)) (PNat 3)) k_fwd)))
-        | _ →
+      -- Both the empty-arms forwarder and the main dispatch law take the
+      -- name ``encode_name(hint + "_dispatch")``.  Mirrors Python's
+      -- f'{name_hint}_dispatch' construction in _compile_dispatch_fn.
+      -- LE-packed encode_name("dispatch") = 7521983764486121828.
+      let nn_dispatch_s = 7521983764486121828 in
+      let disp_name = cg_concat_under hint nn_dispatch_s in
+      -- Use a length probe instead of ``match op_arms { | Nil → … | _ → … }``.
+      -- The Nil-vs-Cons match shape (nullary + binary, mixed-arity, 2-arm
+      -- one-explicit + wildcard) is one of the bootstrap codegen pitfalls
+      -- documented in CLAUDE.md — the wildcard arm body was silently
+      -- unreachable for any non-empty list, so every handler fell into the
+      -- Nil branch.  ``length op_arms == 0`` discriminates safely.
+      match (nat_eq (length op_arms) 0) {
+        | 0 →
             -- Collect free vars from all arm bodies
             let all_bodies = map (λ arm →
                                     match arm {
@@ -7104,18 +7137,29 @@ let cg_compile_dispatch_fn
             let forward_body = cg_bapp (cg_bapp (cg_bapp (PNat dp_idx) (PNat op_tag_idx)) (PNat op_arg_idx)) k_open_forwarded in
             -- Build tag dispatch with virtual resume substitution
             let dispatch_body = cg_build_handle_dispatch op_arms dispatch_env k_idx op_arg_idx op_tag_idx forward_body resume_expr ce ctab hint 0 in
-            let dispatch_law = PPin (PLaw hint (MkPair total_arity dispatch_body)) in
+            let dispatch_law = PPin (PLaw disp_name (MkPair total_arity dispatch_body)) in
             cg_apply_free_locals dispatch_law free_vars env
+        | _ →
+            -- No op arms: pure forwarder with forward_k wrapping
+            -- 4-arg law: [dp] [tag] [arg] [k_open]
+            -- k_fwd = forward_k(k_open, N(0)) — N(0) is self-ref (no captures)
+            let k_fwd = cg_bapp (cg_bapp (PPin cps_forward_k) (PNat 4)) (PNat 0) in
+            PPin (PLaw disp_name (MkPair 4
+              (cg_bapp (cg_bapp (cg_bapp (PNat 1) (PNat 2)) (PNat 3)) k_fwd)))
       }
 
 -- cg_compile_return_fn: build return handler law
 -- L(n_cap+1, name, body) where last param is the pure return value.
+-- Law name = ``encode_name(hint + "_return")``; sub-compile hint uses
+-- the same suffix.  Mirrors bootstrap/codegen.py::_compile_return_fn.
 let cg_compile_return_fn
       : Expr → CEnv → List (Pair Nat (Pair Nat (Pair Nat Nat))) → Nat
       → (Expr → CEnv → List (Pair Nat (Pair Nat (Pair Nat Nat))) → Nat → PlanVal) → PlanVal
   = λ ret_fn env ctab hint ce →
       match ret_fn {
         | ELam ret_var ret_body →
+            let nn_return_s = 121437875889522 in    -- "return" LE
+            let ret_name = cg_concat_under hint nn_return_s in
             let free_vars = cg_free_vars ret_body (Cons ret_var Nil) env in
             let n_cap = length free_vars in
             let total_arity = add n_cap 1 in
@@ -7125,8 +7169,8 @@ let cg_compile_return_fn
             let ret_env1 = cg_bind_params free_vars ret_env0 in
             let ret_env2 = cenv_set_arity ret_env1 total_arity in
             let ret_env3 = cenv_bind_local ret_env2 ret_var val_idx in
-            let body_val = ce ret_body ret_env3 ctab hint in
-            let ret_law = PPin (PLaw hint (MkPair total_arity body_val)) in
+            let body_val = ce ret_body ret_env3 ctab ret_name in
+            let ret_law = PPin (PLaw ret_name (MkPair total_arity body_val)) in
             cg_apply_free_locals ret_law free_vars env
         | _ →
             -- Default: identity
@@ -7137,6 +7181,11 @@ let cg_compile_return_fn
 -- handle comp { | return x → body_r | op arg k → body_op }
 -- Open-continuation protocol:
 -- Produces: λ(dp, ko_open) → comp(dispatch(dp), compose_open(ko_open, ret_fn))
+--
+-- CPS law name = ``encode_name(hint + "_handle")``; the ``comp`` sub-expr
+-- is compiled with hint suffix ``_comp``.  Dispatch and return helpers
+-- carry their own suffixes (see cg_compile_dispatch_fn / _return_fn).
+-- Mirrors bootstrap/codegen.py::_compile_handle.
 let cg_compile_handle
       : Expr → CEnv → List (Pair Nat (Pair Nat (Pair Nat Nat))) → Nat → PlanVal
       → (Expr → CEnv → List (Pair Nat (Pair Nat (Pair Nat Nat))) → Nat → PlanVal) → PlanVal
@@ -7155,13 +7204,19 @@ let cg_compile_handle
                   let total_arity = add n_cap 2 in
                   let dp_idx = add n_cap 1 in
                   let ko_idx = add n_cap 2 in
+                  -- Sub-hint suffixes (match Python).
+                  -- LE-packed encode_name() of each suffix.
+                  let nn_comp_s   = 1886220131 in            -- "comp"
+                  let nn_handle_s = 111516215828840 in       -- "handle"
+                  let comp_hint = cg_concat_under hint nn_comp_s in
+                  let cps_name  = cg_concat_under hint nn_handle_s in
                   -- Build cps env
                   let g = cenv_globals env in
                   let cps_env0 = cenv_make g Nil 0 None in
                   let cps_env1 = cg_bind_params free_vars cps_env0 in
                   let cps_env = cenv_set_arity cps_env1 total_arity in
                   -- Compile comp in cps env
-                  let comp_val = ce comp cps_env ctab hint in
+                  let comp_val = ce comp cps_env ctab comp_hint in
                   -- Build dispatch function
                   let dispatch_fn = cg_compile_dispatch_fn op_arms cps_env ctab hint ce in
                   -- Build return function
@@ -7173,13 +7228,15 @@ let cg_compile_handle
                   let composed_k = cg_bapp (cg_bapp (PPin cps_compose_open) (PNat ko_idx)) return_fn in
                   -- CPS body: comp(dispatch(dp), composed_k_open)
                   let cps_body = cg_bapp (cg_bapp comp_val dispatch_applied) composed_k in
-                  let cps_law = PLaw hint (MkPair total_arity cps_body) in
-                  -- Apply to captures
+                  let cps_law = PLaw cps_name (MkPair total_arity cps_body) in
+                  -- At top level (env.arity == 0): return bare ``cps_law``;
+                  -- inside another law: PPin it and bapp-apply captures.
+                  -- Mirrors Python's ``if env.arity == 0`` branch.
                   match (nat_eq (cenv_arity env) 0) {
-                    | 0 → PPin cps_law
-                    | _ →
+                    | 0 →
                         let pinned = PPin cps_law in
                         cg_apply_free_locals pinned free_vars env
+                    | _ → cps_law
                   }
             }
         | _ → PNat 0
@@ -7192,6 +7249,11 @@ let cg_compile_handle
 --   Reordered: k_open_outer BEFORE dispatch so partial application
 --   with (caps, k_open_outer) gives a 2-arg open continuation.
 -- Outer body: rhs dispatch inner_cont_open
+--
+-- Law names: outer = ``encode_name(hint + "_do")``,
+-- inner = ``encode_name(hint + "_cont")``.  Sub-compile hints get
+-- ``_body``/``_rhs`` suffixes so any lambda-lifted sub-laws get unique
+-- names.  Mirrors bootstrap/codegen.py::_compile_do.
 let cg_compile_do
       : Expr → CEnv → List (Pair Nat (Pair Nat (Pair Nat Nat))) → Nat → PlanVal
       → (Expr → CEnv → List (Pair Nat (Pair Nat (Pair Nat Nat))) → Nat → PlanVal) → PlanVal
@@ -7214,6 +7276,16 @@ let cg_compile_do
                   let inner_k_open_idx   = add n_cap 1 in
                   let inner_dispatch_idx = add n_cap 2 in
                   let inner_x_idx        = add n_cap 3 in
+                  -- Sub-law / sub-compile hints (match Python's suffix scheme).
+                  -- LE-packed encode_name() of each suffix.
+                  let nn_body = 2036625250 in          -- "body"
+                  let nn_rhs  = 7563378 in             -- "rhs"
+                  let nn_cont = 1953394531 in          -- "cont"
+                  let nn_do   = 28516 in               -- "do"
+                  let body_hint  = cg_concat_under hint nn_body in
+                  let rhs_hint   = cg_concat_under hint nn_rhs in
+                  let cont_name  = cg_concat_under hint nn_cont in
+                  let do_name    = cg_concat_under hint nn_do in
                   -- Build inner env
                   let g = cenv_globals env in
                   let inner_env0 = cenv_make g Nil 0 None in
@@ -7221,29 +7293,33 @@ let cg_compile_do
                   let inner_env2 = cenv_set_arity inner_env1 (add n_cap 3) in
                   let inner_env3 = cenv_bind_local inner_env2 bind_name inner_x_idx in
                   -- Compile body in inner env
-                  let body_cps = ce body inner_env3 ctab hint in
+                  let body_cps = ce body inner_env3 ctab body_hint in
                   -- Inner body: body_cps(dispatch, k_open_outer)
                   let inner_body = cg_bapp (cg_bapp body_cps (PNat inner_dispatch_idx)) (PNat inner_k_open_idx) in
-                  let inner_law = PPin (PLaw hint (MkPair (add n_cap 3) inner_body)) in
+                  let inner_law = PPin (PLaw cont_name (MkPair (add n_cap 3) inner_body)) in
                   -- Build outer env
                   let outer_env0 = cenv_make g Nil 0 None in
                   let outer_env1 = cg_bind_params free_vars outer_env0 in
                   let outer_env  = cenv_set_arity outer_env1 (add n_cap 2) in
                   -- Compile rhs in outer env
-                  let rhs_val = ce rhs outer_env ctab hint in
+                  let rhs_val = ce rhs outer_env ctab rhs_hint in
                   -- Apply inner_law to captures + k_open_outer (NOT dispatch).
                   -- Result is a 2-arg open continuation: (dispatch, x) → body(dispatch, k_open_outer)
                   let inner_applied = cg_apply_range inner_law 1 n_cap in
                   let inner_cont_open = cg_bapp inner_applied (PNat outer_k_open_idx) in
                   -- Outer body: rhs_comp(dispatch, inner_cont_open)
                   let outer_body = cg_bapp (cg_bapp rhs_val (PNat outer_dispatch_idx)) inner_cont_open in
-                  let do_law = PLaw hint (MkPair (add n_cap 2) outer_body) in
-                  -- Apply to captures
+                  let do_law = PLaw do_name (MkPair (add n_cap 2) outer_body) in
+                  -- At top level (env.arity == 0): return bare ``do_law``;
+                  -- captures from env.locals are necessarily empty so there is
+                  -- nothing further to apply.  Inside another law: pin and
+                  -- bapp-apply free-local captures.  Mirrors Python's
+                  -- ``if env.arity == 0`` branch in _compile_do.
                   match (nat_eq (cenv_arity env) 0) {
-                    | 0 → do_law
-                    | _ →
+                    | 0 →
                         let pinned = PPin do_law in
                         cg_apply_free_locals pinned free_vars env
+                    | _ → do_law
                   }
             }
         | _ → PNat 0
@@ -7909,6 +7985,15 @@ let cg_compile_inst_members
 -- Each op: L(3, op_name, dispatch(tag, op_arg, k))
 -- N(1)=op_arg, N(2)=dispatch, N(3)=k
 -- body = A(A(A(N(2), tag_val), N(1)), N(3))
+--
+-- Bind ONLY under the FQ name.  The bare-name binding the Python
+-- bootstrap also creates (env.globals[op.name] = val) isn't safe here:
+-- sr_dispatch has a known gap where it sometimes leaves cross-binding
+-- EVars un-qualified (phase_h_handoff.md L289-293), and if the bare
+-- binding exists the lookup picks it up and PNamed-tags with the bare
+-- name — emit then prints ``(#pin inc)`` instead of the FQ symbol.
+-- Without the bare binding the cg_var_from_env short-tail fallback in
+-- cg_global_lookup_by_short fires and resolves to the canonical FQ.
 let cg_register_eff_ops
       : List Nat → Nat → Nat → CEnv → List (Pair Nat PlanVal) → Nat
       → Pair CEnv (Pair (List (Pair Nat PlanVal)) Nat)
@@ -7922,7 +8007,7 @@ let cg_register_eff_ops
             -- body = dispatch(tag, op_arg, k) = A(A(A(N(2), tag_val), N(1)), N(3))
             let body = cg_bapp (cg_bapp (cg_bapp (PNat 2) tag_val) (PNat 1)) (PNat 3) in
             let val = PLaw op_name (MkPair 3 body) in
-            let new_env = cenv_bind_global (cenv_bind_global env fq_op val) op_name val in
+            let new_env = cenv_bind_global env fq_op val in
             let new_compiled = Cons (MkPair fq_op val) compiled in
             cg_register_eff_ops rest eff_fq mod_name new_env new_compiled (add tag 1)
       }

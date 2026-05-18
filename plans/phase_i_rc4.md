@@ -117,6 +117,120 @@ Three coupled changes to `compiler/src/Compiler.gls`:
 
 ## rc4-2 — Effect handler CPS alignment
 
+**Status:** partial progress on `phase-i-1.0.0-rc4` — multiple
+sub-issues fixed; one remaining divergence in the `return`-arm law body
+(emits `_0` instead of the compiled body for the gate fixture).
+
+### Sub-fixes landed (2026-05-17 session)
+
+Each fix is small and self-contained; all are gated by
+``python3 tools/selfcompile.py /tmp/edo_only.gls`` (which now passes
+byte-identical) and ``/tmp/effect_fixture.gls`` (still diverges by one
+byte in `result_return` law body).
+
+1. **Suffix-named CPS sub-laws.**  Self-host's lifted CPS laws were
+   taking the bare outer ``hint`` as their name; Python appends a
+   role-specific suffix.  Added inline ``nn_do``, ``nn_cont``,
+   ``nn_handle``, ``nn_dispatch``, ``nn_return``, ``nn_body``,
+   ``nn_rhs``, ``nn_comp`` constants and wired them through
+   ``cg_compile_do`` (outer = ``_do``, inner = ``_cont``, body hint
+   = ``_body``, rhs hint = ``_rhs``), ``cg_compile_handle``
+   (cps_law = ``_handle``, comp hint = ``_comp``),
+   ``cg_compile_dispatch_fn`` (both branches use ``_dispatch``), and
+   ``cg_compile_return_fn`` (``_return``).
+
+2. **Top-of-let arity branch swap.**  Both ``cg_compile_do`` and
+   ``cg_compile_handle`` had the ``nat_eq (cenv_arity env) 0`` arms
+   inverted relative to Python — top-level was wrapping in PPin and
+   bapp-applying captures (only valid inside another law), while
+   inside-law was returning bare law (no captures applied).  Swapped
+   to mirror Python's ``if env.arity == 0: bare else: P(law) + bapp``.
+
+3. **CPS helper-law bodies wrapped with ``cg_bapp``.**  ``cps_compose``,
+   ``cps_compose_open``, ``cps_forward_k``, ``cps_pure_law``, and
+   ``cps_run_law`` used raw ``PApp`` for every application node.  Emit
+   interprets ``App(App(N(1), rhs), body)`` as the let-binding form
+   ``_d(rhs)\n  body`` (per spec/04-plan-encoding.md §body context),
+   which silently mis-rendered ``_forward_k`` and friends as let-forms.
+   Python wraps every node via ``bapp``; matched that here.  Fixed
+   the body-shape divergence for the no-arms ``handle`` case.
+
+4. **Eff-op short-name binding removed.**  ``cg_register_eff_ops`` used
+   to ``cenv_bind_global`` under both the FQ name *and* the bare op
+   name.  Scope resolution sometimes leaves cross-binding bare EVars
+   un-qualified (phase_h_handoff.md L289 known-gap), and when it does,
+   the bare lookup wins and PNamed-tags the pin with the bare name —
+   emit prints ``(#pin inc)`` instead of ``(#pin
+   Compiler_Counter_inc)``.  With only the FQ binding present, the
+   ``cg_var_from_env`` short-tail fallback resolves bare names to the
+   canonical FQ instead.  Python's bind-table dedup achieves the same
+   effect via id-based first-wins; this is the GLS-side equivalent.
+
+5. **Wildcard arg in handler arms.**  Added ``tok_eat_ident_or_wild``
+   (defined next to ``tok_eat_ident`` for SCC ordering) that accepts
+   either an ident or a leading ``_`` token, rewriting the latter to
+   ``kw_underscore``.  Without it, ``| inc _ kk → kk 7`` produced a
+   sentinel arm with name=0 and ``parse_handle_op_arm`` aborted; the
+   enclosing handler ended up with an empty arm list and a degenerate
+   dispatch law.  ``parse_handle_op_arm`` now calls
+   ``tok_eat_ident_or_wild`` for both the op-arg and resume slots.
+
+6. **Length probe for arm-count dispatch in ``cg_compile_dispatch_fn``.**
+   The original ``match op_arms { | Nil → forwarder | _ → main }``
+   tripped the bootstrap-codegen mixed-arity wildcard pitfall — every
+   non-empty list fell into the Nil arm.  Replaced with
+   ``match (nat_eq (length op_arms) 0) { | 0 → main | _ → forwarder }``
+   which discriminates safely without relying on the constructor-match
+   shape.
+
+### Open: `result_return` body emits `_0`
+
+For ``handle comp { | return rr → body }``, the constructed
+``result_return`` law has the right name and arity, but its body is
+``PNat 0`` (emits as ``_0``) instead of the compiled ``body``.  The
+ELam arm in ``cg_compile_return_fn`` clearly fires (we see the
+non-default ``result_return`` name in the output) yet
+``body_val = ce ret_body ret_env3 ctab ret_name`` produces ``PNat 0``
+for both ``ret_body = ENat 42`` (should be ``PApp(PNat 0)(PNat 42)``)
+and ``ret_body = EVar rr`` (should be ``PNat 1``, since rr is bound at
+val_idx=1).
+
+Hypotheses to investigate next:
+
+- ``parse_handle_expr``'s parse of the return body — maybe
+  ``parse_expr rt (tok_tail rest5)`` returns ``EVar 0`` sentinel (the
+  expression parser failing silently) instead of the actual body.
+  Verifiable by comparing Python's parsed AST for the gate fixture
+  with what the self-host's parser would produce.
+- Lambda-lifted sub-law capture in ``cg_compile_return_fn``'s ELam
+  arm.  The 13-let chain inside the arm body might be triggering a
+  bootstrap-codegen mis-lift where ``ce`` (the compile-function
+  closure parameter) is captured incorrectly.  Test by replacing
+  ``ce`` with the direct ``cg_compile_expr`` name — should be safe
+  since both are in the same mutual SCC.
+- The ``cps_id_law`` default path being silently selected after all,
+  with the law name appearing to be ``result_return`` because of
+  some other emit-side path.  Check by adding a sentinel like
+  ``PLaw 99999 …`` in the wildcard arm to see which branch fires.
+
+### Replay loop
+
+```
+cat > /tmp/handle_return_42.gls <<'EOF'
+let comp : Nat = 1
+let result : Nat = handle comp {
+  | return rr → 42
+}
+let main = result
+EOF
+python3 tools/selfcompile.py -v /tmp/handle_return_42.gls
+```
+
+Each iteration ~1s.  Once `result_return` body matches, run
+`/tmp/effect_fixture.gls` to confirm end-to-end.
+
+## rc4-2 (original) — Effect handler CPS alignment
+
 **Status:** not started.  Pickup notes for a fresh continuation below.
 
 ### Fresh-continuation handoff
