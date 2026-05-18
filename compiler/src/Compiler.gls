@@ -3327,34 +3327,44 @@ let parse_handle_arms
 
 -- parse_handle_expr: parse handle comp { | return x → body | op ... }
 -- toks positioned after 'handle' keyword
+--
+-- Restructured to hoist the second parse_expr call out of the deeply
+-- nested match arms.  The previous version had it five levels deep
+-- inside the `| _ → match (parse_expr rt …) { … }` chain; the
+-- bootstrap codegen lambda-lifts each match-arm body into a sub-law,
+-- and the slot resolution for the mutual-SCC shared-pin reference to
+-- ``parse_expr`` was returning the wrong closure for the second call,
+-- making it always yield the ``EVar 0`` parse-failure sentinel for
+-- the return-arm body.  Flattening to ``let`` chains keeps parse_expr
+-- calls at the outer-lambda's body root, where slot resolution is
+-- already correct (the first parse_expr call works there).
 let parse_handle_expr : List (Pair Nat (List Nat)) → List Token → Pair Expr (List Token)
   = λ rt toks →
       match (parse_expr rt toks) {
         | MkPair comp rest →
-            -- skip opening {
             let rest2 = tok_tail rest in
-            -- skip | before 'return'
             let rest3 = match (tok_is rest2 TkBar) {
                           | 0 → rest2
                           | k → tok_tail rest2
                         } in
-            -- eat 'return' ident, then return var name, then → then body
             let rest4 = tok_tail rest3 in
-            match (tok_eat_ident rest4) {
-              | MkPair ret_var rest5 →
-                  match ret_var {
-                    | 0 → MkPair (EVar 0) toks
-                    | _ →
-                      match (parse_expr rt (tok_tail rest5)) {
-                        | MkPair ret_body rest6 →
-                            match (parse_handle_arms rt rest6) {
-                              | MkPair op_arms rest7 →
-                                  -- skip closing }
-                                  MkPair (EHandle comp (MkPair (ELam ret_var ret_body) op_arms))
-                                         (tok_tail rest7)
-                            }
-                      }
-                  }
+            let ret_var_pair = tok_eat_ident rest4 in
+            let ret_var = match ret_var_pair { | MkPair v _ → v } in
+            let rest5   = match ret_var_pair { | MkPair _ r → r } in
+            match (nat_eq ret_var 0) {
+              | 0 →
+                  -- parse the return body at the outer let level (not
+                  -- inside a nested match arm) so the mutual-SCC slot
+                  -- resolution for parse_expr stays correct.
+                  let body_pair = parse_expr rt (tok_tail rest5) in
+                  let ret_body  = match body_pair { | MkPair b _ → b } in
+                  let rest6     = match body_pair { | MkPair _ r → r } in
+                  let arms_pair = parse_handle_arms rt rest6 in
+                  let op_arms   = match arms_pair { | MkPair a _ → a } in
+                  let rest7     = match arms_pair { | MkPair _ r → r } in
+                  MkPair (EHandle comp (MkPair (ELam ret_var ret_body) op_arms))
+                         (tok_tail rest7)
+              | _ → MkPair (EVar 0) toks
             }
       }
 
