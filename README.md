@@ -1,3 +1,14 @@
+## This fork
+Personal experiments in using Gallowglass as a substrate for agent-shaped programs. 
+
+Upstream: https://github.com/sigilante/gallowglass
+
+- Experiment work lives in experiments/ 
+- Notes in experiments/notes/
+
+Pull upstream changes: `git fetch upstream && git merge upstream/master`
+
+
 # Gallowglass
 
 An LLM-first programming language targeting the PLAN virtual machine.
