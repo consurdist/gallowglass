@@ -1,0 +1,150 @@
+use Core.List unqualified { List, Cons, Nil }
+use Core.Pair unqualified { Pair, MkPair }
+
+-- The possible states a supervised process can be in.
+-- Each constructor is a distinct situation the supervisor recognises.
+-- The compiler ensures every function that touches a ProcState
+-- must account for all six possibilities.
+type ProcState =
+  | Stopped     -- process is not running; has not been started
+  | Starting    -- launch signal sent; waiting for first heartbeat
+  | Running     -- process is up and heartbeating normally
+  | Degraded    -- heartbeat missed but not yet failed; one warning issued
+  | Restarting  -- crash or too many missed beats; relaunch in progress
+  | Failed      -- restart attempts exhausted; supervisor gives up
+
+-- Events that the supervisor can receive from the outside world.
+-- These are the only inputs the state machine will ever respond to.
+type Event =
+  | Launch          -- operator requests the process be started
+  | Heartbeat       -- process signals it is alive
+  | HeartbeatMissed -- no heartbeat received within the expected window
+  | Crash           -- process exited unexpectedly
+  | RestartOk       -- relaunch succeeded; process is up again
+  | GiveUp          -- retry limit reached; stop trying
+
+-- The pure transition function.
+-- Given the current state and one incoming event, return the next state.
+-- Every (state, event) combination is handled explicitly below.
+-- The compiler rejects any missing arm -- there is no way to silently
+-- drop a case, however unlikely it seems at design time.
+let step : ProcState -> Event -> ProcState
+  = λ st ev -> match st {
+
+      -- Stopped: only Launch moves us forward.
+      -- Any other event while stopped is a deliberate no-op.
+      | Stopped -> match ev {
+          | Launch          -> Starting
+          | Heartbeat       -> Stopped
+          | HeartbeatMissed -> Stopped
+          | Crash           -> Stopped
+          | RestartOk       -> Stopped
+          | GiveUp          -> Stopped
+        }
+
+      -- Starting: launch sent, waiting for the first heartbeat.
+      -- A Crash or GiveUp during startup goes straight to Failed
+      -- because we have not yet established a retry budget.
+      | Starting -> match ev {
+          | Launch          -> Starting
+          | Heartbeat       -> Running
+          | HeartbeatMissed -> Starting
+          | Crash           -> Failed
+          | RestartOk       -> Running
+          | GiveUp          -> Failed
+        }
+
+      -- Running: healthy normal operation.
+      -- One missed beat issues a warning (Degraded);
+      -- an outright Crash skips the warning and goes straight to Restarting.
+      | Running -> match ev {
+          | Launch          -> Running
+          | Heartbeat       -> Running
+          | HeartbeatMissed -> Degraded
+          | Crash           -> Restarting
+          | RestartOk       -> Running
+          | GiveUp          -> Failed
+        }
+
+      -- Degraded: one warning already on record.
+      -- A good Heartbeat clears it and returns to Running.
+      -- A second miss or a Crash escalates to Restarting.
+      | Degraded -> match ev {
+          | Launch          -> Degraded
+          | Heartbeat       -> Running
+          | HeartbeatMissed -> Restarting
+          | Crash           -> Restarting
+          | RestartOk       -> Running
+          | GiveUp          -> Failed
+        }
+
+      -- Restarting: relaunch in progress.
+      -- We stay in this state until RestartOk confirms success
+      -- or GiveUp ends the attempt permanently.
+      | Restarting -> match ev {
+          | Launch          -> Restarting
+          | Heartbeat       -> Restarting
+          | HeartbeatMissed -> Restarting
+          | Crash           -> Restarting
+          | RestartOk       -> Running
+          | GiveUp          -> Failed
+        }
+
+      -- Failed: terminal state.
+      -- Once the supervisor gives up, no event can revive the process.
+      -- This forces callers to make an explicit decision rather than
+      -- accidentally restarting a permanently broken process.
+      | Failed -> match ev {
+          | Launch          -> Failed
+          | Heartbeat       -> Failed
+          | HeartbeatMissed -> Failed
+          | Crash           -> Failed
+          | RestartOk       -> Failed
+          | GiveUp          -> Failed
+        }
+    }
+
+-- Walk the event list, threading the current state and a step counter.
+-- `init` is kept unchanged throughout so the result carries both
+-- the starting state and the final state.
+-- Returns: MkPair (MkPair initial_state final_state) steps_taken
+let run_go : ProcState -> ProcState -> Nat -> List Event -> Pair (Pair ProcState ProcState) Nat
+  = fix λ self init cur count evs ->
+      match evs {
+        | Nil          -> MkPair (MkPair init cur) count
+        | Cons ev rest ->
+            let next = step cur ev in
+            self init next (Core.Nat.add count 1) rest
+      }
+
+-- Entry point: run the machine from a given initial state over a list of events.
+let run_machine : ProcState -> List Event -> Pair (Pair ProcState ProcState) Nat
+  = λ init evs -> run_go init init 0 evs
+
+-- A realistic event sequence modelling snapd on Ubuntu.
+-- Scenario:
+--   1. Normal startup (Launch -> 3x Heartbeat)
+--   2. One missed beat, then recovery (HeartbeatMissed -> Heartbeat)
+--   3. Crash with successful restart (Crash -> RestartOk -> Heartbeat)
+--   4. Two more missed beats, operator gives up (HeartbeatMissed x2 -> GiveUp)
+-- Expected final state: Failed
+-- Expected steps: 12
+let sample_events : List Event
+  = Cons Launch
+  ( Cons Heartbeat
+  ( Cons Heartbeat
+  ( Cons Heartbeat
+  ( Cons HeartbeatMissed
+  ( Cons Heartbeat
+  ( Cons Crash
+  ( Cons RestartOk
+  ( Cons Heartbeat
+  ( Cons HeartbeatMissed
+  ( Cons HeartbeatMissed
+  ( Cons GiveUp
+    Nil)))))))))))
+
+-- Run from Stopped through the full scenario.
+-- Result layout: MkPair (MkPair initial_state final_state) steps_taken
+let result : Pair (Pair ProcState ProcState) Nat
+  = run_machine Stopped sample_events
