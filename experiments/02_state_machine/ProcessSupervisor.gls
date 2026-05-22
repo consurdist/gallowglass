@@ -101,8 +101,8 @@ let step : ProcState -> Event -> ProcState
       -- This forces callers to make an explicit decision rather than
       -- accidentally restarting a permanently broken process.
       | Failed -> match ev {
-          | Launch          -> Failed
-          | Stop            -> Failed
+          | Launch          -> Starting    -- operator explicitly retries; was: Failed
+          | Stop            -> Stopped     -- operator cleans up; acknowleges Failed state
           | Heartbeat       -> Failed
           | HeartbeatMissed -> Failed
           | Crash           -> Failed
@@ -136,7 +136,7 @@ let run_machine : ProcState -> List Event -> Pair (Pair ProcState ProcState) Nat
 --   4. Two more missed beats, operator gives up (HeartbeatMissed x2 -> GiveUp)
 -- Expected final state: Failed
 -- Expected steps: 12
-let sample_events : List Event
+let sample_events_1 : List Event
   = Cons Launch
   ( Cons Heartbeat
   ( Cons Heartbeat
@@ -153,8 +153,8 @@ let sample_events : List Event
 
 -- Run from Stopped through the full scenario.
 -- Result layout: MkPair (MkPair initial_state final_state) steps_taken
-let result : Pair (Pair ProcState ProcState) Nat
-  = run_machine Stopped sample_events
+let result_1 : Pair (Pair ProcState ProcState) Nat
+  = run_machine Stopped sample_events_1
 
 
 -- Test outside Stop
@@ -164,7 +164,7 @@ let result : Pair (Pair ProcState ProcState) Nat
 --   3. Explicit Stop from operator (Running -> Stopped)
 -- Expected final state: Stopped
 -- Expected steps: 7
-let sample_events_extended : List Event
+let sample_events_2 : List Event
   = Cons Launch
   ( Cons Heartbeat
   ( Cons Heartbeat
@@ -174,5 +174,27 @@ let sample_events_extended : List Event
   ( Cons Stop
     Nil))))))
 
-let extended_result : Pair (Pair ProcState ProcState) Nat
-  = run_machine Stopped sample_events_extended
+let result_2 : Pair (Pair ProcState ProcState) Nat
+  = run_machine Stopped sample_events_2
+
+
+-- Test Launch on Failed
+-- Scenario:
+--   1. Normal operation (Running)
+--   2. Two missed beats, operator gives up (HeartbeatMissed x2 -> GiveUp)
+--   3. Explicit Stop from operator (Failed -> Stopped)
+--   4. Explicit Launch from operator (Stopped -> Starting)
+--   5. Normal operation (Heartbeat -> Running)
+-- Expected final state: Running
+-- Expected steps: 6
+let sample_events_3 : List Event
+  = Cons HeartbeatMissed
+  ( Cons HeartbeatMissed
+  ( Cons GiveUp
+  ( Cons Stop
+  ( Cons Launch
+  ( Cons Heartbeat
+    Nil)))))
+
+let result_3 : Pair (Pair ProcState ProcState) Nat
+  = run_machine Running sample_events_3
