@@ -12,8 +12,12 @@ vendor/
 prelude/glass_ir/
 prelude/pins/
 
+# Python virtual environment
+.venv/
+
 # Local IDE / agent state
 .claude/
+.hermes/
 
 # Jupyter
 **/.ipynb_checkpoints/
@@ -23,6 +27,11 @@ Untitled[0-9]*.ipynb
 # macOS
 .DS_Store
 **/.DS_Store
+
+# Editor swap / backup files
+*.swp
+*.swo
+*~
 
 # Mathematica scratch
 *.nb
