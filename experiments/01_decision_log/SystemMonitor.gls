@@ -1,0 +1,57 @@
+use Core.List   unqualified { List, Cons, Nil }
+use Core.Pair   unqualified { Pair, MkPair }
+
+type Observation =
+  | CpuLoad   Nat
+  | MemFree   Nat
+  | ProcUp    Text
+  | ProcDown  Text
+  | Threshold Text Nat
+
+-- Summary = MkPair (MkPair sample_count peak_cpu) (MkPair low_mem_free alert_count)
+
+let is_alert : Observation -> Bool
+  = λ obs -> match obs {
+      | CpuLoad   nn       -> Core.Nat.nat_lt 85 nn
+      | MemFree   nn       -> Core.Nat.nat_lt nn 20
+      | ProcDown  _        -> True
+      | ProcUp    _        -> False
+      | Threshold _ thresh -> Core.Nat.nat_lt 90 thresh
+    }
+
+let nat_max : Nat -> Nat -> Nat
+  = λ aa bb -> if Core.Nat.nat_lt aa bb then bb else aa
+
+let nat_min : Nat -> Nat -> Nat
+  = λ aa bb -> if Core.Nat.nat_lt aa bb then aa else bb
+
+let summarize_go : Nat -> Nat -> Nat -> Nat -> List Observation -> Pair (Pair Nat Nat) (Pair Nat Nat)
+  = fix λ self sc pc lm ac log ->
+      match log {
+        | Nil           -> MkPair (MkPair sc pc) (MkPair lm ac)
+        | Cons obs rest ->
+            let alert  = if is_alert obs then 1 else 0 in
+            let new_pc = match obs { | CpuLoad nn -> nat_max pc nn | _ -> pc } in
+            let new_lm = match obs { | MemFree nn -> nat_min lm nn | _ -> lm } in
+            self (Core.Nat.add sc 1) new_pc new_lm (Core.Nat.add ac alert) rest
+      }
+
+let summarize : List Observation -> Pair (Pair Nat Nat) (Pair Nat Nat)
+  = λ log -> summarize_go 0 0 196 0 log
+
+let sample_log : List Observation
+  = Cons (CpuLoad 12)
+  ( Cons (MemFree 171)
+  ( Cons (ProcUp "chromium")
+  ( Cons (CpuLoad 91)
+  ( Cons (MemFree 168)
+  ( Cons (ProcDown "snapd")
+  ( Cons (Threshold "swap_use" 94)
+  ( Cons (CpuLoad 34)
+  ( Cons (MemFree 170)
+  ( Cons (ProcUp "hermes-agent")
+    Nil)))))))))
+
+-- result : MkPair (MkPair sample_count peak_cpu) (MkPair low_mem_free alert_count)
+let result : Pair (Pair Nat Nat) (Pair Nat Nat)
+  = summarize sample_log
