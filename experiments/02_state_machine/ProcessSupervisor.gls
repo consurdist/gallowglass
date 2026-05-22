@@ -17,6 +17,7 @@ type ProcState =
 -- These are the only inputs the state machine will ever respond to.
 type Event =
   | Launch          -- operator requests the process be started
+  | Stop            -- operator requests the process to be stopped
   | Heartbeat       -- process signals it is alive
   | HeartbeatMissed -- no heartbeat received within the expected window
   | Crash           -- process exited unexpectedly
@@ -35,6 +36,7 @@ let step : ProcState -> Event -> ProcState
       -- Any other event while stopped is a deliberate no-op.
       | Stopped -> match ev {
           | Launch          -> Starting
+          | Stop            -> Stopped
           | Heartbeat       -> Stopped
           | HeartbeatMissed -> Stopped
           | Crash           -> Stopped
@@ -47,6 +49,7 @@ let step : ProcState -> Event -> ProcState
       -- because we have not yet established a retry budget.
       | Starting -> match ev {
           | Launch          -> Starting
+          | Stop            -> Stopped
           | Heartbeat       -> Running
           | HeartbeatMissed -> Starting
           | Crash           -> Failed
@@ -59,6 +62,7 @@ let step : ProcState -> Event -> ProcState
       -- an outright Crash skips the warning and goes straight to Restarting.
       | Running -> match ev {
           | Launch          -> Running
+          | Stop            -> Stopped
           | Heartbeat       -> Running
           | HeartbeatMissed -> Degraded
           | Crash           -> Restarting
@@ -71,6 +75,7 @@ let step : ProcState -> Event -> ProcState
       -- A second miss or a Crash escalates to Restarting.
       | Degraded -> match ev {
           | Launch          -> Degraded
+          | Stop            -> Stopped
           | Heartbeat       -> Running
           | HeartbeatMissed -> Restarting
           | Crash           -> Restarting
@@ -83,6 +88,7 @@ let step : ProcState -> Event -> ProcState
       -- or GiveUp ends the attempt permanently.
       | Restarting -> match ev {
           | Launch          -> Restarting
+          | Stop            -> Stopped
           | Heartbeat       -> Restarting
           | HeartbeatMissed -> Restarting
           | Crash           -> Restarting
@@ -96,6 +102,7 @@ let step : ProcState -> Event -> ProcState
       -- accidentally restarting a permanently broken process.
       | Failed -> match ev {
           | Launch          -> Failed
+          | Stop            -> Failed
           | Heartbeat       -> Failed
           | HeartbeatMissed -> Failed
           | Crash           -> Failed
@@ -148,3 +155,24 @@ let sample_events : List Event
 -- Result layout: MkPair (MkPair initial_state final_state) steps_taken
 let result : Pair (Pair ProcState ProcState) Nat
   = run_machine Stopped sample_events
+
+
+-- Test outside Stop
+-- Scenario:
+--   1. Normal startup (Launch -> 3x Heartbeat)
+--   2. One missed beat, then recovery (HeartbeatMissed -> Heartbeat)
+--   3. Explicit Stop from operator (Running -> Stopped)
+-- Expected final state: Stopped
+-- Expected steps: 7
+let sample_events_extended : List Event
+  = Cons Launch
+  ( Cons Heartbeat
+  ( Cons Heartbeat
+  ( Cons Heartbeat
+  ( Cons HeartbeatMissed
+  ( Cons Heartbeat
+  ( Cons Stop
+    Nil))))))
+
+let extended_result : Pair (Pair ProcState ProcState) Nat
+  = run_machine Stopped sample_events_extended
