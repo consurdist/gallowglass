@@ -11,7 +11,7 @@ use Core.Pair unqualified { Pair, MkPair }
 --      every known service -- you cannot silently add a service without
 --      updating all functions that process ServiceIds.
 type ServiceId =
-  | Snapd
+  | Thermald
   | HermesAgent
   | NetworkManager
   | DBus
@@ -39,7 +39,7 @@ type QueryResult =
 -- Gallowglass when no Eq typeclass instance is available.
 let service_eq : ServiceId -> ServiceId -> Bool
   = λ aa bb -> match aa {
-      | Snapd          -> match bb { | Snapd          -> True | _ -> False }
+      | Thermald     -> match bb { | Thermald          -> True | _ -> False }
       | HermesAgent    -> match bb { | HermesAgent    -> True | _ -> False }
       | NetworkManager -> match bb { | NetworkManager -> True | _ -> False }
       | DBus           -> match bb { | DBus           -> True | _ -> False }
@@ -105,17 +105,17 @@ let kb : List Fact
   ( Cons (Hardware "RAM-GB" 196)
   ( Cons (Software "linux-kernel" 6)
   ( Cons (Software "chromium" 124)
-  ( Cons (Status Snapd 1)
+  ( Cons (Status Thermald 1)
   ( Cons (Status HermesAgent 1)
   ( Cons (Metric 0 14)
   ( Cons (Metric 1 170)
   ( Cons (Metric 2 2)
     Nil))))))))
 
--- Query: find the status of Snapd in the knowledge base.
--- Expected: Found (Status Snapd 1)
-let snapd_query : QueryResult
-  = find_service Snapd kb
+-- Query: find the status of Thermald in the knowledge base.
+-- Expected: Found (Status Thermald 1)
+let thermald_query : QueryResult
+  = find_service Thermald kb
 
 -- Summary of the knowledge base.
 -- Layout: MkPair (MkPair total_facts metric_count) status_count
@@ -129,7 +129,7 @@ let summary : Pair (Pair Nat Nat) Nat
 -- Constructor tag decoding:
 --   QueryResult: Found=0, NotFound=1
 --   Fact:        Hardware=0, Software=1, Status=2, Metric=3
---   ServiceId:   Snapd=0, HermesAgent=1, ...
+--   ServiceId:   Thermald=0, HermesAgent=1, ...
 -- Expected raw output: (0 (0 (2 0 1)) (0 (0 9 3) 2))
 let result : Pair QueryResult (Pair (Pair Nat Nat) Nat)
-  = MkPair snapd_query summary
+  = MkPair thermald_query summary
