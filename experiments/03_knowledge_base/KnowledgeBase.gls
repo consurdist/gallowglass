@@ -136,6 +136,6 @@ let summary : Pair (Pair Nat Nat) Nat
 --   QueryResult: Found=0, NotFound=1
 --   Fact:        Hardware=0, Software=1, Status=2, Metric=3
 --   ServiceId:   Thermald=0, HermesAgent=1, ...
--- Expected raw output: (0 (0 (2 0 1)) (0 (0 9 3) 2))  (0 (0 (2 1 1)) (0 (0 9 3) 2))
-let result : Pair (Pair QueryResult (Pair (Pair Nat Nat) Nat))
-  = (MkPair thermald_query summary (MkPair hermes_query summary))
+-- Expected raw output: (0   (0  (0 (2 0 1))  (0 (2 1 1)))   (0 (0 9 3) 2))
+let result : Pair (Pair QueryResult QueryResult) (Pair (Pair Nat Nat) Nat)
+  = MkPair (MkPair thermald_query hermes_query) summary
