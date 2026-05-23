@@ -32,22 +32,7 @@ type QueryResult =
   | Found    Fact   -- a matching fact was found; carries the fact
   | NotFound        -- no matching fact in the list
 
--- Compare two ServiceIds for equality by nested pattern match.
--- Each arm of the outer match nests an inner match on the second arg.
--- Only identical constructor pairs return True.
--- This is the canonical way to compare enum-style ADT constructors in
--- Gallowglass when no Eq typeclass instance is available.
--- let service_eq : ServiceId -> ServiceId -> Bool
---  = λ aa bb -> match aa {
---      | Thermald       -> match bb { | Thermald       -> True | _ -> False }
---      | HermesAgent    -> match bb { | HermesAgent    -> True | _ -> False }
---      | NetworkManager -> match bb { | NetworkManager -> True | _ -> False }
---      | DBus           -> match bb { | DBus           -> True | _ -> False }
---      | Chromium       -> match bb { | Chromium       -> True | _ -> False }
---    }
-
 -- to_nat projection function surfaces the existing nat mapping.
--- Reduces verbosity of previous service_eq equality match.
 let service_to_nat : ServiceId -> Nat
   = λ sid -> match sid {
     | Thermald       -> 0
@@ -57,10 +42,10 @@ let service_to_nat : ServiceId -> Nat
     | Chromium       -> 4
   }
 
--- Simpler equality test:
+-- Compare two ServiceIds for equality via their Nat projections. 
+-- See service_to_nat for the mapping:
 let service_eq : ServiceId -> ServiceId -> Bool
   = λ aa bb -> Core.Nat.nat_eq (service_to_nat aa) (service_to_nat bb)
-    
 
 -- Return True only if this Fact is a Status entry for the given service.
 -- All other Fact kinds return False via the wildcard arm.
@@ -133,6 +118,11 @@ let kb : List Fact
 let thermald_query : QueryResult
   = find_service Thermald kb
 
+-- Query Hermesd status:
+-- Expected: Found
+let hermes_query: QueryResult
+ = find_service HermesAgent kb
+
 -- Summary of the knowledge base.
 -- Layout: MkPair (MkPair total_facts metric_count) status_count
 -- Expected: MkPair (MkPair 9 3) 2
@@ -146,6 +136,6 @@ let summary : Pair (Pair Nat Nat) Nat
 --   QueryResult: Found=0, NotFound=1
 --   Fact:        Hardware=0, Software=1, Status=2, Metric=3
 --   ServiceId:   Thermald=0, HermesAgent=1, ...
--- Expected raw output: (0 (0 (2 0 1)) (0 (0 9 3) 2))
-let result : Pair QueryResult (Pair (Pair Nat Nat) Nat)
-  = MkPair thermald_query summary
+-- Expected raw output: (0 (0 (2 0 1)) (0 (0 9 3) 2))  (0 (0 (2 1 1)) (0 (0 9 3) 2))
+let result : Pair (Pair QueryResult (Pair (Pair Nat Nat) Nat))
+  = (MkPair thermald_query summary (MkPair hermes_query summary))
