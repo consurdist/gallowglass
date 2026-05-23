@@ -1,0 +1,135 @@
+use Core.List unqualified { List, Cons, Nil }
+use Core.Pair unqualified { Pair, MkPair }
+
+-- Service identifiers as a typed enum rather than Text strings.
+-- DESIGN NOTE: we use a typed enum here rather than Text for two reasons:
+--   1. Text comparison under Reaver is extremely slow without a string-eq
+--      jet. Comparing two Text values reduces large content-nats (the
+--      PLAN encoding of string bytes) to normal form, which is unbounded
+--      without native acceleration. Nat/constructor comparison is O(1).
+--   2. A typed enum means the compiler enforces exhaustive handling of
+--      every known service -- you cannot silently add a service without
+--      updating all functions that process ServiceIds.
+type ServiceId =
+  | Snapd
+  | HermesAgent
+  | NetworkManager
+  | DBus
+  | Chromium
+
+-- A fact is a typed observation about the workstation.
+-- Four kinds cover the main categories an agent might track.
+-- The compiler requires every function that processes a Fact to
+-- handle all four constructors -- no silent omissions possible.
+type Fact =
+  | Hardware  Text Nat       -- component label, numeric value (e.g. core count)
+  | Software  Text Nat       -- package label, major version as Nat
+  | Status    ServiceId Nat  -- which service, 1=running / 0=stopped
+  | Metric    Nat Nat        -- metric id (0=cpu_load 1=mem_free 2=swap), value
+
+-- The result of querying the knowledge base for a specific service.
+type QueryResult =
+  | Found    Fact   -- a matching fact was found; carries the fact
+  | NotFound        -- no matching fact in the list
+
+-- Compare two ServiceIds for equality by nested pattern match.
+-- Each arm of the outer match nests an inner match on the second arg.
+-- Only identical constructor pairs return True.
+-- This is the canonical way to compare enum-style ADT constructors in
+-- Gallowglass when no Eq typeclass instance is available.
+let service_eq : ServiceId -> ServiceId -> Bool
+  = λ aa bb -> match aa {
+      | Snapd          -> match bb { | Snapd          -> True | _ -> False }
+      | HermesAgent    -> match bb { | HermesAgent    -> True | _ -> False }
+      | NetworkManager -> match bb { | NetworkManager -> True | _ -> False }
+      | DBus           -> match bb { | DBus           -> True | _ -> False }
+      | Chromium       -> match bb { | Chromium       -> True | _ -> False }
+    }
+
+-- Return True only if this Fact is a Status entry for the given service.
+-- All other Fact kinds return False via the wildcard arm.
+let matches_service : ServiceId -> Fact -> Bool
+  = λ sid ff -> match ff {
+      | Status fsid _ -> service_eq fsid sid
+      | Hardware _ _  -> False
+      | Software _ _  -> False
+      | Metric   _ _  -> False
+    }
+
+-- Walk the fact list and return the first Status fact for the given service.
+-- Returns NotFound if no match is found by the end of the list.
+let find_service : ServiceId -> List Fact -> QueryResult
+  = fix λ self sid facts -> match facts {
+      | Nil          -> NotFound
+      | Cons ff rest ->
+          if matches_service sid ff
+          then Found ff
+          else self sid rest
+    }
+
+-- Count how many facts in the list satisfy the predicate.
+-- Used to build the summary.
+let count_where : (Fact -> Bool) -> List Fact -> Nat
+  = fix λ self pred facts -> match facts {
+      | Nil          -> 0
+      | Cons ff rest ->
+          let this = if pred ff then 1 else 0 in
+          Core.Nat.add this (self pred rest)
+    }
+
+let is_metric : Fact -> Bool
+  = λ ff -> match ff { | Metric _ _ -> True | _ -> False }
+
+let is_status : Fact -> Bool
+  = λ ff -> match ff { | Status _ _ -> True | _ -> False }
+
+-- The knowledge base as a plain Cons list.
+--
+-- NOTE ON PROGRAMMER PINS: this experiment was originally designed to
+-- use `@name = fact in body` pin expressions for each fact. That syntax
+-- was found to be broken for values that are later used as pattern-match
+-- scrutinees: `Elim` dispatches on the Pin wrapper rather than the inner
+-- constructor, causing match arms to return the unpinned value rather
+-- than the arm body. Programmer pins work correctly when the pinned value
+-- is passed as a function argument, but NOT when it is the scrutinee of
+-- a match. This is a known bootstrap codegen limitation.
+--
+-- The compiler still introduces its own automatic pins (visible as @!
+-- annotations in Glass IR) for shared subexpressions -- that
+-- deduplication is unaffected and is what a real persistent knowledge
+-- store would rely on. The pin identity principle still holds at the
+-- PLAN level; the programmer-facing @pin syntax just cannot be used
+-- for values that will be matched.
+let kb : List Fact
+  = Cons (Hardware "AMD-9950X3D" 16)
+  ( Cons (Hardware "RAM-GB" 196)
+  ( Cons (Software "linux-kernel" 6)
+  ( Cons (Software "chromium" 124)
+  ( Cons (Status Snapd 1)
+  ( Cons (Status HermesAgent 1)
+  ( Cons (Metric 0 14)
+  ( Cons (Metric 1 170)
+  ( Cons (Metric 2 2)
+    Nil))))))))
+
+-- Query: find the status of Snapd in the knowledge base.
+-- Expected: Found (Status Snapd 1)
+let snapd_query : QueryResult
+  = find_service Snapd kb
+
+-- Summary of the knowledge base.
+-- Layout: MkPair (MkPair total_facts metric_count) status_count
+-- Expected: MkPair (MkPair 9 3) 2
+let summary : Pair (Pair Nat Nat) Nat
+  = MkPair
+      (MkPair (Core.List.length kb) (count_where is_metric kb))
+      (count_where is_status kb)
+
+-- Top-level result: query outcome paired with the summary.
+-- Constructor tag decoding:
+--   QueryResult: Found=0, NotFound=1
+--   Fact:        Hardware=0, Software=1, Status=2, Metric=3
+--   ServiceId:   Snapd=0, HermesAgent=1, ...
+-- Expected raw output: (0 (0 (2 0 1)) (0 (0 9 3) 2))
+let result : Pair QueryResult (Pair (Pair Nat Nat) Nat)
+  = MkPair snapd_query summary
