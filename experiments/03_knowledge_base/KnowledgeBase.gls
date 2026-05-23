@@ -37,14 +37,30 @@ type QueryResult =
 -- Only identical constructor pairs return True.
 -- This is the canonical way to compare enum-style ADT constructors in
 -- Gallowglass when no Eq typeclass instance is available.
+-- let service_eq : ServiceId -> ServiceId -> Bool
+--  = λ aa bb -> match aa {
+--      | Thermald       -> match bb { | Thermald       -> True | _ -> False }
+--      | HermesAgent    -> match bb { | HermesAgent    -> True | _ -> False }
+--      | NetworkManager -> match bb { | NetworkManager -> True | _ -> False }
+--      | DBus           -> match bb { | DBus           -> True | _ -> False }
+--      | Chromium       -> match bb { | Chromium       -> True | _ -> False }
+--    }
+
+-- to_nat projection function surfaces the existing nat mapping.
+-- Reduces verbosity of previous service_eq equality match.
+let service_to_nat : ServiceId -> Nat
+  = λ sid -> match sid {
+    | Thermald       -> 0
+    | HermesAgent    -> 1
+    | NetworkManager -> 2
+    | DBus           -> 3
+    | Chromium       -> 4
+  }
+
+-- Simpler equality test:
 let service_eq : ServiceId -> ServiceId -> Bool
-  = λ aa bb -> match aa {
-      | Thermald     -> match bb { | Thermald          -> True | _ -> False }
-      | HermesAgent    -> match bb { | HermesAgent    -> True | _ -> False }
-      | NetworkManager -> match bb { | NetworkManager -> True | _ -> False }
-      | DBus           -> match bb { | DBus           -> True | _ -> False }
-      | Chromium       -> match bb { | Chromium       -> True | _ -> False }
-    }
+  = λ aa bb -> Core.Nat.nat_eq (service_to_nat aa) (service_to_nat bb)
+    
 
 -- Return True only if this Fact is a Status entry for the given service.
 -- All other Fact kinds return False via the wildcard arm.
