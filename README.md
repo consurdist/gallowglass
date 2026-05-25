@@ -4,7 +4,7 @@ Personal experiments in using Gallowglass as a substrate for agent-shaped progra
 Upstream: https://github.com/sigilante/gallowglass
 
 - Experiment work lives in experiments/ 
-- Notes in experiments/notes/
+- Notes in companion repo [consurdist/trust-the-plan/notes](https://github.com/consurdist/trust-the-plan/tree/main/notes)
 
 Pull upstream changes: `git fetch upstream && git merge upstream/master`
 

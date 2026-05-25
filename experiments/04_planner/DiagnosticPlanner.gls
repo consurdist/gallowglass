@@ -1,0 +1,209 @@
+use Core.List unqualified { List, Cons, Nil }
+use Core.Pair unqualified { Pair, MkPair }
+
+-- Resource readings: same vocabulary as Experiment 01 (SystemMonitor).
+-- CpuLoad and MemFree match the Observation types from that experiment.
+-- ThermTemp corresponds to the Thermald service introduced in Experiment 03.
+-- In a future multi-file build these would be imported directly.
+type Resource =
+  | CpuLoad   Nat   -- current CPU load percent (0-100)
+  | MemFree   Nat   -- free memory in GB
+  | ThermTemp Nat   -- temperature reading from thermald (degrees C; 0 = daemon down)
+
+-- The diagnostic goal the planner is asked to address.
+type Goal =
+  | DiagnoseCpu     -- investigate high CPU load
+  | DiagnoseMemory  -- investigate low free memory
+  | DiagnoseTherm   -- investigate thermal anomaly via thermald
+
+-- A single planned action.  Nat arguments are typed by convention:
+--   CheckProcess / RestartService: service tag (0=thermald 1=hermes-agent ...)
+--   ReadMetric: metric id (0=cpu 1=mem 2=temp)
+--   AlertOperator: severity (1=warn 2=critical)
+--   LogObservation: category tag (0=general 1=cpu 2=mem 3=thermal)
+type Action =
+  | CheckProcess   Nat
+  | ReadMetric     Nat
+  | RestartService Nat
+  | AlertOperator  Nat
+  | LogObservation Nat
+
+-- Planning failure reasons.
+--
+-- MissingPrereq: a required precondition is absent.
+--   Carries the service tag of the missing component.
+--   Example: DiagnoseTherm requires ThermTemp > 0 (thermald must be running).
+--
+-- ResourceConstraint: a resource reading is outside safe bounds for the
+--   intended action.  Carries:
+--     resource_tag: which resource (0=cpu 1=mem 2=temp)
+--     MkPair actual_value safe_limit: the observed value and the limit exceeded.
+--
+-- Note: ResourceConstraint uses (Core.Pair.Pair Nat Nat) rather than three
+-- separate Nat fields to avoid the bootstrap arity-3 constructor limit.
+-- The fully-qualified form is required in type declarations.
+type PlanError =
+  | MissingPrereq      Nat
+  | ResourceConstraint Nat (Core.Pair.Pair Nat Nat)
+
+-- The planning effect.
+-- A function carrying {Fail | r} in its return type may raise a PlanError.
+-- The effect is discharged by `handle` in `plan_or_fallback` below.
+-- Callers of `plan_or_fallback` see a pure return type with no effect.
+--
+-- The return type of `raise` must match the type the handler resolves to
+-- (Core.List.List Action), because `raise` is the CPS operation that
+-- delivers a value to the continuation.
+eff Fail {
+  raise : PlanError -> Core.List.List Action
+}
+
+-- Resource accessors: extract a specific reading from the resource list.
+-- Return safe defaults when the reading is absent from the list.
+
+let get_cpu : Core.List.List Resource -> Nat
+  = fix λ self rs -> match rs {
+      | Nil          -> 0
+      | Cons rr rest -> match rr { | CpuLoad nn -> nn | _ -> self rest }
+    }
+
+let get_mem : Core.List.List Resource -> Nat
+  = fix λ self rs -> match rs {
+      | Nil          -> 999   -- absent = assume plenty of memory
+      | Cons rr rest -> match rr { | MemFree nn -> nn | _ -> self rest }
+    }
+
+let get_temp : Core.List.List Resource -> Nat
+  = fix λ self rs -> match rs {
+      | Nil          -> 0     -- absent = treat as daemon down
+      | Cons rr rest -> match rr { | ThermTemp nn -> nn | _ -> self rest }
+    }
+
+-- The planner.
+-- Given a list of current resource readings and a diagnostic goal,
+-- produce a list of Actions OR raise a Fail effect.
+--
+-- Resource constraint thresholds (matching Experiment 01 alert rules):
+--   CpuLoad  > 85%      unsafe for heavy diagnostic steps
+--   MemFree  < 20 GB    unsafe for memory-intensive operations
+--   ThermTemp > 90 C    unsafe to restart services (too hot)
+--
+-- Missing prerequisite rule:
+--   DiagnoseTherm requires ThermTemp > 0 (thermald must be reporting).
+--   ThermTemp = 0 means the daemon is down or not installed.
+--
+-- The {Fail | r} effect row is visible in this function's signature.
+-- It propagates to any caller that does not handle it.
+-- `plan_or_fallback` below is the designated handler.
+let plan : Core.List.List Resource -> Goal -> {Fail | r} (Core.List.List Action)
+  = λ resources goal ->
+      let cpu  = get_cpu  resources in
+      let mem  = get_mem  resources in
+      let temp = get_temp resources in
+      match goal {
+
+        | DiagnoseCpu ->
+            -- Resource constraint: need at least 20 GB free to run diagnostics.
+            -- A system with < 20 GB free is itself under stress; diagnosing
+            -- CPU load would risk making the memory situation worse.
+            if Core.Nat.nat_lt mem 20
+            then raise (ResourceConstraint 1 (MkPair mem 20))
+            else
+              Cons (ReadMetric 0)       -- sample cpu_load
+              ( Cons (CheckProcess 1)   -- examine hermes-agent (likely culprit)
+              ( Cons (LogObservation 1) -- log cpu category
+              ( Cons (AlertOperator 2)  -- critical alert
+                Nil)))
+
+        | DiagnoseMemory ->
+            -- Resource constraint: CPU must not be saturated during a memory scan.
+            -- Scanning memory while the CPU is at > 85% risks stalling the system.
+            if Core.Nat.nat_lt 85 cpu
+            then raise (ResourceConstraint 0 (MkPair cpu 85))
+            else
+              Cons (ReadMetric 1)       -- sample mem_free
+              ( Cons (LogObservation 2) -- log mem category
+              ( Cons (AlertOperator 1)  -- warning alert
+                Nil))
+
+        | DiagnoseTherm ->
+            -- Missing prerequisite: thermald must be running (temp > 0).
+            -- If temp = 0, thermald is down; the diagnostic cannot proceed
+            -- because there is nothing to read. A missing daemon is itself
+            -- the finding: escalate to the operator.
+            if Core.Nat.nat_eq temp 0
+            then raise (MissingPrereq 0)
+            else
+              -- Resource constraint: do not restart thermald if already overheating.
+              -- Restarting a service during a thermal event risks a crash.
+              if Core.Nat.nat_lt 90 temp
+              then raise (ResourceConstraint 2 (MkPair temp 90))
+              else
+                Cons (ReadMetric 2)         -- sample temp
+                ( Cons (CheckProcess 0)     -- examine thermald
+                ( Cons (RestartService 0)   -- restart thermald (within safe bounds)
+                ( Cons (LogObservation 3)   -- log thermal category
+                  Nil)))
+      }
+
+-- Fallback plan: safe minimal response when any planning failure occurs.
+-- Takes no remediation action (no restart, no scan).
+-- Logs the general failure category and raises a critical alert.
+-- This plan is always safe regardless of system state.
+let fallback_plan : Core.List.List Action
+  = Cons (LogObservation 0)  -- log general failure
+  ( Cons (AlertOperator 2)   -- critical alert to operator
+    Nil)
+
+-- Run the planner with error handling.
+-- The {Fail} effect is fully discharged here: the return type is pure.
+--
+-- `handle` intercepts the Fail effect:
+--   | return pp   the plan succeeded; pp is the computed action list
+--   | raise  _ kk the plan failed; ignore the error and return fallback_plan
+--                 kk (the continuation) is discarded -- we do not resume
+--
+-- `run` executes the CPS-wrapped computation with a null dispatch chain.
+-- After `run`, no effect remains. The caller sees only a plain List Action.
+let plan_or_fallback : Core.List.List Resource -> Goal -> Core.List.List Action
+  = λ resources goal ->
+      run (handle (plan resources goal) {
+        | return pp -> pp
+        | raise _  kk -> fallback_plan
+      })
+
+-- Scenario 1: Normal system state -- DiagnoseTherm should succeed.
+-- CPU 34%, Mem 170 GB free, ThermTemp 62 C: all within safe bounds.
+-- Expected: ReadMetric 2, CheckProcess 0, RestartService 0, LogObservation 3
+let current_resources : Core.List.List Resource
+  = Cons (CpuLoad 34)
+  ( Cons (MemFree 170)
+  ( Cons (ThermTemp 62)
+    Nil))
+
+let result_normal : Core.List.List Action
+  = plan_or_fallback current_resources DiagnoseTherm
+
+-- Scenario 2: Low memory -- DiagnoseCpu should fail on ResourceConstraint.
+-- MemFree 14 GB < 20 GB threshold triggers ResourceConstraint 1 (14, 20).
+-- Expected: fallback_plan (LogObservation 0, AlertOperator 2)
+let stressed_resources : Core.List.List Resource
+  = Cons (CpuLoad 92)
+  ( Cons (MemFree 14)
+  ( Cons (ThermTemp 71)
+    Nil))
+
+let result_constrained : Core.List.List Action
+  = plan_or_fallback stressed_resources DiagnoseCpu
+
+-- Scenario 3: Thermald not running (ThermTemp 0) -- DiagnoseTherm
+-- should fail on MissingPrereq 0 and return fallback_plan.
+-- Expected: fallback_plan (LogObservation 0, AlertOperator 2)
+let no_therm_resources : Core.List.List Resource
+  = Cons (CpuLoad 18)
+  ( Cons (MemFree 172)
+  ( Cons (ThermTemp 0)
+    Nil))
+
+let result_missing_prereq : Core.List.List Action
+  = plan_or_fallback no_therm_resources DiagnoseTherm
