@@ -184,6 +184,8 @@ let current_resources : Core.List.List Resource
 let result_normal : Core.List.List Action
   = plan_or_fallback current_resources DiagnoseTherm
 
+let normal_length : Nat = Core.List.length result_normal
+
 -- Scenario 2: Low memory -- DiagnoseCpu should fail on ResourceConstraint.
 -- MemFree 14 GB < 20 GB threshold triggers ResourceConstraint 1 (14, 20).
 -- Expected: fallback_plan (LogObservation 0, AlertOperator 2)
@@ -196,6 +198,8 @@ let stressed_resources : Core.List.List Resource
 let result_constrained : Core.List.List Action
   = plan_or_fallback stressed_resources DiagnoseCpu
 
+let constrained_length : Nat = Core.List.length result_constrained
+
 -- Scenario 3: Thermald not running (ThermTemp 0) -- DiagnoseTherm
 -- should fail on MissingPrereq 0 and return fallback_plan.
 -- Expected: fallback_plan (LogObservation 0, AlertOperator 2)
@@ -207,3 +211,5 @@ let no_therm_resources : Core.List.List Resource
 
 let result_missing_prereq : Core.List.List Action
   = plan_or_fallback no_therm_resources DiagnoseTherm
+
+let missing_prereq_length : Nat = Core.List.length result_missing_prereq
