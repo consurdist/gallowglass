@@ -1,0 +1,129 @@
+use Core.Pair unqualified { Pair, MkPair }
+
+-- A minimal expression language for computing over natural numbers.
+--
+-- The four constructors are a direct analogue of what PLAN does:
+--
+--   Lit  -- a value already in normal form; eval returns it unchanged.
+--          Corresponds to a bare Nat in PLAN: no reduction needed.
+--
+--   Add  -- a Law applied to two sub-expressions; eval both, then combine.
+--          Corresponds to a two-argument Law application in PLAN.
+--
+--   Mul  -- same shape as Add with multiplication as the combining function.
+--
+--   IfZ  -- "if zero": eval the scrutinee; if it reduces to 0 take the first
+--          branch, otherwise take the second.
+--          This is exactly the nat-zero / nat-successor dispatch of PLAN's
+--          Elim opcode: Case zero → branch₀, Case succ → branch₁.
+--          Note: the two branches are packed into a Pair to stay within the
+--          bootstrap's arity-2 constructor limit for pattern matching.
+type Expr =
+  | Lit Nat                          -- literal value
+  | Add Expr Expr                    -- addition of two sub-expressions
+  | Mul Expr Expr                    -- multiplication of two sub-expressions
+  | IfZ Expr (Core.Pair.Pair Expr Expr)
+  -- ^ scrutinee, MkPair (then-branch) (else-branch)
+  -- ^ IfZ (Lit 0) branches -> then-branch fires
+  -- ^ IfZ (Lit n) branches (n>0) -> else-branch fires; n is the successor nat
+
+-- The evaluator.
+-- Given any Expr, recursively reduce it to a single Nat.
+-- `fix` is required because the bootstrap does not support
+-- self-recursive top-level `let`.
+--
+-- Each recursive `self` call corresponds to one reduction step in the
+-- PLAN sense: a Law (eval) applied to its argument (the sub-expression).
+-- Writing `eval` is writing a small model of PLAN's own reduction engine.
+let eval : Expr -> Nat
+  = fix λ self expr -> match expr {
+
+      -- Base case: a literal is already fully reduced.
+      | Lit nn      -> nn
+
+      -- Recursive cases: evaluate both sub-expressions, then combine.
+      | Add e1 e2   -> Core.Nat.add (self e1) (self e2)
+      | Mul e1 e2   -> Core.Nat.mul (self e1) (self e2)
+
+      -- Conditional: evaluate the scrutinee first.
+      -- If it is zero, evaluate and return the then-branch (et).
+      -- If it is non-zero, evaluate and return the else-branch (ef).
+      -- The non-zero arm binds the predecessor, not the value itself
+      -- (Nat pattern semantics in Gallowglass) -- we use _ since we
+      -- only care that it is non-zero, not what its predecessor is.
+      | IfZ sc brs  ->
+          match brs {
+            | MkPair et ef ->
+                if Core.Nat.nat_eq (self sc) 0
+                then self et
+                else self ef
+          }
+    }
+
+-- ---------------------------------------------------------------------------
+-- Sample expressions.
+-- Domain: values drawn from the monitoring/planning thread of experiments 1-4.
+-- All arithmetic matches numbers used in those experiments.
+-- ---------------------------------------------------------------------------
+
+-- Expr 1: CPU alert check.
+-- From Experiment 01: CpuLoad=34, alert threshold=85.
+-- Headroom = 85 - 34 = 51.
+-- IfZ 51: scrutinee is 51, which is non-zero, so else-branch fires.
+-- Interpretation: load is BELOW threshold -> no alert -> result 0.
+-- (If headroom were 0, load equals threshold -> critical alert, result 2.)
+let expr_cpu_alert : Expr
+  = IfZ
+      (Lit 51)               -- headroom between load and threshold
+      (MkPair
+        (Lit 2)              -- then: headroom = 0 -> critical alert (severity 2)
+        (Lit 0))             -- else: headroom > 0 -> normal, no alert
+
+-- Expr 2: Thermal restart safety check.
+-- From Experiment 03/04: ThermTemp=62C, restart cap=90C.
+-- Headroom = 90 - 62 = 28.
+-- IfZ 28: non-zero -> else-branch fires.
+-- Interpretation: temperature is BELOW cap -> restart is safe -> result 1.
+-- (If headroom were 0, temperature = cap -> restart blocked, result 0.)
+let expr_temp_safe : Expr
+  = IfZ
+      (Lit 28)               -- headroom between temperature and restart cap
+      (MkPair
+        (Lit 0)              -- then: headroom = 0 -> unsafe, restart blocked
+        (Lit 1))             -- else: headroom > 0 -> safe, restart permitted
+
+-- Expr 3: Combined resource headroom score.
+-- From Experiment 04 (DiagnosticPlanner resource constraints):
+--   cpu_headroom  = 85 - 34  = 51  (how far CPU load is below alert threshold)
+--   mem_headroom  = 170 - 20 = 150 (how far free memory is above minimum)
+-- Score = Add both: 51 + 150 = 201.
+-- A higher score indicates a more comfortable operating margin for
+-- scheduling diagnostic actions.
+let expr_headroom : Expr
+  = Add
+      (Lit 51)               -- cpu headroom
+      (Lit 150)              -- mem headroom
+
+-- Expr 4: Alert priority score.
+-- From Experiment 01 (SystemMonitor): alert_count=3, critical severity weight=2.
+-- Raw score = Mul 3 2 = 6.
+-- IfZ 6: non-zero -> else-branch fires -> return the score.
+-- Interpretation: alerts exist (score > 0) -> return priority score 6.
+-- (If score were 0, no alerts -> return 0 as "no action needed".)
+let expr_priority : Expr
+  = IfZ
+      (Mul (Lit 3) (Lit 2))          -- alert_count * severity_weight = 6
+      (MkPair
+        (Lit 0)                      -- then: score = 0 -> no action needed
+        (Mul (Lit 3) (Lit 2)))       -- else: score > 0 -> return priority score
+
+-- Evaluate all four expressions.
+-- Expected:
+--   result_cpu_alert  = 0    (load below threshold: no alert)
+--   result_temp_safe  = 1    (temperature below restart cap: safe)
+--   result_headroom   = 201  (51 + 150: combined resource margin)
+--   result_priority   = 6    (3 alerts * weight 2: priority score)
+let result_cpu_alert : Nat = eval expr_cpu_alert
+let result_temp_safe : Nat = eval expr_temp_safe
+let result_headroom  : Nat = eval expr_headroom
+let result_priority  : Nat = eval expr_priority
