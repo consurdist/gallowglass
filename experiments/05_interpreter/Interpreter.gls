@@ -127,3 +127,85 @@ let result_cpu_alert : Nat = eval expr_cpu_alert
 let result_temp_safe : Nat = eval expr_temp_safe
 let result_headroom  : Nat = eval expr_headroom
 let result_priority  : Nat = eval expr_priority
+
+-- ---------------------------------------------------------------------------
+-- Extension: step-counted evaluator.
+-- ---------------------------------------------------------------------------
+--
+-- eval_counted returns MkPair result steps, where `steps` counts every
+-- node visited during evaluation.  The counting rule is:
+--
+--   Lit      -> 1 step   (base case: one node, already in normal form)
+--   Add/Mul  -> steps(e1) + steps(e2) + 1  (two sub-evaluations plus this node)
+--   IfZ      -> steps(scrutinee) + steps(taken_branch) + 1
+--              (the unchosen branch is NOT evaluated -- lazy in branches)
+--
+-- This mirrors PLAN's own reduction accounting: every Law application
+-- costs one step, including evaluating a Nat to itself.
+--
+-- The step count makes the cost of duplicated sub-expressions visible.
+-- expr_priority evaluates Mul (Lit 3) (Lit 2) TWICE -- once as the IfZ
+-- scrutinee and once as the else-branch body.  Each evaluation costs 3
+-- steps, so the total is 7.  With programmer pins (@shared = Mul ... in
+-- IfZ shared (MkPair (Lit 0) shared)), the Mul would be evaluated once
+-- and pinned; subsequent references would cost 0 additional steps.
+-- The step counter makes the experiment-03 pin concept concrete.
+--
+-- Expected counts:
+--   expr_cpu_alert  -> MkPair 0   3   (IfZ: sc=1, else=1, node=1)
+--   expr_temp_safe  -> MkPair 1   3   (IfZ: sc=1, else=1, node=1)
+--   expr_headroom   -> MkPair 201 3   (Add: lhs=1, rhs=1, node=1)
+--   expr_priority   -> MkPair 6   7   (IfZ: sc=3, else=3, node=1)
+let eval_counted : Expr -> Core.Pair.Pair Nat Nat
+  = fix λ self expr -> match expr {
+
+      -- Base case: Lit is already a value.  1 step.
+      | Lit nn    -> MkPair nn 1
+
+      -- Add: evaluate both sides, sum results and step counts.
+      | Add e1 e2 ->
+          match self e1 {
+            | MkPair r1 s1 ->
+                match self e2 {
+                  | MkPair r2 s2 ->
+                      MkPair
+                        (Core.Nat.add r1 r2)
+                        (Core.Nat.add (Core.Nat.add s1 s2) 1)
+                }
+          }
+
+      -- Mul: same structure as Add, different combining function.
+      | Mul e1 e2 ->
+          match self e1 {
+            | MkPair r1 s1 ->
+                match self e2 {
+                  | MkPair r2 s2 ->
+                      MkPair
+                        (Core.Nat.mul r1 r2)
+                        (Core.Nat.add (Core.Nat.add s1 s2) 1)
+                }
+          }
+
+      -- IfZ: evaluate the scrutinee, then evaluate only the chosen branch.
+      -- The unchosen branch is never touched.  This is the lazy-branch
+      -- property that mirrors PLAN's Elim: only the matching arm fires.
+      | IfZ sc brs ->
+          match self sc {
+            | MkPair sc_val sc_steps ->
+                match brs {
+                  | MkPair et ef ->
+                      match self (if Core.Nat.nat_eq sc_val 0 then et else ef) {
+                        | MkPair br_val br_steps ->
+                            MkPair
+                              br_val
+                              (Core.Nat.add (Core.Nat.add sc_steps br_steps) 1)
+                      }
+                }
+          }
+    }
+
+-- Counted results: MkPair result steps_taken
+let counted_cpu_alert : Core.Pair.Pair Nat Nat = eval_counted expr_cpu_alert
+let counted_temp_safe : Core.Pair.Pair Nat Nat = eval_counted expr_temp_safe
+let counted_headroom  : Core.Pair.Pair Nat Nat = eval_counted expr_headroom
+let counted_priority  : Core.Pair.Pair Nat Nat = eval_counted expr_priority
